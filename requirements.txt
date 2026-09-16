@@ -1,0 +1,13 @@
+# Web Arayuzu (Frontend)
+streamlit>=1.49.0
+
+# API Istekleri ve Haberlesme
+requests>=2.31.0
+urllib3>=2.2.0
+
+# Cevre Degiskenleri (.env) Yonetimi
+python-dotenv>=1.0.1
+
+# Hizli hash ve log template mining
+xxhash>=3.4.1
+drain3>=0.9.11,<1.0

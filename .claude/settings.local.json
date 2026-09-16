@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import streamlit; print\\(streamlit.__version__\\)\")",
+      "Bash(python -m py_compile src/frontend/theme.py src/frontend/streamlit_app.py)",
+      "Bash(python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python -m streamlit run src/frontend/streamlit_app.py --server.headless true --server.port 8599)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:8599/)",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 900 python tools/frontend_render_qa.py)",
+      "Bash(python -c \"import playwright; print\\('playwright ok'\\)\")",
+      "Read(//c/Program Files \\\\\\(x86\\\\\\)/Microsoft/Edge/Application/**)",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft/Edge/Application/msedge.exe\" --headless=new --disable-gpu --hide-scrollbars --no-sandbox --window-size=1680,1500 --virtual-time-budget=25000 --screenshot=/tmp/aopdemo/shot1.png \"http://localhost:8601/\")",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft/Edge/Application/msedge.exe\" --headless=new --disable-gpu --no-sandbox --user-data-dir=\"C:\\\\\\\\Users\\\\\\\\tcsdiker\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\edgeshot\" --window-size=1680,1500 --virtual-time-budget=25000 --screenshot=\"C:\\\\\\\\Users\\\\\\\\tcsdiker\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\aop_shot1.png\" \"http://localhost:8601/\")",
+      "Read(//c/Users/tcsdiker/AppData/Local/Temp/**)",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft/Edge/Application/msedge.exe\" --headless=new --disable-gpu --no-sandbox --user-data-dir=\"C:\\\\Users\\\\tcsdiker\\\\AppData\\\\Local\\\\Temp\\\\edgeshot2\" --window-size=1400,900 --virtual-time-budget=8000 --screenshot=\"C:\\\\Users\\\\tcsdiker\\\\AppData\\\\Local\\\\Temp\\\\t.png\" \"https://example.com\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft/Edge/Application/msedge.exe\" --headless --disable-gpu --no-sandbox --user-data-dir=\"C:\\\\Users\\\\tcsdiker\\\\AppData\\\\Local\\\\Temp\\\\edgeshot3\" --window-size=1400,900 --screenshot=\"C:\\\\Users\\\\tcsdiker\\\\AppData\\\\Local\\\\Temp\\\\t2.png\" \"https://example.com\")",
+      "Bash(python -c \"import websocket; print\\('websocket-client OK', websocket.__version__\\)\")",
+      "Bash(python -c \"import websockets; print\\('websockets OK'\\)\")"
+    ]
+  }
+}

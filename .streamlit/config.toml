@@ -1,0 +1,24 @@
+# AOP • Turkcell kurumsal tema
+# Sarı (#FFC800) + lacivert (#0A1628) marka paleti.
+
+[theme]
+base = "dark"
+primaryColor = "#FFC800"
+backgroundColor = "#0A1628"
+secondaryBackgroundColor = "#101F38"
+textColor = "#E9EFF9"
+linkColor = "#FFC800"
+borderColor = "#1E3355"
+baseRadius = "medium"
+font = "sans serif"
+
+[theme.sidebar]
+backgroundColor = "#070F1E"
+secondaryBackgroundColor = "#101F38"
+borderColor = "#1E3355"
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+maxUploadSize = 200
