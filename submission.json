@@ -1,0 +1,52 @@
+{
+    "takim": {
+        "ad": "Teletabiler",
+        "uyeler": [
+            "Sertan Sambur,Muhammed Karadeniz, Sefa Çotur, Süleyman Diker"
+        ],
+        "iletisim": "teletabiler@turkcell.com.tr"
+    },
+    "proje": {
+        "ad": "teletabiler-ai-ops",
+        "ozet": "SRE AI Otomasyon.",
+        "deploy_url": null
+    },
+    "calistirma": {
+        "komut": "streamlit run src/frontend/streamlit_app.py",
+        "on_kosullar": [
+            "Python >= 3.10"
+        ],
+        "veri_yolu": "./data"
+    },
+    "ai_kullanimi": {
+        "platform": "SAKA",
+        "modeller": [
+            {
+                "ad": "qwen35-122b-a10b-awq-ai",
+                "surum": "2026-v1",
+                "kullanim": "analiz"
+            },
+            {
+                "ad": "llm-dynamo-deepseek-v4-flash-0731",
+                "surum": "2026-v1",
+                "kullanim": "analiz"
+            }
+        ],
+        "mcp_sunuculari": [],
+        "apiler": []
+    },
+    "cozum": {
+        "yaklasim": "Deterministic + Agentic LLM Hybrid",
+        "x_factor": "Otonom AI Regex Bulucu ve Sıfır-Kayıp Normalleştirici",
+        "olctugumuz_metrikler": {
+            "zeroloss": "%100"
+        }
+    },
+    "sunum": {
+        "demo_akisi": [
+            "1. Log Yükleme",
+            "2. X-Factor Analizi",
+            "3. Çıktı Gösterimi"
+        ]
+    }
+}
