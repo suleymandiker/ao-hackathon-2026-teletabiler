@@ -76,3 +76,17 @@ def test_continuation_severity_does_not_discard_header_message(assembled_record,
     parsed = StructuredTextParser().parse(event)
     assert parsed is not None
     assert parsed["message"] == "operation started\n" + CONTINUATION
+
+
+@pytest.mark.parametrize("terminator", ["\n", "\r\n", ""], ids=["lf", "crlf", "no-terminator"])
+def test_single_line_event_remains_unchanged(tmp_path, terminator):
+    from segmentation_layer.multiline_assembler import MultilineAssembler
+
+    log_path = tmp_path / "single-line.log"
+    log_path.write_bytes((HEADER + terminator).encode("utf-8"))
+    records = list(MultilineAssembler().iter_event_records(str(log_path), HEADER_REGEX))
+    assert len(records) == 1
+    assert records[0]["event"] == HEADER
+    assert records[0]["line_count"] == 1
+    assert records[0]["first_line_is_header"] is True
+    assert records[0]["decisions"][0]["classification"] == "STRONG_HEADER"
