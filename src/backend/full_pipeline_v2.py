@@ -79,7 +79,9 @@ class FullAIOpsPipelineV2:
         print(f"[PIPELINE] Sinyal adayı={ds.get('signal_candidates',0)} | Nitelikli={ds.get('qualified_signals',0)} | Gürültü={ds.get('noise_suppressed',0)} | Korelasyon={ds.get('correlations',0)} | Olay={ds.get('incidents',0)} | RCA={ds.get('rca',0)}")
         return downstream
 
-    def process_file(self, path: str) -> Dict[str,Any]:
+    def process_file(self, path: str, *, topology=None) -> Dict[str,Any]:
+        # Raw analyses use only their explicitly supplied context.
+        self.downstream.set_context(topology)
         templated: List[Dict[str,Any]]=[]
         trace_limit = 200
         trace = {'segmentation': [], 'parser': [], 'template': []}
