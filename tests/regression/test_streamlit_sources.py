@@ -1,10 +1,14 @@
 """Real Streamlit AppTest routing with fake acquisition/analysis boundaries."""
+import asyncio
+from contextlib import closing
+import http.client
 import json
 import os
 from pathlib import Path
 import socket
 import sqlite3
 from types import SimpleNamespace
+import urllib.request
 
 import pytest
 
@@ -35,12 +39,29 @@ def ui(monkeypatch, tmp_path):
     import full_pipeline_v2
     import opensearch_application as boundary
     from segmentation_layer.contracts import SegmentationPolicy
+    from template_layer.engine import DrainCandidateMiner, ValidatedTemplateRegistry
 
     def forbidden(*args, **kwargs):
         pytest.fail('UI tests must not use network, LLM, SQLite or production learning state')
 
-    for owner, names in ((socket.socket, ('connect', 'connect_ex')), (socket, ('create_connection', 'getaddrinfo')),
-                         (sqlite3, ('connect',)), (sqlite3.dbapi2, ('connect',)), (requests.sessions.Session, ('request',))):
+    def loopback_only(original):
+        def guarded(sock, address):
+            # Windows asyncio's socketpair uses literal loopback TCP addresses.
+            # HTTP is blocked separately, including HTTP directed at localhost.
+            if (sock.family not in (socket.AF_INET, socket.AF_INET6)
+                    or not isinstance(address, tuple) or not address
+                    or address[0] not in ('127.0.0.1', '::1')):
+                forbidden()
+            return original(sock, address)
+        return guarded
+
+    for name in ('connect', 'connect_ex'):
+        monkeypatch.setattr(socket.socket, name, loopback_only(getattr(socket.socket, name)))
+    for owner, names in ((socket, ('create_connection', 'getaddrinfo')),
+                         (requests.sessions.Session, ('request', 'send')),
+                         (http.client.HTTPConnection, ('connect',)), (http.client.HTTPSConnection, ('connect',)),
+                         (sqlite3, ('connect',)), (sqlite3.dbapi2, ('connect',)),
+                         (DrainCandidateMiner, ('__init__',)), (ValidatedTemplateRegistry, ('__init__',))):
         for name in names:
             monkeypatch.setattr(owner, name, forbidden)
     monkeypatch.setattr(ai_engine, 'call_ai_agent', forbidden)
@@ -77,10 +98,12 @@ def ui(monkeypatch, tmp_path):
                        page_size=request.page_size, record_budget=request.max_pages * request.page_size)
         return boundary.presentation_result(result_fixture(), summary, boundary.load_connection())
 
+    real_run_analysis = boundary.run_analysis
     monkeypatch.setattr(boundary, 'run_analysis', run_analysis)
     st.cache_resource.clear()
     yield SimpleNamespace(app=lambda: AppTest.from_file(str(APP), default_timeout=10).run(), st=st,
-                          boundary=boundary, selected=selected, files=file_calls, packages=package_calls, sources=source_calls)
+                          boundary=boundary, selected=selected, files=file_calls, packages=package_calls, sources=source_calls,
+                          real_run_analysis=real_run_analysis)
     st.cache_resource.clear()
 
 
@@ -94,6 +117,93 @@ def assert_safe(app):
     rendered = str(app) + str(app.session_state.filtered_state)
     for forbidden in (SECRET, 'private-user', 'private-host.invalid', 'private-signature', '^BEGIN ', RAW):
         assert forbidden not in rendered
+
+
+def test_framework_event_loop_and_socketpair_work(ui):
+    with closing(asyncio.new_event_loop()) as loop:
+        assert not loop.is_closed()
+    reader, writer = socket.socketpair()
+    with reader, writer:
+        reader.settimeout(2)
+        writer.sendall(b'wakeup')
+        assert reader.recv(6) == b'wakeup'
+
+
+@pytest.mark.parametrize('family,host', [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')])
+@pytest.mark.parametrize('method', ['connect', 'connect_ex'])
+def test_framework_loopback_connections_are_allowed(ui, family, host, method):
+    with socket.socket(family) as listener, socket.socket(family) as writer:
+        try:
+            listener.bind((host, 0))
+        except OSError:
+            if family == socket.AF_INET6:
+                pytest.skip('IPv6 loopback is unavailable on this host')
+            raise
+        listener.listen(1)
+        listener.settimeout(2)
+        writer.settimeout(2)
+        result = getattr(writer, method)(listener.getsockname())
+        assert result == (0 if method == 'connect_ex' else None)
+        reader, _ = listener.accept()
+        with reader:
+            reader.settimeout(2)
+            writer.sendall(b'wakeup')
+            assert reader.recv(6) == b'wakeup'
+
+
+@pytest.mark.parametrize('family,host', [(socket.AF_INET, '192.0.2.1'), (socket.AF_INET6, '2001:db8::1'),
+                                       (socket.AF_INET, 'example.invalid')])
+@pytest.mark.parametrize('method', ['connect', 'connect_ex'])
+def test_non_loopback_socket_connections_remain_forbidden(ui, family, host, method):
+    with socket.socket(family) as connection:
+        connection.settimeout(0.1)
+        with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+            getattr(connection, method)((host, 443))
+
+
+@pytest.mark.parametrize('host', ['example.invalid', '127.0.0.1', '[::1]'])
+@pytest.mark.parametrize('scheme', ['http', 'https'])
+def test_http_boundaries_block_external_and_loopback_requests(ui, host, scheme):
+    import requests
+
+    url = f'{scheme}://{host}/'
+    with requests.Session() as session:
+        with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+            session.get(url)
+        with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+            session.send(requests.Request('GET', url).prepare())
+    with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+        urllib.request.urlopen(url, timeout=0.1)
+    connection_type = http.client.HTTPSConnection if scheme == 'https' else http.client.HTTPConnection
+    with closing(connection_type(host, timeout=0.1)) as connection:
+        with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+            connection.request('GET', '/')
+
+
+@pytest.mark.parametrize('host', ['example.invalid', '127.0.0.1', '[::1]'])
+def test_unmocked_opensearch_analysis_cannot_issue_http(ui, monkeypatch, host):
+    monkeypatch.setenv('OPENSEARCH_HOSTS', f'https://{host}')
+    request = ui.boundary.make_request('ns', 'app', '', 15, 100, 3, '2026-10-04T09:00:00+00:00')
+
+    def unexpected_pipeline():
+        pytest.fail('Network must be blocked before pipeline construction')
+
+    # Exercise the real application, source and client, bypassing only the UI fake.
+    with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+        ui.real_run_analysis(unexpected_pipeline, request, ui.selected)
+
+
+def test_llm_sqlite_and_learning_state_remain_forbidden(ui, tmp_path):
+    import ai_engine
+    from template_layer.engine import DrainCandidateMiner, ValidatedTemplateRegistry
+
+    for action in (lambda: ai_engine.call_ai_agent('unused'),
+                   lambda: sqlite3.connect(tmp_path / 'unused.sqlite3'),
+                   lambda: sqlite3.dbapi2.connect(tmp_path / 'unused.sqlite3'),
+                   DrainCandidateMiner, ValidatedTemplateRegistry):
+        with pytest.raises(pytest.fail.Exception, match='UI tests must not use network'):
+            action()
+    assert not (tmp_path / 'unused.sqlite3').exists()
 
 
 def test_default_source_keeps_upload_ui_and_no_analysis(ui):

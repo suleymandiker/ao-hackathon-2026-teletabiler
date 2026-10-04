@@ -20,7 +20,7 @@ END = datetime(2026, 10, 4, 9, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def app(monkeypatch, tmp_path):
+def app(monkeypatch, tmp_path, request):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'src' / 'backend'))
     import requests
     import ai_engine
@@ -40,7 +40,7 @@ def app(monkeypatch, tmp_path):
     for name, value in dict(HOSTS='https://example.invalid', USERNAME='private-user', PASSWORD=SECRET,
                             USE_SSL='true', VERIFY_CERTS='true', SOURCE_SCOPE='test-cluster', INDEX='test-*').items():
         monkeypatch.setenv('OPENSEARCH_' + name, value)
-    database = tmp_path / 'policies.sqlite3'
+    database = tmp_path / getattr(request, 'param', 'policies.sqlite3')
     monkeypatch.setenv('AIOPS_POLICY_REGISTRY_PATH', str(database))
     real_connect = sqlite3.connect
 
@@ -60,7 +60,16 @@ def app(monkeypatch, tmp_path):
             con.execute('INSERT INTO parser_policies VALUES(?, ?)', ('unverified', 'private payload'))
             con.commit()
 
-    return SimpleNamespace(module=module, database=database, seed=seed, forbidden=forbidden)
+    def read_catalog():
+        try:
+            return module.list_verified_policies()
+        except module.ApplicationError as error:
+            # Expose the original failure only for this test-owned database.
+            # Production retains its safe, suppressed exception chain.
+            raise AssertionError('Unable to read the temporary test policy catalog') from error.__context__
+
+    return SimpleNamespace(module=module, database=database, seed=seed, forbidden=forbidden,
+                           read_catalog=read_catalog)
 
 
 def policy(app):
@@ -193,14 +202,41 @@ def test_tls_ca_and_timeout_settings_are_preserved(app, monkeypatch):
 def test_verified_catalog_is_read_only_and_does_not_leak_regex_or_signature(app):
     app.seed([('private-signature', REGEX), ('broken', '['), ('empty', '')])
     before = app.database.read_bytes()
-    policies = app.module.list_verified_policies()
+    policies = app.read_catalog()
     assert len(policies) == 1
     assert policies[0].snapshot.policy_id == 'private-signature'
     assert policies[0].snapshot.regex_pattern == REGEX
     assert policies[0].selection_id.startswith('policy-')
     assert 'private-signature' not in repr(policies) and REGEX not in repr(policies)
     assert app.database.read_bytes() == before
-    assert app.module.list_verified_policies() == policies
+    assert app.read_catalog() == policies
+
+
+@pytest.mark.parametrize('app', ['policies.sqlite3', 'policies # % ı.sqlite3'], indirect=True)
+def test_catalog_connection_rejects_writes_and_preserves_encoded_path_identity(app, monkeypatch):
+    signature = '0123456789abcdef01234567'
+    app.seed([(signature, REGEX)])
+    before = app.database.read_bytes()
+    guarded_connect = sqlite3.connect
+    write_checks = []
+
+    def check_read_only(*args, **kwargs):
+        connection = guarded_connect(*args, **kwargs)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match='readonly'):
+                connection.execute('DELETE FROM segmentation_policies')
+        except BaseException:
+            connection.close()
+            raise
+        write_checks.append(True)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', check_read_only)
+    selected, = app.read_catalog()
+    assert write_checks == [True]
+    assert selected.selection_id == 'policy-' + signature
+    assert selected.snapshot.policy_id == signature and selected.snapshot.regex_pattern == REGEX
+    assert app.database.read_bytes() == before
 
 
 def test_missing_catalog_does_not_create_sqlite_or_choose_fallback(app):
@@ -276,7 +312,7 @@ def test_oversized_page_cannot_bypass_record_budget(app, monkeypatch):
 def test_normal_registry_signature_is_recognizable_without_altering_identity(app):
     signature = '0123456789abcdef01234567'
     app.seed([(signature, REGEX)])
-    selected, = app.module.list_verified_policies()
+    selected, = app.read_catalog()
     assert selected.selection_id == 'policy-' + signature
     assert selected.snapshot.policy_id == signature
 
