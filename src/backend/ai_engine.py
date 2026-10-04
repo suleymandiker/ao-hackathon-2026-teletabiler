@@ -89,6 +89,16 @@ def _result(error: str, duration: float, return_usage: bool):
     return error, duration
 
 
+def safe_usage(usage):
+    """Allowlisted gateway measurements; missing tokens stay unknown, not estimated."""
+    usage = usage if isinstance(usage, dict) else {}
+    result = {key: value if type(value := usage.get(key)) is int and value >= 0 else None
+              for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')}
+    reason = usage.get('finish_reason')
+    result['finish_reason'] = reason if reason in ('stop', 'length', 'max_tokens', 'content_filter', 'tool_calls') else 'unknown'
+    return result
+
+
 def call_ai_agent(
     agent_key: str,
     system_prompt: str,
@@ -101,6 +111,7 @@ def call_ai_agent(
 ):
     """OpenAI-compatible kurumsal endpoint'e tek bir sade istek gönderir."""
     config = MODELS_CONFIG.get(agent_key)
+    is_rca = agent_key == 'Ajan_2_RCA_Expert'
     if config is None:
         return _result(f"Hata: {agent_key} konfigürasyonu bulunamadı.", 0.0, return_usage)
 
@@ -125,7 +136,7 @@ def call_ai_agent(
     # Qwen yalnız RCA yorumu için kullanılır; kısa ve doğrudan JSON cevap isteriz.
     if config["family"] == "qwen":
         payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = QWEN_RCA_ENABLE_THINKING
-        ##payload.setdefault("include_reasoning", QWEN_RCA_INCLUDE_REASONING)
+        payload["include_reasoning"] = QWEN_RCA_INCLUDE_REASONING
 
     headers = {
         "Authorization": f"Bearer {config['key']}",
@@ -133,21 +144,20 @@ def call_ai_agent(
         "Accept": "application/json",
     }
 
-    print(
-        f"[AI] CALL | agent={agent_key} | model={config['model_id']} | "
-        f"endpoint={config['url']}"
-    )
+    if is_rca:
+        print('[AI] CALL | agent=Ajan_2_RCA_Expert')
+    else:
+        print(
+            f"[AI] CALL | agent={agent_key} | model={config['model_id']} | "
+            f"endpoint={config['url']}"
+        )
 
     start = time.time()
+    session = None
     try:
         session = requests.Session()
         if config["family"] == "qwen":
             session.trust_env = False
-        #print("ANALİZ...")    
-        #print(config["url"])
-        #print(headers)
-        #print(payload)
-        #print("ANALİZ SONU...")   
         response = session.post(
             config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
         )
@@ -161,7 +171,8 @@ def call_ai_agent(
 
         duration = time.time() - start
         if response.status_code != 200:
-            error = f"API Hatası ({response.status_code}): {response.text[:500]}"
+            error = (f'RCA API error ({response.status_code})' if is_rca
+                     else f"API Hatası ({response.status_code}): {response.text[:500]}")
             print(f"[AI] FAIL | agent={agent_key} | duration={duration:.2f}s | {error}")
             return _result(error, duration, return_usage)
 
@@ -175,6 +186,9 @@ def call_ai_agent(
             "total_tokens": usage.get("total_tokens", 0) or 0,
             "finish_reason": finish_reason,
         }
+        if is_rca:
+            usage_info = safe_usage({**usage, 'finish_reason': finish_reason})
+            finish_reason = usage_info['finish_reason']
         print(
             f"[AI] SUCCESS | agent={agent_key} | duration={duration:.2f}s | "
             f"tokens={usage_info['total_tokens']} | finish_reason={finish_reason}"
@@ -185,6 +199,9 @@ def call_ai_agent(
 
     except Exception as exc:
         duration = time.time() - start
-        error = f"Bağlantı Hatası: {exc}"
-        print(f"[AI] CONNECTION_ERROR | agent={agent_key} | duration={duration:.2f}s | {exc}")
+        error = 'RCA connection error' if is_rca else f"Bağlantı Hatası: {exc}"
+        print(f"[AI] CONNECTION_ERROR | agent={agent_key} | duration={duration:.2f}s | {error}")
         return _result(error, duration, return_usage)
+    finally:
+        if session is not None:
+            session.close()

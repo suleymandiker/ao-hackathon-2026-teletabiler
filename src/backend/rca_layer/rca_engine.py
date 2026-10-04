@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 import os
-import re
 from typing import Any, Dict, Iterable, List
 
-from ai_engine import call_ai_agent, load_prompt
+from ai_engine import call_ai_agent, load_prompt, safe_usage, MODELS_CONFIG
+from rca_layer.evidence import RCAEvidenceSelector, EvidenceBudgetError, serialize
+from rca_layer.expert_output import RCAExpertOutputValidator, ExpertOutputError, response_format
 
 
 class DeterministicRCAEngine:
@@ -68,32 +68,8 @@ class DeterministicRCAEngine:
         return results
 
 
-def _extract_json(text: str) -> Dict[str, Any] | None:
-    if not text:
-        return None
-    cleaned = text.strip()
-    cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\\s*```$", "", cleaned)
-    try:
-        value = json.loads(cleaned)
-        return value if isinstance(value, dict) else None
-    except Exception:
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                value = json.loads(cleaned[start:end + 1])
-                return value if isinstance(value, dict) else None
-            except Exception:
-                pass
-    return None
-
-
 class ExpertRCAEngine:
-    """Deterministik RCA + tüm case için tek Qwen uzman yorumu.
-
-    Qwen karar üretmez; deterministik pipeline'ın oluşturduğu olayları ve kanıtları
-    yorumlar. Qwen erişilemezse pipeline deterministik RCA ile devam eder.
-    """
+    """Deterministic RCA plus one bounded, validated expert interpretation per case."""
 
     def __init__(self, enabled: bool = True, max_incidents: int = 5):
         self.enabled = enabled
@@ -101,119 +77,48 @@ class ExpertRCAEngine:
         self.base = DeterministicRCAEngine()
         self.last_case_analysis: Dict[str, Any] | None = None
         self.last_ai_error: str | None = None
+        self.last_expert_diagnostics: Dict[str, Any] = {}
 
-    @staticmethod
-    def _compact_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "signal_id": signal.get("signal_id"),
-            "template": str(signal.get("template", ""))[:220],
-            "count": signal.get("count"),
-            "severity_min": signal.get("severity_min"),
-            "qualification_score": signal.get("qualification_score"),
-            "scope": signal.get("scope"),
-            "service_name": signal.get("service_name"),
-            "component": signal.get("component"),
-            "host": signal.get("host"),
-            "alarm_type": signal.get("alarm_type"),
-            "source_severity_max": signal.get("source_severity_max"),
-            "data_centers": signal.get("data_centers", []),
-            "racks": signal.get("racks", []),
-            "evidence": signal.get("qualification_evidence", []),
-        }
-
-    def analyze(
-        self,
-        incidents: Iterable[Dict[str, Any]],
-        correlations: Iterable[Dict[str, Any]],
-        signals: Iterable[Dict[str, Any]] = (),
-    ) -> List[Dict[str, Any]]:
-        incidents = list(incidents)
-        correlations = list(correlations)
-        signals = list(signals)
+    def analyze(self, incidents: Iterable[Dict[str, Any]], correlations: Iterable[Dict[str, Any]],
+                signals: Iterable[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
+        incidents, correlations, signals = list(incidents), list(correlations), list(signals)
         self.last_case_analysis = None
         self.last_ai_error = None
-
+        self.last_expert_diagnostics = {}
         base_results = self.base.analyze(incidents, correlations, signals)
-
-        if not self.enabled:
-            print("[RCA] Qwen uzman analizi devre dışı; deterministik RCA kullanılıyor.")
+        if not self.enabled or not incidents:
             return base_results
-        if not incidents:
-            print("[RCA] Olay adayı yok; Qwen çağrısı yapılmadı.")
-            return base_results
-
-        selected_incidents = incidents[:self.max_incidents]
-        selected_ids = {
-            sid
-            for incident in selected_incidents
-            for sid in incident.get("signal_ids", [])
-        }
-        signal_map = {s["signal_id"]: s for s in signals}
-        selected_signals = [
-            self._compact_signal(signal_map[sid])
-            for sid in selected_ids
-            if sid in signal_map
-        ][:20]
-        selected_edges = [
-            edge for edge in correlations
-            if edge.get("source") in selected_ids and edge.get("target") in selected_ids
-        ][:30]
-
-        payload = {
-            "olaylar": [{
-                "incident_id": inc.get("incident_id"),
-                "severity_min": inc.get("severity_min"),
-                "confidence": inc.get("confidence"),
-                "event_count": inc.get("event_count"),
-                "signal_count": inc.get("signal_count"),
-                "signal_ids": inc.get("signal_ids", []),
-                "probable_root": inc.get("probable_root", {}),
-                "context": {
-                    "services": (inc.get("context", {}) or {}).get("services", []),
-                    "hosts": (inc.get("context", {}) or {}).get("hosts", [])[:12],
-                    "data_centers": (inc.get("context", {}) or {}).get("data_centers", []),
-                    "racks": (inc.get("context", {}) or {}).get("racks", []),
-                    "business_criticalities": (inc.get("context", {}) or {}).get("business_criticalities", []),
-                    "dependencies": (inc.get("context", {}) or {}).get("dependencies", [])[:12],
-                },
-            } for inc in selected_incidents],
-            "sinyaller": selected_signals,
-            "korelasyonlar": selected_edges,
-            "deterministik_rca": base_results,
-        }
-
-        print(
-            f"[RCA] Qwen uzman case analizi başlatılıyor | "
-            f"olay={len(selected_incidents)} | sinyal={len(selected_signals)} | "
-            f"korelasyon={len(selected_edges)}"
-        )
-        reply, duration, usage = call_ai_agent(
-            "Ajan_2_RCA_Expert",
-            load_prompt("rca_expert.md"),
-            json.dumps(payload, ensure_ascii=False),
-            temperature=0.0,
-            max_tokens=max(256, min(1600, int(os.getenv("QWEN_RCA_MAX_TOKENS", "1400")))),
-            response_format={"type": "json_object"},
-            return_usage=True,
-        )
-        parsed = _extract_json(reply)
-        # Gateway/API errors are JSON too; they are not a successful RCA response.
-        if parsed and not any(k in parsed for k in ("durum_ozeti", "kok_neden_hipotezi", "guven", "nedensellik_durumu")):
-            parsed = None
-
-        if parsed:
-            self.last_case_analysis = {
-                **parsed,
-                "analysis_source": "qwen_uzman",
-                "analysis_model": "saka__glm-53-flash-dynamo-saka",
-                "ai_usage": usage,
-                "ai_duration_seconds": round(duration, 3),
-            }
+        try:
+            prompt, schema = load_prompt('rca_expert.md'), response_format()
+            overhead = prompt + serialize(schema)
+            pack = RCAEvidenceSelector().build(incidents, correlations, signals, base_results,
+                max_incidents=self.max_incidents, overhead_chars=len(overhead), overhead_bytes=len(overhead.encode('utf-8')))
+            self.last_expert_diagnostics = dict(pack.diagnostics)
+            print('[RCA CONTEXT] ' + ' | '.join(f'{key}={value}' for key, value in pack.diagnostics))
+            reply, duration, usage = call_ai_agent(
+                'Ajan_2_RCA_Expert', prompt, pack.serialized, temperature=0.0,
+                max_tokens=max(256, min(1600, int(os.getenv('QWEN_RCA_MAX_TOKENS', '1400')))),
+                response_format=schema, return_usage=True)
+            usage = safe_usage(usage)
+            duration = duration if type(duration) in (int, float) and 0 <= duration < float('inf') else 0.0
+            self.last_expert_diagnostics.update(usage, duration_seconds=round(duration, 3))
+            print('[RCA AI] ' + ' | '.join(f'{key}={value}' for key, value in usage.items()) + f' | duration={duration:.3f}s')
+            parsed = RCAExpertOutputValidator().validate(reply, pack, usage['finish_reason'])
+            self.last_case_analysis = dict(parsed, analysis_source='qwen_uzman', ai_usage=usage,
+                                          analysis_model=MODELS_CONFIG['Ajan_2_RCA_Expert']['model_id'],
+                                          ai_duration_seconds=round(duration, 3),
+                                          expert_diagnostics=dict(self.last_expert_diagnostics))
+            # Retain the existing supported/unsupported annotation, without
+            # changing any deterministic candidates, scores, evidence or ordering.
             for result in base_results:
-                result["analysis_source"] = "qwen_destekli"
-            print(f"[RCA] Qwen uzman case analizi tamamlandı | sure={duration:.2f}s")
-        else:
-            self.last_ai_error = str(reply)[:500]
-            print(f"[RCA] Qwen çıktısı kullanılamadı; deterministik RCA korunuyor | {self.last_ai_error}")
-
+                result['analysis_source'] = 'qwen_destekli'
+        except (EvidenceBudgetError, ExpertOutputError) as error:
+            self.last_ai_error = 'Uzman RCA kabul edilmedi; deterministik RCA korunuyor.'
+            self.last_expert_diagnostics['status'] = str(error)
+            print('[RCA] expert_rejected; deterministic RCA retained')
+        except Exception:
+            # No raw gateway reply, template, mapping, URL or exception body in logs.
+            self.last_ai_error = 'Uzman RCA tamamlanamadı; deterministik RCA korunuyor.'
+            self.last_expert_diagnostics['status'] = 'expert_unavailable'
+            print('[RCA] expert_unavailable; deterministic RCA retained')
         return base_results
