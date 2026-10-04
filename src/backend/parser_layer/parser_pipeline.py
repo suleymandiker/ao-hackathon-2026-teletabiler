@@ -10,6 +10,7 @@ from parser_layer.parsers.positional_structured_parser import PositionalStructur
 from parser_layer.parsers.plain_text_parser import PlainTextParser
 from parser_layer.parsers.policy_parser import PolicyParser
 from parser_layer.canonical_event_builder import CanonicalEventBuilder
+from parser_layer.contracts import Delivery, ParseOutcome, Recognition
 from parser_layer.policy.policy_registry import ParserPolicyRegistry
 from parser_layer.policy.policy_discovery import ParserPolicyDiscovery
 
@@ -124,8 +125,15 @@ class ParserPipeline:
         }
 
     def process(self, event):
+        """Return the existing canonical payload without outcome metadata."""
+        return self.process_with_outcome(event).event
+
+    def process_with_outcome(self, event) -> ParseOutcome:
+        """Describe the existing parse path without changing extraction or routing."""
         if not event or not event.strip():
-            return None
+            return ParseOutcome(
+                None, Recognition.EMPTY_INPUT, Delivery.IGNORED, None, "empty_input"
+            )
 
         t0 = time.perf_counter()
         format_type = "safe_fallback"
@@ -133,19 +141,23 @@ class ParserPipeline:
         try:
             format_type = self.detector.detect(event)
             parser = self.parsers.get(format_type, self.parsers["plain_text"])
+            parser_id = format_type if format_type in self.parsers else "plain_text"
 
             # A learned policy is consulted only for unknown/plain-text events and is
             # already resident in RAM. No hash/SQLite/AI operation occurs here.
             if format_type == "plain_text" and self.custom_parser is not None:
+                parser_id = "custom"
                 fields = self.custom_parser.parse(event)
                 if not fields:
                     fields = self.parsers["plain_text"].parse(event)
                     parser_fallback = True
+                    parser_id = "plain_text"
             else:
                 fields = parser.parse(event)
                 if not fields and format_type != "plain_text":
                     fields = self.parsers["plain_text"].parse(event)
                     parser_fallback = True
+                    parser_id = "plain_text"
 
             # Zero-loss safe fallback: a meaningful logical event must remain
             # representable without inventing timestamp or severity.
@@ -157,6 +169,7 @@ class ParserPipeline:
                     "attributes": {},
                 }
                 parser_fallback = True
+                parser_id = "safe_fallback"
 
             result = self.builder.build(fields, event, format_type)
 
@@ -168,12 +181,27 @@ class ParserPipeline:
                     format_type,
                     parser_fallback,
                 )
-            return result
+            if parser_fallback:
+                recognition, reason_code = None, "no_fields"
+            elif parser_id == "plain_text":
+                recognition, reason_code = Recognition.PLAIN_TEXT, "plain_text_unclassified"
+            elif parser_id == "custom":
+                # Preserve legacy injected parsers without inventing a Phase 1 category.
+                recognition, reason_code = None, "custom_parser_result"
+            else:
+                recognition, reason_code = Recognition.BUILTIN_RECOGNIZED, None
+            return ParseOutcome(
+                result,
+                recognition,
+                Delivery.FALLBACK if parser_fallback else Delivery.PARSED,
+                parser_id,
+                reason_code,
+            )
         except Exception as exc:
             logger.exception(
                 "[PARSER] deterministic parse failed; preserving raw event: %s", exc
             )
-            return self.builder.build(
+            result = self.builder.build(
                 {
                     "timestamp": None,
                     "severity": None,
@@ -182,4 +210,8 @@ class ParserPipeline:
                 },
                 event,
                 "safe_fallback",
+            )
+            return ParseOutcome(
+                result, Recognition.PARSER_ERROR, Delivery.FALLBACK,
+                "safe_fallback", "processing_exception",
             )
