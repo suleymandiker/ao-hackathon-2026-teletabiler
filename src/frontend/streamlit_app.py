@@ -3,6 +3,7 @@ import csv, io, json, os, sys, tempfile
 from datetime import datetime
 from html import escape
 from pathlib import Path
+from threading import Lock
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,6 +13,7 @@ if str(BACKEND) not in sys.path:
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from full_pipeline_v2 import FullAIOpsPipelineV2
+import opensearch_application as openshift
 import theme as ui
 
 st.set_page_config(page_title='AOP • Açıklanabilir SRE Zekâsı', page_icon='◈', layout='wide')
@@ -21,6 +23,12 @@ st.markdown(ui.CSS, unsafe_allow_html=True)
 def get_pipeline():
     # Keşif: DeepSeek. Olay/RCA yorumu: Qwen. Qwen başarısız olsa bile deterministik RCA korunur.
     return FullAIOpsPipelineV2(use_ai_rca=True)
+
+@st.cache_resource
+def get_analysis_lock():
+    # The cached pipeline is single-owner; serialize uploads and source analyses
+    # without caching any client, cursor, segmentation session or event buffers.
+    return Lock()
 
 ALARM_SEVERITY = {
     1: "INFO",
@@ -126,17 +134,60 @@ with st.sidebar:
     html(ui.side_label('Görünüm'))
     page = st.selectbox('Görünüm', ['Operasyon Analizi', 'Katman İzleme'], key='view', label_visibility='collapsed')
 
-    html(ui.side_label('Veri Paketi'))
-    upload = st.file_uploader(
-        'Hackathon veri paketini seç', type=['zip','csv','json','txt','md','log'],
-        label_visibility='collapsed',
-        help='Önerilen: alarms.json + host_inventory.csv + service_dependencies.csv içeren tek ZIP. Tekil dosyalar geriye dönük desteklenir.')
-    st.caption('Önerilen: ZIP paket • Ayrıca CSV / JSON / TXT / MD / LOG')
-    run = st.button('◈  Analizi Başlat', type='primary', width='stretch')
+    source = st.radio('Analiz kaynağı', ['Dosya / paket', 'OpenShift logları'], key='analysis_source')
+    upload = None
+    request = selected_policy = None
+    if source == 'Dosya / paket':
+        html(ui.side_label('Veri Paketi'))
+        upload = st.file_uploader(
+            'Hackathon veri paketini seç', type=['zip','csv','json','txt','md','log'],
+            label_visibility='collapsed',
+            help='Önerilen: alarms.json + host_inventory.csv + service_dependencies.csv içeren tek ZIP. Tekil dosyalar geriye dönük desteklenir.')
+        st.caption('Önerilen: ZIP paket • Ayrıca CSV / JSON / TXT / MD / LOG')
+    else:
+        html(ui.side_label('OpenShift Logları'))
+        connection = None
+        try:
+            connection = openshift.load_connection()
+            st.caption(openshift.safe_text(f'Kaynak: {connection.source_scope} | İndeks: {connection.index_expression}', connection))
+            st.caption('TLS doğrulaması: ' + ('açık' if connection.verify_certs else 'kapalı'))
+        except openshift.ApplicationError as error:
+            st.error(openshift.error_message(error))
+        namespace = st.text_input('Namespace', value=os.environ.get('OPENSEARCH_SMOKE_NAMESPACE', ''), key='os_namespace')
+        workload = st.text_input('Uygulama / workload', value=os.environ.get('OPENSEARCH_SMOKE_WORKLOAD', ''), key='os_workload')
+        container = st.text_input('Container (isteğe bağlı)', value=os.environ.get('OPENSEARCH_SMOKE_CONTAINER', ''), key='os_container')
+        lookback = st.number_input('Geriye bakış (dakika)', min_value=1, max_value=openshift.MAX_LOOKBACK_MINUTES, value=15, key='os_lookback')
+        end_text = st.text_input('Bitiş zamanı (isteğe bağlı, saat dilimli ISO)', key='os_end',
+                                 help='Boş bırakılırsa analiz başlangıcındaki zaman kullanılır. Örnek: 2026-10-04T12:00:00+03:00')
+        page_size = st.number_input('Sayfa başına kayıt', min_value=1, max_value=openshift.MAX_PAGE_SIZE, value=100, key='os_page_size')
+        max_pages = st.number_input('En fazla sayfa', min_value=1, max_value=openshift.MAX_PAGES, value=3, key='os_max_pages')
+        policies = ()
+        try:
+            policies = openshift.list_verified_policies()
+        except openshift.ApplicationError as error:
+            st.error(openshift.error_message(error))
+        by_id = {policy.selection_id: policy for policy in policies}
+        policy_id = st.selectbox('Doğrulanmış sınır politikası', list(by_id), index=None,
+                                 placeholder='Politika seçin', key='os_policy')
+        selected_policy = by_id.get(policy_id)
+        if selected_policy is None:
+            st.warning(openshift.MESSAGES['no_policy'])
+        st.caption('Seçilen politika bu sorgudaki tüm log akışlarına uygulanır. Log formatına uygun politikayı seçin.')
+        if connection:
+            try:
+                request = openshift.make_request(namespace, workload, container, lookback, page_size, max_pages, end_text)
+                st.caption(openshift.safe_text(
+                    f'{request.start.isoformat()} ≤ zaman < {request.end.isoformat()} | '
+                    f'{namespace} / {workload} | Container: {container or "tümü"} | '
+                    f'En fazla {max_pages} sayfa / {page_size * max_pages} kayıt', connection))
+            except openshift.ApplicationError as error:
+                st.info(openshift.error_message(error))
+    run = st.button('◈  Analizi Başlat', type='primary', width='stretch',
+                    disabled=source == 'OpenShift logları' and (request is None or selected_policy is None))
 
     html(ui.side_label('Model Yönlendirmesi'))
     html(
-        ui.pill('Keşif · DeepSeek', 'info')
+        ui.pill('Doğrulanmış sınır politikası' if source == 'OpenShift logları' else 'Keşif · DeepSeek', 'info')
         + ui.pill('RCA yorumu · Qwen', 'yellow')
         + ui.pill('Karar motoru · Deterministik', 'good')
     )
@@ -150,23 +201,59 @@ html(ui.hero(
     [('9 katmanlı pipeline', 'yellow'), ('XAI karar izi', 'info'), ('İnsan onaylı aksiyon', 'good')],
 ))
 
-if run and upload:
-    try:
-        with st.spinner('Loglar analiz ediliyor...'):
-            st.session_state['result'] = run_uploaded(upload)
-    except Exception as e:
-        st.exception(e)
+if run and (upload or source == 'OpenShift logları'):
+    lock = get_analysis_lock()
+    if not lock.acquire(blocking=False):
+        st.warning(openshift.MESSAGES['busy'])
+    else:
+        # A failed/no-data invocation must not masquerade as an earlier success.
+        st.session_state.pop('result', None)
+        st.session_state.pop('result_source', None)
+        try:
+            with st.spinner('Loglar analiz ediliyor...'):
+                if source == 'Dosya / paket':
+                    st.session_state['result'] = run_uploaded(upload)
+                else:
+                    st.session_state['result'] = openshift.run_analysis(get_pipeline, request, selected_policy)
+                st.session_state['result_source'] = source
+        except Exception as error:
+            if source == 'Dosya / paket':
+                st.exception(error)
+            elif isinstance(error, openshift.ApplicationError) and error.code == 'no_records':
+                st.info(openshift.error_message(error))
+            else:
+                st.error(openshift.error_message(error))
+        finally:
+            lock.release()
 
-result = st.session_state.get('result')
+result = st.session_state.get('result') if st.session_state.get('result_source', 'Dosya / paket') == source else None
 if not result:
     html(ui.empty_state(
         'Analiz bekleniyor',
+        'OpenShift filtrelerini ve doğrulanmış politikayı seçip “Analizi Başlat” düğmesine basın.' if source == 'OpenShift logları' else
         'Üç ana dosyayı içeren ZIP paketini soldan yükleyip “Analizi Başlat” düğmesine basın. '
         'Paket içindeki inventory ve service dependency verileri korelasyon/RCA bağlamında kullanılır.'))
     st.stop()
 
 stats=result.get('stats',{}); signals=result.get('signals',[]); qualified=result.get('qualified_signals',[]); correlations=result.get('correlations',[]); incidents=result.get('incidents',[]); rca=result.get('rca',[]); plans=result.get('plans',[]); case_analysis=result.get('case_analysis') or {}; case_error=result.get('case_analysis_error'); signal_by_id=smap(signals)
 unique_templates=len({s.get('template_id') for s in signals if s.get('template_id')})
+
+if source == 'OpenShift logları':
+    summary = result['source_summary']
+    html(ui.section('Kaynak Özeti', f'{summary["start"]} ≤ zaman < {summary["end"]}'))
+    html(ui.kpi_grid([
+        ui.kpi('Sayfa', summary['pages_read']), ui.kpi('Fiziksel kayıt', summary['records_read']),
+        ui.kpi('Log olayı', summary['assembled_events']), ui.kpi('Olay üreten akış', summary['assembled_stream_count']),
+        ui.kpi('Birleştirilmeyen kayıt', summary['unassembled_count']),
+    ]))
+    if summary['budget_reached']:
+        st.warning('Analiz sayfa sınırına ulaştı. Bu sonuç yalnız okunan sınırlı örneği kapsar; aralıkta başka kayıtlar olabilir.')
+    else:
+        st.caption('Seçilen aralığın mevcut arama görünümü tükendi; geç gelen kayıtlar bu analize dahil değildir.')
+    if summary['unassembled_by_reason']:
+        with st.expander('Birleştirilmeyen kayıt nedenleri'):
+            st.dataframe([{'Neden': reason, 'Adet': count} for reason, count in summary['unassembled_by_reason'].items()],
+                         width='stretch', hide_index=True)
 
 # --------------------------------------------------------------- Veri paketi
 package_summary=result.get('package_summary') or {}
@@ -242,6 +329,10 @@ if page == 'Katman İzleme':
             'output': (len(plans), 'inceleme planı', 'Operatörün değerlendirebileceği açıklanabilir sonraki adımlar.'),
         },
     }
+    if source == 'OpenShift logları':
+        layer_info['1 • Segmentasyon']['input'] = (result['source_summary']['records_read'], 'fiziksel kayıt', 'Sınırlı OpenShift log örneği')
+        layer_info['1 • Segmentasyon']['decision'] = ('Doğrulanmış politika', 'Akış başına multiline birleştirme',
+                                                     'Seçilen mevcut politika uygulanır; bu kaynak yolunda canlı format keşfi yapılmaz.')
     info=layer_info[layer]
     c1,arrow1,c2,arrow2,c3=st.columns([1,.10,1,.10,1])
     with c1: html(ui.trace_card('GİRDİ', *info['input']))
@@ -251,7 +342,9 @@ if page == 'Katman İzleme':
     with c3: html(ui.trace_card('ÇIKTI', *info['output']))
 
     html(ui.section('Katman Kanıtı', 'Aşağıdaki kayıtlar yukarıdaki kararın gerçek pipeline çıktısındaki karşılığını gösterir.'))
-    if layer.startswith('1'):
+    if source == 'OpenShift logları' and layer.startswith(('1', '2', '3')):
+        st.info('OpenShift görünümünde ham loglar ve kayıt bazlı kaynak kanıtı gösterilmez. Katman sayaçları yukarıdadır.')
+    elif layer.startswith('1'):
         st.dataframe(seg.get('items',[]), width='stretch', hide_index=True)
     elif layer.startswith('2'):
         st.dataframe(par.get('items',[]), width='stretch', hide_index=True)
