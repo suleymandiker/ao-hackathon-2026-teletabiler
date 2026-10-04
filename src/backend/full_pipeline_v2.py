@@ -1,5 +1,9 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+from dataclasses import asdict
+from typing import Any, Dict, Iterable, List
+from ingestion_layer.contracts import IngestedLogRecord, SourcePage
+from segmentation_layer.contracts import AssembledEvent, UnassembledRecord
+from segmentation_layer.segmentation_session import PolicyProvider, SegmentationSession
 from segmentation_layer.segmentation_pipeline import SegmentationPipeline
 from parser_layer.parser_pipeline import ParserPipeline
 from template_layer.template_pipeline import TemplatePipeline
@@ -82,15 +86,136 @@ class FullAIOpsPipelineV2:
     def process_file(self, path: str, *, topology=None) -> Dict[str,Any]:
         # Raw analyses use only their explicitly supplied context.
         self.downstream.set_context(topology)
+        return self._process_logical_events(self.segmenter.iter_events(path))
+
+    def process_ingested_pages(
+        self,
+        pages: Iterable[SourcePage],
+        *,
+        policy_provider: PolicyProvider,
+        topology=None,
+    ) -> Dict[str, Any]:
+        """Analyze one caller-bounded, finite sequence of already acquired pages.
+
+        The caller supplies Phase 3's deterministic prevalidated policy binding;
+        this path never prepares/discovers segmentation or parser policies.
+        Existing resident parser configuration and template learning are reused.
+        Input is consumed once, in supplied order, without cursor interpretation,
+        sorting or deduplication. Iterable exhaustion is explicit analysis end.
+
+        One local session emits events in completion order, followed by close
+        tails in first-seen stream order. Dispositions are counted with the first
+        200 diagnostic samples, matching the existing trace budget. Every parsed
+        event carries source_provenance in attributes; an ordered event_provenance
+        list preserves all assembled-event evidence beyond trace/aggregate samples.
+        A None event_id in that list means the parser returned no canonical event.
+
+        Pages/emitted AssembledEvents are not retained as an input history, but
+        the existing batch downstream, result provenance and one pending event
+        per stream consume memory proportional to the supplied finite analysis.
+        This is not a continuous or byte-bounded processing API.
+
+        On failure, pending session state is released and the error propagates;
+        there is no partial success, replay or rollback of template learning.
+        Explicit topology is applied for this invocation and cleared on exit.
+        Like the existing pipeline, an instance is not a concurrent request API.
+        """
+        session = SegmentationSession(policy_provider)
+        diagnostics = {
+            'pages_read': 0, 'records_read': 0,
+            'unassembled_count': 0, 'unassembled_by_reason': {},
+            'sample_limit': 200, 'unassembled_samples': [],
+        }
+        event_provenance = []
+
+        def logical_events():
+            for page in pages:
+                if not isinstance(page, SourcePage):
+                    raise TypeError('pages must contain SourcePage objects')
+                diagnostics['pages_read'] += 1
+                diagnostics['records_read'] += len(page.records)
+                for output in session.feed_page(page):
+                    if isinstance(output, UnassembledRecord):
+                        diagnostics['unassembled_count'] += 1
+                        reasons = diagnostics['unassembled_by_reason']
+                        reasons[output.reason] = reasons.get(output.reason, 0) + 1
+                        samples = diagnostics['unassembled_samples']
+                        if len(samples) < diagnostics['sample_limit']:
+                            samples.append({
+                                'reason': output.reason,
+                                'stream_key': asdict(output.stream_key) if output.stream_key else None,
+                                'framing': output.record.framing.value,
+                                'record': self._record_provenance(output.record),
+                            })
+                    else:
+                        yield output
+            yield from session.close()
+
+        events = logical_events()
+        try:
+            self.downstream.set_context(topology)
+            result = self._process_logical_events(events, event_provenance=event_provenance)
+        finally:
+            events.close()
+            if not session.closed:
+                session.close()
+            self.downstream.set_context(None)
+        result['ingestion_diagnostics'] = diagnostics
+        result['event_provenance'] = event_provenance
+        return result
+
+    @staticmethod
+    def _record_provenance(record: IngestedLogRecord) -> Dict[str, Any]:
+        # An explicit acquisition-evidence allowlist: never copy raw text,
+        # arbitrary metadata, configuration, policy values or page cursors.
+        return {
+            'source_reference': asdict(record.source_reference),
+            'source_timestamp_raw': record.source_timestamp_raw,
+            'source_timestamp': record.source_timestamp.isoformat() if record.source_timestamp else None,
+            'retrieval_order': record.retrieval_order,
+            'first_observed_at': record.first_observed_at.isoformat() if record.first_observed_at else None,
+        }
+
+    def _assembled_provenance(self, assembled: AssembledEvent) -> Dict[str, Any]:
+        return {
+            'stream_key': asdict(assembled.stream_key),
+            'emission_reason': assembled.emission_reason,
+            'contributors': [
+                {**self._record_provenance(record), 'ordinal': evidence.ordinal, 'included': evidence.included}
+                for record, evidence in zip(assembled.records, assembled.evidence)
+            ],
+        }
+
+    def _process_logical_events(
+        self, logical_events: Iterable[str | AssembledEvent], *, event_provenance=None,
+    ) -> Dict[str, Any]:
+        """Shared existing parser/template/downstream flow; no policy preparation."""
         templated: List[Dict[str,Any]]=[]
         trace_limit = 200
         trace = {'segmentation': [], 'parser': [], 'template': []}
         stats={'segmented':0,'parsed':0,'templated':0,'template_unreliable':0}
-        for raw in self.segmenter.iter_events(path):
+        for logical in logical_events:
+            raw = logical.text if isinstance(logical, AssembledEvent) else logical
             stats['segmented']+=1
             if len(trace['segmentation']) < trace_limit:
                 trace['segmentation'].append(raw)
             event=self.parser.process(raw)
+            if isinstance(logical, AssembledEvent):
+                provenance = self._assembled_provenance(logical)
+                event_provenance.append({'event_id': event.get('event_id') if event else None,
+                                         'provenance': provenance})
+                if event:
+                    # Attach diagnostics AFTER the builder has assigned identity.
+                    # Preserve source attributes on collision, using the same
+                    # source_ backup convention as CanonicalEventBuilder.
+                    attributes = dict(event.get('attributes') or {})
+                    if 'source_provenance' in attributes:
+                        backup = 'source_source_provenance'
+                        while backup in attributes:
+                            backup = 'source_' + backup
+                        attributes[backup] = attributes['source_provenance']
+                    attributes['source_provenance'] = provenance
+                    event = dict(event, attributes=attributes)
             if not event: continue
             stats['parsed']+=1
             if len(trace['parser']) < trace_limit:
