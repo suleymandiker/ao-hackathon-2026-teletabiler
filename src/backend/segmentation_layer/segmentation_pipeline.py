@@ -126,11 +126,6 @@ class SegmentationPipeline:
         self.validator = RegexValidator()
         self.assembler = MultilineAssembler()
         self.policy_registry = SegmentationPolicyRegistry(db_path=registry_path)
-        try:
-            from parser_layer.parser_pipeline import ParserPipeline
-            self.parser = ParserPipeline()
-        except ImportError:
-            self.parser = None
         self.last_result: Dict[str, Any] = {}
 
     def prepare(self, file_path: str, force_rediscovery: bool = False) -> Dict[str, Any]:
@@ -153,7 +148,9 @@ class SegmentationPipeline:
                     f"[SEGMENTATION] POLICY FOUND | registry={level} | "
                     f"signature={signature} | AI=0"
                 )
+                print(f"prepare_result={policy} | AI=0")
                 return result
+            
 
         ai_calls = 0
         token_usage: Dict[str, Any] = {}
@@ -593,6 +590,35 @@ class SegmentationPipeline:
     def iter_events(self, file_path: str, force_rediscovery: bool = False) -> Iterator[str]:
         result = self.prepare(file_path, force_rediscovery=force_rediscovery)
         if not result.get("verified"):
+            
+            event_header_regex = str(result["regex"])
+
+            print("=== SEGMENTATION DEBUG ===", flush=True)
+            print("file_path:", file_path, flush=True)
+            print("regex repr:", repr(event_header_regex), flush=True)
+
+            rx = re.compile(event_header_regex)
+
+            physical_lines = 0
+            regex_matches = 0
+            first_matches = []
+
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for i, line in enumerate(f, 1):
+                    physical_lines += 1
+
+                    if rx.match(line):
+                        regex_matches += 1
+
+                        if len(first_matches) < 5:
+                            first_matches.append((i, line[:150]))
+
+            print("physical_lines:", physical_lines, flush=True)
+            print("regex_matches:", regex_matches, flush=True)
+            print("first_matches:", first_matches, flush=True)
+            print("=== SEGMENTATION DEBUG COMPLETE ===", flush=True)
+            
+
             raise RuntimeError(
                 "Segmentation verification failed; refusing to use an unverified policy. "
                 + str(result.get("reason", "unknown reason"))
@@ -606,7 +632,6 @@ class SegmentationPipeline:
         return self.validator.validate(
             file_path,
             regex,
-            parser_fn=(self.parser.process if self.parser else None),
         )
 
     @staticmethod
