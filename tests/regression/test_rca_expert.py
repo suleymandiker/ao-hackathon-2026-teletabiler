@@ -208,7 +208,8 @@ def test_budget_failure_skips_gateway_and_preserves_deterministic_result(isolate
 def fake_gateway(monkeypatch, gateway, responses):
     module, call = gateway
     monkeypatch.setitem(module.MODELS_CONFIG, 'Ajan_2_RCA_Expert',
-                        dict(url='https://example.invalid', key='synthetic-api-key', model_id='test-model', family='qwen'))
+                        dict(module.MODELS_CONFIG['Ajan_2_RCA_Expert'],
+                             url='https://example.invalid', key='synthetic-api-key', model_id='test-model'))
     monkeypatch.setattr(module, 'QWEN_RCA_ENABLE_THINKING', False)
     monkeypatch.setattr(module, 'QWEN_RCA_INCLUDE_REASONING', False)
     requests = []
@@ -222,7 +223,13 @@ def fake_gateway(monkeypatch, gateway, responses):
             response = responses.pop(0)
             if isinstance(response, Exception):
                 raise response
-            return SimpleNamespace(status_code=response[0], text='Authorization: synthetic-api-key', json=lambda: response[1])
+
+            def body():
+                if isinstance(response[1], Exception):
+                    raise response[1]
+                return response[1]
+
+            return SimpleNamespace(status_code=response[0], text='Authorization: synthetic-api-key', json=body)
 
         def close(self):
             closed.append(True)
@@ -236,19 +243,111 @@ def response_body(finish='stop', reply=None):
                 usage={'prompt_tokens': 101, 'completion_tokens': 42, 'total_tokens': 143})
 
 
-def test_schema_and_false_reasoning_flags_survive_400_fallback(isolated, gateway, monkeypatch, capsys):
+@pytest.mark.parametrize('failures', [0, 1])
+def test_current_deployment_schema_and_thinking_survive_fallback(isolated, gateway, monkeypatch, capsys, failures):
     from rca_layer.expert_output import response_format
-    call, requests, closed = fake_gateway(monkeypatch, gateway, [(400, {}), (200, response_body())])
-    reply, duration, usage = call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=response_format(), return_usage=True)
-    assert requests[0]['response_format']['json_schema']['strict'] is True
-    assert 'response_format' not in requests[1]
+    from rca_layer.evidence import RCAEvidenceSelector, serialize
+    errors = [dict(error=dict(type='invalid_request_error', code='unsupported_response_format', param='response_format'))]
+    call, requests, closed = fake_gateway(monkeypatch, gateway,
+        [(400, body) for body in errors[:failures]] + [(200, response_body())])
+    monkeypatch.setattr(isolated, 'call_ai_agent', call)
+    monkeypatch.setenv('QWEN_RCA_MAX_TOKENS', '2200')
+    engine = isolated.ExpertRCAEngine()
+    data = case()
+    before = deepcopy(data)
+    expected = engine.base.analyze(*data)
+    overhead = isolated.load_prompt('rca_expert.md') + serialize(response_format())
+    pack = RCAEvidenceSelector().build(*data, expected, overhead_chars=len(overhead),
+                                      overhead_bytes=len(overhead.encode('utf-8')))
+    for row in expected:
+        row['analysis_source'] = 'qwen_destekli'
+    assert engine.analyze(*data) == expected
+    assert data == before
+    assert engine.last_case_analysis['etkilenen_olaylar'] == ['real-incident']
+    assert engine.last_case_analysis['kanit_sinyal_idleri'] == ['real-signal']
+    formats = [response_format(), None]
+    assert [request.get('response_format') for request in requests] == formats[:failures + 1]
     for request in requests:
         assert request['chat_template_kwargs']['enable_thinking'] is False
-        assert request['include_reasoning'] is False
-        assert request['messages'][1]['content'] == 'evidence'
-    assert usage == dict(prompt_tokens=101, completion_tokens=42, total_tokens=143, finish_reason='stop')
+        assert 'include_reasoning' not in request
+        assert request['max_tokens'] == 1600
+        assert request['messages'][1]['content'] == pack.serialized
+        assert {key: value for key, value in request.items() if key != 'response_format'} == {
+            key: value for key, value in requests[0].items() if key != 'response_format'}
+    assert engine.last_case_analysis['ai_usage'] == dict(
+        prompt_tokens=101, completion_tokens=42, total_tokens=143, finish_reason='stop')
     assert closed == [True]
-    assert 'synthetic-api-key' not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    modes = ['json_schema', 'none'][:failures + 1]
+    for index, mode in enumerate(modes, 1):
+        detail = f'agent=Ajan_2_RCA_Expert | attempt={index} | response_mode={mode}'
+        assert f'[AI] ATTEMPT | {detail}' in output
+        status = 400 if index <= failures else 200
+        assert f'[AI] HTTP_{status} | {detail}' in output
+        if index > 1:
+            assert f'[AI] RETRY | {detail}' in output
+    assert output.count('[AI] ATTEMPT') == failures + 1
+    assert output.count('[AI] RETRY') == failures
+    for secret in ('synthetic-api-key', 'Authorization', pack.serialized, 'Database unavailable'):
+        assert secret not in output
+
+
+def test_current_deployment_capabilities_are_explicit(gateway):
+    assert gateway[0].MODELS_CONFIG['Ajan_2_RCA_Expert']['capabilities'] == {
+        'supports_enable_thinking': True, 'supports_include_reasoning': False,
+        'supports_json_object': True, 'supports_json_schema': True,
+    }
+
+
+@pytest.mark.parametrize('configured', ['false', 'true'])
+def test_unsupported_include_reasoning_is_absent_even_from_extra_body(isolated, gateway, monkeypatch, configured):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())] * 2)
+    monkeypatch.setenv('QWEN_RCA_INCLUDE_REASONING', configured)
+    monkeypatch.setattr(gateway[0], 'QWEN_RCA_INCLUDE_REASONING', configured == 'true')
+    extra = {'include_reasoning': configured == 'true', 'chat_template_kwargs': {'enable_thinking': True}}
+    original = deepcopy(extra)
+    for _ in range(2):
+        call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=response_format(), extra_body=extra)
+    assert extra == original
+    assert requests[0] == requests[1]
+    assert 'include_reasoning' not in requests[0]
+    assert requests[0]['chat_template_kwargs']['enable_thinking'] is False
+    assert requests[0]['response_format'] == response_format()
+
+
+@pytest.mark.parametrize('include_supported', [False, True])
+@pytest.mark.parametrize('configured', [False, True])
+def test_reasoning_capability_is_deployment_scoped(isolated, gateway, monkeypatch, include_supported, configured):
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())])
+    config = gateway[0].MODELS_CONFIG['Ajan_2_RCA_Expert']
+    monkeypatch.setitem(config, 'capabilities', dict(config.get('capabilities', {}),
+        supports_enable_thinking=False, supports_include_reasoning=include_supported))
+    monkeypatch.setattr(gateway[0], 'QWEN_RCA_INCLUDE_REASONING', configured)
+    extra = {'include_reasoning': True, 'chat_template_kwargs': {'enable_thinking': True, 'other_option': False}}
+    original = deepcopy(extra)
+    call('Ajan_2_RCA_Expert', 'system', 'evidence', extra_body=extra)
+    assert extra == original
+    assert requests[0]['chat_template_kwargs'] == {'other_option': False}
+    if include_supported:
+        assert requests[0]['include_reasoning'] is configured
+    else:
+        assert 'include_reasoning' not in requests[0]
+
+
+@pytest.mark.parametrize('schema_supported,object_supported', [(True, True), (False, True), (False, False)])
+def test_explicit_format_capabilities_control_first_request(isolated, gateway, monkeypatch, schema_supported, object_supported):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())])
+    config = gateway[0].MODELS_CONFIG['Ajan_2_RCA_Expert']
+    monkeypatch.setitem(config, 'capabilities', dict(config.get('capabilities', {}),
+        supports_json_schema=schema_supported, supports_json_object=object_supported))
+    schema = response_format()
+    before = deepcopy(schema)
+    call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=schema)
+    expected = schema if schema_supported else ({'type': 'json_object'} if object_supported else None)
+    assert len(requests) == 1 and requests[0].get('response_format') == expected
+    assert schema == before
 
 
 @pytest.mark.parametrize('finish', ['length', 'max_tokens'])
@@ -263,12 +362,148 @@ def test_truncated_gateway_responses_are_never_cached_or_accepted(isolated, gate
     assert requests[0]['messages'] == requests[1]['messages']
 
 
-def test_schema_fallback_still_rejects_invalid_model_output(isolated, gateway, monkeypatch):
-    call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, {}), (200, response_body(reply='{"olaylar": []}'))])
+@pytest.mark.parametrize('failures', [0, 1])
+@pytest.mark.parametrize('reply,finish', [
+    ('{"olaylar": []}', 'stop'),
+    (json.dumps(dict(answer(), kanit_referanslari=['S99'])), 'stop'),
+    (json.dumps(dict(answer(), guven=1.1)), 'stop'),
+    (json.dumps(answer()), 'length'),
+    (json.dumps(answer()), 'max_tokens'),
+])
+def test_schema_fallback_still_rejects_invalid_model_output(isolated, gateway, monkeypatch, failures, reply, finish):
+    call, requests, _ = fake_gateway(monkeypatch, gateway,
+        [(400, {'error': {'code': 'unsupported_schema'}})] * failures
+        + [(200, response_body(reply=reply, finish=finish))])
     monkeypatch.setattr(isolated, 'call_ai_agent', call)
     engine = isolated.ExpertRCAEngine()
     assert engine.analyze(*case()) == engine.base.analyze(*case())
-    assert engine.last_case_analysis is None and len(requests) == 2
+    assert engine.last_case_analysis is None and len(requests) == failures + 1
+
+
+def test_all_format_attempts_fail_and_deterministic_rca_survives(isolated, gateway, monkeypatch, capsys):
+    call, requests, closed = fake_gateway(monkeypatch, gateway,
+        [(400, {'error': {'code': 'unsupported_response_format'}}), (400, {})])
+    monkeypatch.setattr(isolated, 'call_ai_agent', call)
+    engine = isolated.ExpertRCAEngine()
+    assert engine.analyze(*case()) == engine.base.analyze(*case())
+    assert engine.last_case_analysis is None and engine.last_ai_error
+    assert len(requests) == 2 and closed == [True]
+    assert all('include_reasoning' not in request for request in requests)
+    assert engine.last_expert_diagnostics['prompt_tokens'] is None
+    assert engine.last_expert_diagnostics['finish_reason'] == 'unknown'
+    output = capsys.readouterr().out
+    assert output.count('[AI] HTTP_400') == 2
+    assert 'attempt=2 | response_mode=none' in output
+    assert 'RCA API error (400)' in output
+
+
+@pytest.mark.parametrize('param', ['include_reasoning', 'chat_template_kwargs.enable_thinking',
+                                  'model', 'max_tokens', 'temperature', 'messages'])
+def test_explicit_other_field_error_does_not_retry_formats(isolated, gateway, monkeypatch, capsys, param):
+    from rca_layer.expert_output import response_format
+    error = dict(error=dict(type='invalid_request_error', code='unsupported_parameter', param=param,
+                           message='Authorization: synthetic-api-key; private-evidence'))
+    call, requests, closed = fake_gateway(monkeypatch, gateway, [(400, error)])
+    reply, _, usage = call('Ajan_2_RCA_Expert', 'private-prompt', 'private-evidence',
+                          response_format=response_format(), return_usage=True)
+    assert reply == 'RCA API error (400)' and usage == {}
+    assert len(requests) == 1 and closed == [True]
+    output = capsys.readouterr().out
+    assert 'error_type=invalid_request_error | error_code=unsupported_parameter' in output
+    assert f'rejected_field={param.split(".")[0]}' in output
+    assert '[AI] RETRY' not in output
+    for secret in ('synthetic-api-key', 'Authorization', 'private-prompt', 'private-evidence'):
+        assert secret not in output
+
+
+@pytest.mark.parametrize('body', [
+    {'error': {'type': 'invalid_request_error', 'code': 'invalid_json_schema',
+               'param': 'response_format.json_schema.schema.properties.kanit_referanslari.maxItems'}},
+    {'detail': [{'type': 'extra_forbidden',
+                 'loc': ['body', 'response_format', 'json_schema', 'schema', 'properties', 'kanit_referanslari', 'maxItems'],
+                 'input': 'Authorization: synthetic-api-key'}]},
+])
+def test_schema_keyword_diagnostic_is_allowlisted(isolated, gateway, monkeypatch, capsys, body):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, body), (200, response_body())])
+    call('Ajan_2_RCA_Expert', 'private-prompt', 'private-evidence', response_format=response_format())
+    assert len(requests) == 1  # Invalid schema details are not proof the format is unsupported.
+    output = capsys.readouterr().out
+    assert 'rejected_field=response_format | schema_keyword=maxItems' in output
+    assert 'synthetic-api-key' not in output and 'kanit_referanslari' not in output
+
+
+@pytest.mark.parametrize('body', [
+    {'error': {'type': 'private-prompt', 'code': 'synthetic-api-key', 'param': 'Authorization',
+               'message': 'private-evidence', 'schema_keyword': 'private-keyword'}},
+    {'error': {'type': ['private-prompt'], 'code': {'private-evidence': True}, 'param': ['synthetic-api-key']}},
+    {'detail': 'Authorization: synthetic-api-key'},
+    ['private-evidence'], None, ValueError('Authorization: synthetic-api-key'),
+])
+def test_unknown_error_bodies_do_not_retry_or_leak(isolated, gateway, monkeypatch, capsys, body):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, body)])
+    reply, _ = call('Ajan_2_RCA_Expert', 'private-prompt', 'private-evidence', response_format=response_format())
+    assert reply == 'RCA API error (400)' and len(requests) == 1
+    output = capsys.readouterr().out
+    assert output.count('error_type=unknown | error_code=unknown | rejected_field=unknown | schema_keyword=unknown') == 1
+    assert '[AI] RETRY' not in output
+    for secret in ('synthetic-api-key', 'Authorization', 'private-prompt', 'private-evidence', 'private-keyword'):
+        assert secret not in output
+
+
+@pytest.mark.parametrize('field', ['include_reasoning', 'response_format', 'json_schema'])
+@pytest.mark.parametrize('envelope', ['error', 'detail', 'text'])
+def test_observed_gateway_message_identifies_only_unsupported_field(isolated, gateway, monkeypatch, capsys, field, envelope):
+    from rca_layer.expert_output import response_format
+    message = f'Validation: Unsupported parameter(s): `{field}`'
+    body = {'error': {'message': message}} if envelope == 'error' else (
+        {'detail': message} if envelope == 'detail' else message)
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, body), (200, response_body())])
+    call('Ajan_2_RCA_Expert', 'private-prompt', 'private-evidence', response_format=response_format())
+    is_format = field != 'include_reasoning'
+    assert len(requests) == (2 if is_format else 1)
+    assert all('include_reasoning' not in request for request in requests)
+    output = capsys.readouterr().out
+    assert f'rejected_field={"response_format" if is_format else field}' in output
+    assert ('[AI] RETRY' in output) is is_format
+    for secret in ('synthetic-api-key', 'Authorization', 'private-prompt', 'private-evidence'):
+        assert secret not in output
+
+
+@pytest.mark.parametrize('status', [401, 403, 422, 429, 500])
+def test_non_400_errors_do_not_retry(isolated, gateway, monkeypatch, capsys, status):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(status, {})])
+    reply, _ = call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=response_format())
+    assert reply == f'RCA API error ({status})' and len(requests) == 1
+    assert f'[AI] HTTP_{status} | agent=Ajan_2_RCA_Expert | attempt=1 | response_mode=json_schema' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('initial_format', [None, {'type': 'json_object'}])
+def test_retry_starts_at_actual_requested_format(isolated, gateway, monkeypatch, initial_format):
+    call, requests, _ = fake_gateway(monkeypatch, gateway,
+        [(400, {'error': {'code': 'unsupported_response_format'}}), (200, response_body())])
+    call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=initial_format)
+    assert [request.get('response_format') for request in requests] == (
+        [None] if initial_format is None else [initial_format, None])
+
+
+@pytest.mark.parametrize('agent,family', [('Parser_Discovery', 'deepseek'), ('Segmentation_Discovery', 'deepseek'),
+                                        ('Other_Expert', 'qwen')])
+def test_non_rca_format_fallback_remains_unchanged(isolated, gateway, monkeypatch, agent, family):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, {}), (200, response_body())])
+    monkeypatch.setitem(gateway[0].MODELS_CONFIG, agent,
+                        dict(url='https://example.invalid', key='synthetic-api-key', model_id='test-model', family=family))
+    call(agent, 'system', 'evidence', response_format=response_format())
+    assert [request.get('response_format') for request in requests] == [response_format(), None]
+    for request in requests:
+        if family == 'qwen':
+            assert request['include_reasoning'] is False
+            assert request['chat_template_kwargs']['enable_thinking'] is False
+        else:
+            assert 'include_reasoning' not in request and 'chat_template_kwargs' not in request
 
 
 @pytest.mark.parametrize('response', [(500, {}), RuntimeError('Authorization: synthetic-api-key')])

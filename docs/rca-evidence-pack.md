@@ -24,8 +24,8 @@ the only new documentation file. The working tree was clean at task start.
 ## Selection and traceability
 
 The flow is deterministic RCA → `RCAEvidenceSelector` → `RCAEvidencePack` → gateway
-→ `RCAExpertOutputValidator` → existing Turkish expert fields. One model call per
-case remains, with the existing one-time HTTP 400 format compatibility retry.
+→ `RCAExpertOutputValidator` → existing Turkish expert fields. One expert
+interpretation per case remains, with at most one HTTP 400 format compatibility retry.
 
 - Incident context selection is stable by severity, start time and ID. Only
   qualified signals belonging to those incidents are eligible.
@@ -107,8 +107,10 @@ non-finite numbers, empty required text and input-echo structures are rejected.
 | `onerilen_incelemeler` | 0–4 nonblank strings, ≤160 characters each; advisory checks only |
 | `eksik_kanitlar` | 0–4 nonblank strings, ≤160 characters each |
 
-`response_format()` defines strict `json_schema` for RCA only. A gateway HTTP 400
-still retries once without that field; local validation remains mandatory. Only
+`response_format()` defines strict `json_schema` for RCA only. An HTTP 400 that
+explicitly identifies unsupported `response_format`/schema can retry once without
+`response_format`. Unrelated, opaque and invalid-schema errors do not trigger that
+retry. Local validation remains mandatory in every mode. Only
 `finish_reason=stop` is accepted. `length`, `max_tokens`, missing/unknown reasons or
 any validation failure preserve deterministic RCA without partially merging output.
 The existing `qwen_destekli` availability annotation remains on accepted results;
@@ -137,11 +139,12 @@ input. Other agents retain their existing response-format behavior.
 
 No `.env` file or `QWEN_RCA_MAX_TOKENS` setting was changed. The pre-existing
 `max(256, min(1600, configured_value))` call cap remains: configured 2200 still means
-an effective 1600 in this checkout. This optimization does not increase it. Thinking
-remains controlled by the existing false flag. `include_reasoning` now explicitly
-honors its existing false flag; its request assignment was previously commented out.
+an effective 1600 in this checkout. This remaining configuration drift is unchanged.
+Thinking remains controlled by the existing false flag. The configured RCA
+deployment does not support `include_reasoning`, so that field is omitted entirely,
+regardless of its environment flag (see the compatibility fix below).
 
-## Validation and Citrix smoke
+## Phase 7 validation baseline and Citrix smoke
 
 | Windows runtime | Focused RCA tests | Full regression suite |
 | --- | --- | --- |
@@ -182,3 +185,103 @@ Success means a compact schema-valid expert object, valid mapped references and
 `finish_reason=stop`; a rejected expert must leave deterministic RCA available.
 Keep only aggregate diagnostics for review. Do not print or persist the prompt,
 raw logs, credentials or alias map. No live gateway smoke was performed here.
+
+## Citrix request-capability fix
+
+The user's live compatibility matrix confirms the root cause: the configured
+`saka__glm-53-flash-dynamo-saka` gateway rejects the **presence** of
+`include_reasoning`, even false, with this message:
+
+> Validation: Unsupported parameter(s): `include_reasoning`
+
+Phase 7 began sending this field through the existing Qwen-family branch. The
+first schema request and the no-format retry both retained it and both returned
+400. The same deployment accepted the current strict schema, JSON object mode,
+and `chat_template_kwargs.enable_thinking=false`; structured calls returned
+`finish_reason=stop` and `reasoning_length=0`.
+
+Before this fix, the working tree contained only the interrupted gateway task's
+changes in `ai_engine.py`, `test_rca_expert.py` and this document. Its three-attempt
+fallback and opaque-400 retries have been replaced by one conditional no-format
+retry. No unrelated user changes were found or discarded.
+
+| RCA request field | Previous Phase 7 request | Corrected first request |
+| --- | --- | --- |
+| Model, endpoint, messages | Existing deployment and bounded evidence | Unchanged |
+| `temperature` | 0.0 | 0.0 |
+| `max_tokens` | 1600 when configured 2200 | Unchanged: 1600 |
+| `chat_template_kwargs.enable_thinking` | false | false |
+| `include_reasoning` | false | **Key absent** |
+| `response_format` | Current strict `json_schema` | Same complete schema |
+
+`MODELS_CONFIG['Ajan_2_RCA_Expert']['capabilities']` explicitly records
+`supports_enable_thinking=True`, `supports_include_reasoning=False`,
+`supports_json_object=True`, and `supports_json_schema=True`. These are
+application configuration for this deployment, not inferred Qwen/GLM capabilities.
+When configuring another deployment, review these four flags against its observed
+support. No model-name heuristics, capability probes or persisted capability cache
+were added. Unrelated agents retain their existing request behavior.
+
+Capability filtering runs after `extra_body` so an unsupported `include_reasoning`
+cannot be reintroduced there. Both false and true environment values are omitted
+when support is false. Caller-owned option dictionaries and schema are preserved.
+The configured deployment keeps the schema on its first request. An explicitly
+configured deployment without schema support can use its supported JSON object
+mode, or omit the format if neither is supported.
+
+RCA retries once without `response_format` only for HTTP 400 with a recognized
+unsupported-format code, or an unsupported-parameter/value code naming
+`response_format`. The observed gateway message pattern is also recognized by
+exact match for known field names. An unrelated/opaque 400, invalid-schema error,
+other HTTP status, or transport error stops immediately. A 200 response also stops
+retries even if local validation subsequently rejects it. Neither request contains
+`include_reasoning` for the configured deployment. No behavior is learned across
+analyses.
+
+`ATTEMPT`, `HTTP_<status>` and `RETRY` identify attempt number and `response_mode`.
+Allowlisted error type/code, field and schema keyword are safe diagnostics;
+unrecognized values stay `unknown`. Even recognized messages are never printed.
+Headers, credentials, payloads, evidence, raw error paths and alias maps are not
+logged. Gateway usage and duration telemetry remain authoritative and unchanged.
+
+The production change is limited to `src/backend/ai_engine.py`; regression tests
+and this document are the only other changed files. Evidence selection, grouping,
+aliases, budgets, prompt/schema, strict validator, deterministic RCA and persisted
+state remain unchanged. Tests check the exact request schema, key omission,
+capability isolation, unchanged evidence and deterministic identities, strict
+validation after fallback, and secret-free diagnostics. Network, LLM and persistent
+state access are blocked by fixtures.
+
+Validation on Windows Python 3.14.8 / Streamlit 1.65.0:
+
+- Before the fix: 34 failures / 88 passes reproduced unsupported-field
+  serialization and the interrupted implementation's fallback behavior.
+- Focused RCA tests: **122 passed** (1.19 s).
+- Full `tests/regression`: **700 passed** (17.52 s), versus the 646-test baseline.
+- `git diff --check`, modified-file whitespace checks and Python syntax checks
+  passed; the complete diff was reviewed. No files staged, committed or pushed.
+
+Re-smoke in the existing Citrix Python 3.14.8 / Streamlit 1.65.0 environment:
+
+1. Restart Streamlit from the repository root to load the changed gateway:
+
+   ```powershell
+   python -B -m streamlit run src/frontend/streamlit_app.py
+   ```
+
+2. Keep current credentials, model, thinking flag, token setting and analysis
+   options. Upload the same 16 MB file and run the same finite analysis.
+3. Compare the deterministic results: 30,394 events, 8,089 patterns, 18 qualified
+   signals, 153 correlations and 1 incident. Expect 8 selected signal groups,
+   10 selected edges, 3 root hints, 6,155 serialized characters and approximately
+   2,350 pre-call tokens for that same input.
+4. Expect attempt 1 with `response_mode=json_schema`, HTTP 200 and no retry.
+   Record only aggregate gateway prompt/completion/total tokens, finish reason and
+   duration. Request-key omission is covered by the request-capture regressions;
+   do not print the live payload or headers to verify it.
+5. Success requires `finish_reason=stop` **and** accepted expert analysis in the UI
+   (`case_analysis` populated with valid mapped references). HTTP 200 alone is not
+   proof of semantic acceptance. Rejected output still preserves deterministic RCA.
+
+No post-fix live gateway smoke was run locally; the supplied live matrix is the
+compatibility evidence, and this re-smoke confirms the integrated production path.

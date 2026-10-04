@@ -60,6 +60,13 @@ MODELS_CONFIG = {
         "key": SAKA_API_KEY,
         "model_id": QWEN_RCA_MODEL_ID,
         "family": "qwen",
+        # Observed capabilities of this configured RCA deployment, not its family.
+        "capabilities": {
+            "supports_enable_thinking": True,
+            "supports_include_reasoning": False,
+            "supports_json_object": True,
+            "supports_json_schema": True,
+        },
     },
 }
 
@@ -99,6 +106,120 @@ def safe_usage(usage):
     return result
 
 
+def _apply_rca_capabilities(payload, capabilities):
+    """Filter optional fields after extra_body; never mutate caller-owned options."""
+    template_kwargs = dict(payload.get('chat_template_kwargs') or {})
+    if capabilities.get('supports_enable_thinking', False):
+        template_kwargs['enable_thinking'] = QWEN_RCA_ENABLE_THINKING
+    else:
+        template_kwargs.pop('enable_thinking', None)
+    if template_kwargs:
+        payload['chat_template_kwargs'] = template_kwargs
+    else:
+        payload.pop('chat_template_kwargs', None)
+    if capabilities.get('supports_include_reasoning', False):
+        payload['include_reasoning'] = QWEN_RCA_INCLUDE_REASONING
+    else:
+        payload.pop('include_reasoning', None)
+
+    requested = payload.get('response_format')
+    mode = requested.get('type') if isinstance(requested, dict) else None
+    if mode == 'json_schema' and not capabilities.get('supports_json_schema', False):
+        mode = 'json_object'
+        payload['response_format'] = {'type': mode}
+    if mode not in ('json_schema', 'json_object') or not capabilities.get('supports_' + mode, False):
+        payload.pop('response_format', None)
+
+
+def _rca_error_diagnostics(response):
+    """Only emit known identifiers; gateway messages and validation inputs may echo secrets."""
+    result = dict.fromkeys(('error_type', 'error_code', 'rejected_field', 'schema_keyword'), 'unknown')
+    try:
+        body = response.json()
+    except (ValueError, RecursionError):
+        body = response.text
+    error = body.get('error', body.get('detail', body)) if isinstance(body, dict) else body
+    if isinstance(error, list):
+        error = error[0] if error else {}
+    message = error.get('message') if isinstance(error, dict) else error
+    if not isinstance(error, dict):
+        error = {}
+    allowed = {
+        'type': ('invalid_request_error', 'BadRequestError', 'bad_request', 'validation_error',
+                 'value_error', 'extra_forbidden', 'unsupported_parameter', 'server_error',
+                 'authentication_error', 'permission_error', 'rate_limit_error'),
+        'code': ('invalid_json_schema', 'invalid_schema', 'unsupported_schema',
+                 'unsupported_response_format', 'unsupported_parameter', 'unsupported_value',
+                 'invalid_parameter', 'invalid_request_error', 'extra_forbidden',
+                 'context_length_exceeded', 'model_not_found', 'invalid_api_key'),
+    }
+    for key, values in allowed.items():
+        value = error.get(key)
+        if isinstance(value, str) and value in values:
+            result['error_' + key] = value
+
+    path = error.get('param')
+    if isinstance(path, str):
+        path = path.split('.')
+    else:
+        path = error.get('loc', [])
+    if not isinstance(path, (list, tuple)):
+        return result
+    if path and path[0] == 'body':
+        path = path[1:]
+    fields = ('response_format', 'model', 'max_tokens', 'temperature', 'messages',
+              'chat_template_kwargs', 'enable_thinking', 'include_reasoning')
+    # Recognize the observed gateway wording by exact match only. Never log the
+    # message itself or extract arbitrary values from it (it may echo evidence).
+    for field in fields + ('json_schema', 'json_object'):
+        if message == f'Validation: Unsupported parameter(s): `{field}`':
+            result['error_code'] = 'unsupported_parameter'
+            result['rejected_field'] = 'response_format' if field in ('json_schema', 'json_object') else field
+            break
+    if path and isinstance(path[0], str) and path[0] in fields:
+        result['rejected_field'] = path[0]
+    keywords = ('type', 'properties', 'required', 'additionalProperties', 'minLength',
+                'maxLength', 'minimum', 'maximum', 'enum', 'items', 'minItems', 'maxItems',
+                'nullable', '$schema', '$ref', 'anyOf', 'allOf', 'oneOf')
+    if (result['rejected_field'] == 'response_format' and 'schema' in path
+            and isinstance(path[-1], str) and path[-1] in keywords):
+        result['schema_keyword'] = path[-1]
+    return result
+
+
+def _post_rca(session, url, headers, payload):
+    """One no-format retry only for an explicit unsupported-format HTTP 400."""
+    initial = payload.get('response_format')
+    formats = [initial, None] if initial is not None else [None]
+    for attempt, format_value in enumerate(formats, 1):
+        if format_value is None:
+            payload.pop('response_format', None)
+            mode = 'none'
+        else:
+            payload['response_format'] = format_value
+            mode = format_value.get('type') if isinstance(format_value, dict) else None
+            if mode not in ('json_schema', 'json_object'):
+                mode = 'other_response_format'
+        detail = f'agent=Ajan_2_RCA_Expert | attempt={attempt} | response_mode={mode}'
+        if attempt > 1:
+            print(f'[AI] RETRY | {detail}')
+        print(f'[AI] ATTEMPT | {detail}')
+        response = session.post(url, headers=headers, json=payload, verify=False, timeout=(60, 180))
+        diagnostics = _rca_error_diagnostics(response) if response.status_code != 200 else {}
+        suffix = ''.join(f' | {key}={value}' for key, value in diagnostics.items())
+        print(f'[AI] HTTP_{response.status_code} | {detail}{suffix}')
+        if response.status_code != 400:
+            break
+        field, code = diagnostics['rejected_field'], diagnostics['error_code']
+        unsupported_format = (
+            field in ('unknown', 'response_format') and code in ('unsupported_response_format', 'unsupported_schema')
+            or field == 'response_format' and code in ('unsupported_parameter', 'unsupported_value')
+        )
+        if not unsupported_format:
+            break
+    return response
+
+
 def call_ai_agent(
     agent_key: str,
     system_prompt: str,
@@ -109,7 +230,7 @@ def call_ai_agent(
     return_usage: bool = False,
     extra_body: dict | None = None,
 ):
-    """OpenAI-compatible kurumsal endpoint'e tek bir sade istek gönderir."""
+    """Call the OpenAI-compatible gateway, with bounded response-format retries."""
     config = MODELS_CONFIG.get(agent_key)
     is_rca = agent_key == 'Ajan_2_RCA_Expert'
     if config is None:
@@ -133,8 +254,9 @@ def call_ai_agent(
     if extra_body:
         payload.update(extra_body)
 
-    # Qwen yalnız RCA yorumu için kullanılır; kısa ve doğrudan JSON cevap isteriz.
-    if config["family"] == "qwen":
+    if is_rca:
+        _apply_rca_capabilities(payload, config.get('capabilities', {}))
+    elif config["family"] == "qwen":
         payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = QWEN_RCA_ENABLE_THINKING
         payload["include_reasoning"] = QWEN_RCA_INCLUDE_REASONING
 
@@ -158,16 +280,18 @@ def call_ai_agent(
         session = requests.Session()
         if config["family"] == "qwen":
             session.trust_env = False
-        response = session.post(
-            config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
-        )
-
-        # Bazı gateway sürümleri response_format kabul etmiyor; bir kez sade tekrar et.
-        if response.status_code == 400 and response_format is not None:
-            payload.pop("response_format", None)
+        if is_rca:
+            response = _post_rca(session, config['url'], headers, payload)
+        else:
             response = session.post(
                 config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
             )
+            # Preserve discovery agents' existing one-time format fallback.
+            if response.status_code == 400 and response_format is not None:
+                payload.pop("response_format", None)
+                response = session.post(
+                    config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
+                )
 
         duration = time.time() - start
         if response.status_code != 200:
