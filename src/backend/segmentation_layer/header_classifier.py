@@ -39,10 +39,26 @@ class HeaderClassifier:
         after_blank: bool = False,
     ) -> LineDecision:
 
-        text = line.rstrip("\r\n")
-        stripped = text.strip()
+        # Preserve the existing standalone/file-facing classification API.
+        return self.classify_raw(
+            line.rstrip("\r\n"), regex,
+            has_current_event=has_current_event, after_blank=after_blank,
+        )
 
-        if not stripped:
+    def classify_raw(
+        self,
+        text: str,
+        regex: Optional[re.Pattern],
+        *,
+        has_current_event: bool,
+        after_blank: bool = False,
+    ) -> LineDecision:
+        """Classify an opaque input unit without trimming or splitting it.
+
+        Indentation is already a hard continuation veto, so header recognition
+        needs no stripped copy. Regex evidence sees the exact supplied text.
+        """
+        if not text or text.isspace():
             return LineDecision(
                 CONTINUATION,
                 False,
@@ -58,8 +74,8 @@ class HeaderClassifier:
         # continuations.
         if (
             text[:1].isspace()
-            or self._TRACE_CONT.match(stripped)
-            or self._STRUCTURED_CONT.match(stripped)
+            or self._TRACE_CONT.match(text)
+            or self._STRUCTURED_CONT.match(text)
         ):
             return LineDecision(
                 CONTINUATION,
@@ -70,12 +86,12 @@ class HeaderClassifier:
             )
 
         strong = bool(
-            self._TIMESTAMP.match(stripped)
-            or self._PREFIXED_TIMESTAMP.match(stripped)
-            or self._SYSLOG.match(stripped)
-            or self._KLOG.match(stripped)
-            or self._LEVEL.match(stripped)
-            or self._NGINX.match(stripped)
+            self._TIMESTAMP.match(text)
+            or self._PREFIXED_TIMESTAMP.match(text)
+            or self._SYSLOG.match(text)
+            or self._KLOG.match(text)
+            or self._LEVEL.match(text)
+            or self._NGINX.match(text)
         )
 
         if strong:
@@ -105,7 +121,7 @@ class HeaderClassifier:
         # JSON that does NOT match the candidate policy remains contextual.
         # This allows nested/multiline JSON fragments to remain attached to
         # the current logical event.
-        if stripped == "{" or stripped.startswith("{\""):
+        if text.startswith('{"') or (text.startswith("{") and (text == "{" or text[1:].isspace())):
             start = (not has_current_event) or after_blank
 
             return LineDecision(
