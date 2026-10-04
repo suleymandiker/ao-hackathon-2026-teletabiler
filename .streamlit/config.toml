@@ -1,21 +1,22 @@
-# AOP • Turkcell kurumsal tema
-# Sarı (#FFC800) + lacivert (#0A1628) marka paleti.
+# AI-IN-AI Operations: light investigation canvas, compact dark navigation.
 
 [theme]
-base = "dark"
-primaryColor = "#FFC800"
-backgroundColor = "#0A1628"
-secondaryBackgroundColor = "#101F38"
-textColor = "#E9EFF9"
-linkColor = "#FFC800"
-borderColor = "#1E3355"
+base = "light"
+primaryColor = "#0764E8"
+backgroundColor = "#F6F8FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#17243B"
+linkColor = "#0764E8"
+borderColor = "#E1E8F2"
 baseRadius = "medium"
 font = "sans serif"
 
 [theme.sidebar]
-backgroundColor = "#070F1E"
-secondaryBackgroundColor = "#101F38"
-borderColor = "#1E3355"
+backgroundColor = "#0C1929"
+secondaryBackgroundColor = "#172B43"
+textColor = "#E4EBF5"
+primaryColor = "#69A9FF"
+borderColor = "#263A53"
 
 [client]
 toolbarMode = "minimal"

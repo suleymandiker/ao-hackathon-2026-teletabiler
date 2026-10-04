@@ -22,6 +22,7 @@ from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldM
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
 from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
 from segmentation_layer.contracts import SegmentationPolicy
+from verified_policy_resolver import VerifiedPolicyResolver, PolicyResolutionError
 
 
 MAX_PAGE_SIZE = 500
@@ -30,7 +31,8 @@ MAX_LOOKBACK_MINUTES = 1440
 MESSAGES = {
     'configuration_error': 'OpenSearch yapılandırması eksik veya geçersiz. OPENSEARCH_* ortam ayarlarını kontrol edin.',
     'query_error': 'Namespace, uygulama, zaman aralığı ve analiz sınırlarını kontrol edin.',
-    'no_policy': 'Doğrulanmış bir sınır politikası seçin. Uygun politika yoksa bu kaynak için analiz başlatılamaz.',
+    'no_policy': 'Bu log formatı için güvenilir doğrulanmış bir ayrıştırma politikası bulunamadı.',
+    'ambiguous_policy': 'Log formatı birden fazla doğrulanmış politikayla eşleşti. Güvenilir seçim yapılamadığı için analiz başlatılmadı.',
     'policy_store_error': 'Doğrulanmış politikalar okunamadı. Uygulama politika deposunu kontrol edin.',
     'connection_error': 'OpenSearch bağlantısı veya kimlik doğrulaması başarısız. Bağlantı, yetki ve TLS ayarlarını kontrol edin.',
     'partial_search': 'Arama tamamlanamadı veya shard hatası oluştu. Kısmi analiz sonucu gösterilmedi.',
@@ -188,21 +190,24 @@ def bounded_pages(source, request, summary):
         cursor = page.next_cursor
 
 
-def run_analysis(pipeline_factory, request, policy):
+def run_analysis(pipeline_factory, request, policy=None, *, automatic=False):
     """Acquire within the budget and pass pages straight to Phase 4.
 
     The UI serializes access to its shared pipeline (including uploads). No
     partial analysis is returned on failure; normal budget exhaustion closes
     the finite Phase 4 session. Existing template-learning lifecycle is retained.
     """
-    if not isinstance(policy, VerifiedPolicy):
+    if not automatic and not isinstance(policy, VerifiedPolicy):
+        raise ApplicationError('no_policy')
+    policies = list_verified_policies() if automatic else ()
+    if automatic and not policies:
         raise ApplicationError('no_policy')
     config = load_connection(request.page_size)
     summary = dict(pages_read=0, records_read=0, stop_reason=None, budget_reached=False,
                    start=request.start.isoformat(), end=request.end.isoformat(),
                    page_size=request.page_size, max_pages=request.max_pages,
                    record_budget=request.page_size * request.max_pages)
-    snapshot = policy.snapshot
+    snapshot = policy.snapshot if policy is not None else None
 
     def provider(key, first_record):
         return snapshot
@@ -214,7 +219,16 @@ def run_analysis(pipeline_factory, request, policy):
                 first = next(pages)
                 if not first.records:
                     raise ApplicationError('no_records')
+                if automatic:
+                    try:
+                        resolution = VerifiedPolicyResolver().resolve(first.records, policies)
+                    except PolicyResolutionError as error:
+                        raise ApplicationError(error.code) from None
+                    snapshot = resolution.snapshot
+                    summary['policy_selection'] = resolution.diagnostics()
                 result = pipeline_factory().process_ingested_pages(chain((first,), pages), policy_provider=provider)
+        summary.update(source_scope=config.source_scope, index_expression=config.index_expression,
+                       verify_certs=config.verify_certs)
         return presentation_result(result, summary, config)
     except ApplicationError:
         raise
@@ -229,10 +243,11 @@ def run_analysis(pipeline_factory, request, policy):
         raise ApplicationError('analysis_error') from None
 
 
-def safe_text(value, config):
+def safe_text(value, config=None):
     """Defense in depth for display strings, including derived analysis text."""
     text = str(value)
-    for secret in sorted((config.password, config.username, *config.hosts), key=len, reverse=True):
+    secrets = (config.password, config.username, *config.hosts) if config is not None else ()
+    for secret in sorted(secrets, key=len, reverse=True):
         if secret:
             text = text.replace(secret, '[redacted]')
     text = re.sub(
@@ -274,7 +289,7 @@ def presentation_result(result, summary, config):
                      ('source_scope', 'pod_instance', 'container_instance', 'channel'))
                for entry in result.get('event_provenance', [])}
     shown['source_summary'] = {
-        **summary, 'assembled_events': result.get('stats', {}).get('segmented', 0),
+        **clean(summary), 'assembled_events': result.get('stats', {}).get('segmented', 0),
         'assembled_stream_count': len(streams),
         'unassembled_count': diagnostics.get('unassembled_count', 0),
         'unassembled_by_reason': {reason: diagnostics.get('unassembled_by_reason', {}).get(reason, 0)
