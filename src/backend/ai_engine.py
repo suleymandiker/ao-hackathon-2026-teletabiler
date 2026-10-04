@@ -26,17 +26,17 @@ PROMPTS_DIR = BACKEND_DIR / "prompts"
 
 DEEPSEEK_URL = os.getenv(
     "DEEPSEEK_URL",
-    "https://common-inference-apis.turkcelltech.ai/llm-dynamo-deepseek-v4-flash-0731/v1/chat/completions",
+    "https://common-inference-apis.turkcelltech.ai/glm-53-flash-dynamo-saka/v1/chat/completions",
 )
-DEEPSEEK_MODEL_ID = os.getenv("DEEPSEEK_MODEL_ID", "deepseek-v4-flash-0731")
+DEEPSEEK_MODEL_ID = os.getenv("DEEPSEEK_MODEL_ID", "saka__glm-53-flash-dynamo-saka")
 SAKA_API_KEY = os.getenv("SAKA_API_KEY", "")
 
 QWEN_RCA_URL = os.getenv(
     "QWEN_RCA_URL",
-    "https://common-inference-apis.turkcelltech.ai/qwen35-122b-a10b-awq-ai-genai/v1/chat/completions",
+    "https://common-inference-apis.turkcelltech.ai/glm-53-flash-dynamo-saka/v1/chat/completions",
 )
 QWEN_RCA_MODEL_ID = os.getenv(
-    "QWEN_RCA_MODEL_ID", "ai-genai__qwen35-122b-a10b-awq-ai-genai"
+    "QWEN_RCA_MODEL_ID", "saka__glm-53-flash-dynamo-saka"
 )
 QWEN_RCA_ENABLE_THINKING = os.getenv("QWEN_RCA_ENABLE_THINKING", "false").lower() == "true"
 QWEN_RCA_INCLUDE_REASONING = os.getenv("QWEN_RCA_INCLUDE_REASONING", "false").lower() == "true"
@@ -125,7 +125,7 @@ def call_ai_agent(
     # Qwen yalnız RCA yorumu için kullanılır; kısa ve doğrudan JSON cevap isteriz.
     if config["family"] == "qwen":
         payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = QWEN_RCA_ENABLE_THINKING
-        payload.setdefault("include_reasoning", QWEN_RCA_INCLUDE_REASONING)
+        ##payload.setdefault("include_reasoning", QWEN_RCA_INCLUDE_REASONING)
 
     headers = {
         "Authorization": f"Bearer {config['key']}",
@@ -143,16 +143,20 @@ def call_ai_agent(
         session = requests.Session()
         if config["family"] == "qwen":
             session.trust_env = False
-
+        #print("ANALİZ...")    
+        #print(config["url"])
+        #print(headers)
+        #print(payload)
+        #print("ANALİZ SONU...")   
         response = session.post(
-            config["url"], headers=headers, json=payload, verify=False, timeout=(15, 180)
+            config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
         )
 
         # Bazı gateway sürümleri response_format kabul etmiyor; bir kez sade tekrar et.
         if response.status_code == 400 and response_format is not None:
             payload.pop("response_format", None)
             response = session.post(
-                config["url"], headers=headers, json=payload, verify=False, timeout=(15, 180)
+                config["url"], headers=headers, json=payload, verify=False, timeout=(60, 180)
             )
 
         duration = time.time() - start

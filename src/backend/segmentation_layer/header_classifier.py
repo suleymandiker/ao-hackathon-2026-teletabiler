@@ -30,34 +30,69 @@ class HeaderClassifier:
     _TRACE_CONT = re.compile(r"^(?:Traceback \(most recent call last\):|Caused by:|Suppressed:|\.\.\. \d+ more\b|at\s+\S+|File\s+\"|[A-Za-z_][\w.]*?(?:Error|Exception):)")
     _STRUCTURED_CONT = re.compile(r"^(?:caused_by:|detail:|dependency chain:|symptom:|recommendation:|client:|server:|request:|upstream:|host:)", re.I)
 
-    def classify(self, line: str, regex: Optional[re.Pattern], *, has_current_event: bool, after_blank: bool = False) -> LineDecision:
+    def classify(
+        self,
+        line: str,
+        regex: Optional[re.Pattern],
+        *,
+        has_current_event: bool,
+        after_blank: bool = False,
+    ) -> LineDecision:
+
         text = line.rstrip("\r\n")
         stripped = text.strip()
+
         if not stripped:
-            return LineDecision(CONTINUATION, False, False, "blank", 1.0)
+            return LineDecision(
+                CONTINUATION,
+                False,
+                False,
+                "blank",
+                1.0,
+            )
+
         regex_match = bool(regex.match(text)) if regex else False
 
-        # Known multiline continuations override a broad AI/fallback regex.
-        if text[:1].isspace() or self._TRACE_CONT.match(stripped) or self._STRUCTURED_CONT.match(stripped):
-            return LineDecision(CONTINUATION, False, regex_match, "known_multiline_continuation", 0.99)
+        # Known multiline continuations are a hard veto.
+        # Even if a broad discovered regex matches them, they must remain
+        # continuations.
+        if (
+            text[:1].isspace()
+            or self._TRACE_CONT.match(stripped)
+            or self._STRUCTURED_CONT.match(stripped)
+        ):
+            return LineDecision(
+                CONTINUATION,
+                False,
+                regex_match,
+                "known_multiline_continuation",
+                0.99,
+            )
 
-        strong = bool(self._TIMESTAMP.match(stripped) or self._PREFIXED_TIMESTAMP.match(stripped) or self._SYSLOG.match(stripped) or self._KLOG.match(stripped) or self._LEVEL.match(stripped) or self._NGINX.match(stripped))
+        strong = bool(
+            self._TIMESTAMP.match(stripped)
+            or self._PREFIXED_TIMESTAMP.match(stripped)
+            or self._SYSLOG.match(stripped)
+            or self._KLOG.match(stripped)
+            or self._LEVEL.match(stripped)
+            or self._NGINX.match(stripped)
+        )
+
         if strong:
-            return LineDecision(STRONG_HEADER, True, regex_match, "deterministic_strong_header", 1.0)
+            return LineDecision(
+                STRONG_HEADER,
+                True,
+                regex_match,
+                "deterministic_strong_header",
+                1.0,
+            )
 
-        # Opening JSON/object line is contextual: top-level/after blank can begin
-        # an event; inside an existing event it is continuation data.
-        if stripped == "{" or stripped.startswith("{\""):
-            start = (not has_current_event) or after_blank
-            return LineDecision(CONTEXTUAL_HEADER if start else CONTINUATION, start, regex_match, "json_context", 0.90 if start else 0.95)
-
-        # A verified/discovered policy regex is allowed to define boundaries for
-        # otherwise unknown formats. Continuation safety above is a hard veto, so
-        # broad AI regexes still cannot split known traceback/stacktrace lines.
+        # A discovered/verified candidate regex is boundary evidence.
         #
-        # This is intentionally format-agnostic: Android logcat, proprietary
-        # application logs, or another unseen grammar do not need a new built-in
-        # HeaderClassifier rule once their policy regex has been validated.
+        # IMPORTANT:
+        # This must come before the generic JSON contextual rule.
+        # Otherwise every JSON object after the first one is incorrectly
+        # swallowed into the active event.
         if regex_match:
             return LineDecision(
                 CONTEXTUAL_HEADER,
@@ -67,4 +102,24 @@ class HeaderClassifier:
                 0.90,
             )
 
-        return LineDecision(CONTINUATION, False, False, "continuation_default", 0.98 if has_current_event else 0.55)
+        # JSON that does NOT match the candidate policy remains contextual.
+        # This allows nested/multiline JSON fragments to remain attached to
+        # the current logical event.
+        if stripped == "{" or stripped.startswith("{\""):
+            start = (not has_current_event) or after_blank
+
+            return LineDecision(
+                CONTEXTUAL_HEADER if start else CONTINUATION,
+                start,
+                False,
+                "json_context",
+                0.90 if start else 0.95,
+            )
+
+        return LineDecision(
+            CONTINUATION,
+            False,
+            False,
+            "continuation_default",
+            0.98 if has_current_event else 0.55,
+        )

@@ -205,7 +205,7 @@ class ExpertRCAEngine:
             self.last_case_analysis = {
                 **parsed,
                 "analysis_source": "qwen_uzman",
-                "analysis_model": "qwen35-122b-a10b-awq-ai-genai",
+                "analysis_model": "saka__glm-53-flash-dynamo-saka",
                 "ai_usage": usage,
                 "ai_duration_seconds": round(duration, 3),
             }
