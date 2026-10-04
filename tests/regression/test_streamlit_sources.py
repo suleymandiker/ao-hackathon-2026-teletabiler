@@ -112,9 +112,20 @@ def select_openshift(app):
     return app
 
 
+def state_has(app, key):
+    try:
+        app.session_state[key]
+    except KeyError:
+        return False
+    return True
+
+
 def assert_safe(app):
     assert not app.exception
-    rendered = str(app) + str(app.session_state.filtered_state)
+    # Inspect owned values explicitly as well as the rendered app/state so this
+    # check does not depend on how a Streamlit version represents session state.
+    retained = {key: app.session_state[key] for key in ('result', 'result_source') if state_has(app, key)}
+    rendered = str(app) + str(app.session_state) + str(retained)
     for forbidden in (SECRET, 'private-user', 'private-host.invalid', 'private-signature', '^BEGIN ', RAW):
         assert forbidden not in rendered
 
@@ -231,8 +242,11 @@ def test_openshift_requires_explicit_policy_then_routes_and_shows_summary(ui):
     assert any('sayfa sınırına' in item.value for item in app.warning)
     assert any('Kaynak Özeti' in item.value for item in app.markdown)
     assert_safe(app)
-    for key in app.session_state.filtered_state:
-        assert 'cursor' not in key.lower() and 'segmentation' not in key.lower()
+    for key in ('cursor', 'next_cursor', 'segmentation', 'segmentation_session', 'policy_provider'):
+        assert not state_has(app, key)
+    stored = app.session_state['result']
+    assert 'event_provenance' not in stored and 'ingestion_diagnostics' not in stored
+    assert all(stage['items'] == [] for stage in stored['pipeline_trace'].values())
     app.selectbox(key='view').select('Katman İzleme').run()
     assert any('ham loglar' in item.value for item in app.info)
     assert_safe(app)
@@ -266,7 +280,8 @@ def test_safe_errors_clear_stale_result_and_do_not_dump_exception(ui, monkeypatc
 
     monkeypatch.setattr(ui.boundary, 'run_analysis', fail)
     app.button[0].click().run()
-    assert 'result' not in app.session_state.filtered_state
+    assert not state_has(app, 'result')
+    assert not state_has(app, 'result_source')
     messages = app.info if code == 'no_records' else app.error
     assert any(ui.boundary.MESSAGES[code] == item.value for item in messages)
     assert_safe(app)

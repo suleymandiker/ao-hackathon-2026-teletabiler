@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import sqlite3
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,18 @@ END = datetime(2026, 10, 4, 9, tzinfo=timezone.utc)
 
 
 @pytest.fixture
-def app(monkeypatch, tmp_path, request):
+def local_catalog_dir():
+    # Citrix TEMP may be UNC; SQLite read-only URIs require a local authority.
+    # An explicit parent bypasses TEMP and keeps all state outside src/data.
+    test_root = Path(__file__).resolve().parents[2] / 'tests'
+    with TemporaryDirectory(prefix='.opensearch-catalog-', dir=test_root) as directory:
+        path = Path(directory)
+        yield path
+    assert not path.exists(), 'Temporary catalog directory was not cleaned up'
+
+
+@pytest.fixture
+def app(monkeypatch, local_catalog_dir, request):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / 'src' / 'backend'))
     import requests
     import ai_engine
@@ -40,7 +52,7 @@ def app(monkeypatch, tmp_path, request):
     for name, value in dict(HOSTS='https://example.invalid', USERNAME='private-user', PASSWORD=SECRET,
                             USE_SSL='true', VERIFY_CERTS='true', SOURCE_SCOPE='test-cluster', INDEX='test-*').items():
         monkeypatch.setenv('OPENSEARCH_' + name, value)
-    database = tmp_path / getattr(request, 'param', 'policies.sqlite3')
+    database = local_catalog_dir / getattr(request, 'param', 'policies.sqlite3')
     monkeypatch.setenv('AIOPS_POLICY_REGISTRY_PATH', str(database))
     real_connect = sqlite3.connect
 
@@ -210,6 +222,13 @@ def test_verified_catalog_is_read_only_and_does_not_leak_regex_or_signature(app)
     assert 'private-signature' not in repr(policies) and REGEX not in repr(policies)
     assert app.database.read_bytes() == before
     assert app.read_catalog() == policies
+
+
+def test_catalog_database_is_in_a_repository_local_test_directory(app):
+    test_root = Path(__file__).resolve().parents[2] / 'tests'
+    assert app.database.parent.parent == test_root
+    assert app.database.parent.name.startswith('.opensearch-catalog-')
+    assert app.database.resolve().as_uri().startswith('file:///')
 
 
 @pytest.mark.parametrize('app', ['policies.sqlite3', 'policies # % ı.sqlite3'], indirect=True)
