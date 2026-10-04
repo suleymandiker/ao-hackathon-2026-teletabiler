@@ -135,7 +135,8 @@ def print_page(label, page):
         })
 
 
-def run_smoke():
+def load_configuration():
+    """Share manual smoke environment/TLS handling without opening a client."""
     # Fix both endpoints before any requests. No subsequent call samples now.
     end_text = os.environ.get("OPENSEARCH_SMOKE_END")
     if end_text:
@@ -169,6 +170,12 @@ def run_smoke():
         workload=os.environ.get("OPENSEARCH_SMOKE_WORKLOAD", "aihub-foya-stt-apis-http"),
         container=os.environ.get("OPENSEARCH_SMOKE_CONTAINER") or None,
     )
+    return config, selection
+
+
+def run_smoke():
+    config, selection = load_configuration()
+    start, end, size = selection["start"], selection["end"], selection["page_size"]
     emit({"index": config.index_expression, "start": start.isoformat(),
           "end": end.isoformat(), "page_size": size})
     with OpenSearchClient(config) as client:
