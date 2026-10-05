@@ -94,6 +94,7 @@ class KVParser:
 
         return {
             "timestamp": self.ts.normalize(str(raw_time)) if raw_time is not None else None,
+            "raw_timestamp": raw_time,
             "severity": normalized_severity,
             "message": str(message).strip('"\' '),
             "attributes": fields,

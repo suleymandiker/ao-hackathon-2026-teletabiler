@@ -86,6 +86,7 @@ class PositionalStructuredParser:
 
         return {
             "timestamp": self.ts.normalize(gd["raw_timestamp"]),
+            "raw_timestamp": gd["raw_timestamp"],
             "severity": self._normalize_severity(gd["severity"]),
             "message": message,
             "host": None if gd["location"].upper() == "NULL" else gd["location"],

@@ -8,7 +8,9 @@ from parser_layer.timestamp.timestamp_normalizer import TimestampNormalizer, FOR
 _KEYS = ("timestamp", "time", "@timestamp")
 _CLOCK = r"\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?"
 _HEADER = re.compile(
-    r"^\s*(?:<\d+>(?:\d+\s+)?)?\[?(?P<time>"
+    r"^\s*(?:<\d+>(?:\d+\s+)?)?"
+    r"(?:(?:INFO|ERROR|WARN|WARNING|DEBUG|TRACE|FATAL|CRITICAL)\s*[:|\-]?\s+)?"
+    r"\[?(?P<time>"
     r"\d{4}-\d{2}-\d{2}[T ]" + _CLOCK + r"(?:\s?(?:Z|[+-]\d{2}:?\d{2}))?"
     r"|\d{2}/\d{2}/\d{4}\s+" + _CLOCK +
     r"|\d{1,2}/[A-Za-z]{3}/\d{4}:" + _CLOCK + r"(?:\s+[+-]\d{4})?"
@@ -64,7 +66,11 @@ def _status(value):
             return "timezone_missing"
     except ValueError:
         pass
-    for fmt in (*FORMATS, "%Y%m%d-%H:%M:%S:%f", "%d/%b/%Y:%H:%M:%S"):
+    # Diagnostic validation only. Neither slash-date interpretation nor a
+    # missing timezone/year is promoted into an absolute canonical timestamp.
+    for fmt in (*FORMATS, "%Y%m%d-%H:%M:%S:%f", "%d/%b/%Y:%H:%M:%S",
+                "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M:%S.%f",
+                "%a %b %d %H:%M:%S %Y", "%Y-%m-%d-%H.%M.%S.%f"):
         try:
             parsed = datetime.strptime(text, fmt)
             return "timezone_missing" if parsed.tzinfo is None else "unparsed"

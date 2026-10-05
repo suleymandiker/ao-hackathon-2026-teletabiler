@@ -191,6 +191,7 @@ class StructuredTextParser:
             gd = windows_match.groupdict()
             return {
                 "timestamp": self.ts.normalize(gd["timestamp"]),
+                "raw_timestamp": gd["timestamp"],
                 "severity": self._normalize_severity(gd["severity"]),
                 "message": gd["message"],
                 "component": gd["component"].upper(),
@@ -215,6 +216,7 @@ class StructuredTextParser:
 
             return {
                 "timestamp": self.ts.normalize(gd["timestamp"]),
+                "raw_timestamp": gd["timestamp"],
                 "severity": self._normalize_severity(gd["severity"]),
                 "message": gd["message"],
                 "component": gd["component"],
@@ -239,6 +241,7 @@ class StructuredTextParser:
             raw_timestamp = groups["timestamp"]
             return {
                 "timestamp": self.ts.normalize(raw_timestamp),
+                "raw_timestamp": raw_timestamp,
                 "severity": None,
                 "message": groups["message"],
                 "component": groups["component"],
@@ -260,6 +263,7 @@ class StructuredTextParser:
 
             return {
                 "timestamp": self.ts.normalize(timestamp_raw),
+                "raw_timestamp": timestamp_raw,
                 "severity": severity,
                 "message": f"{request.strip()} (HTTP {status_code})",
                 "host": ip,
@@ -337,6 +341,7 @@ class StructuredTextParser:
 
         return {
             "timestamp": timestamp,
+            "raw_timestamp": raw_timestamp,
             "severity": severity,
             "message": message,
             **optional_fields,

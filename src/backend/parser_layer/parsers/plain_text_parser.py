@@ -28,6 +28,7 @@ class PlainTextParser:
 
         return {
             "timestamp": timestamp,
+            "raw_timestamp": raw_timestamp,
             "severity": severity,
             "message": event,
             "attributes": {},

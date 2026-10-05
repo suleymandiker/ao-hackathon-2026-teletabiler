@@ -37,8 +37,11 @@ TIMESTAMP_SEARCH_PATTERNS = (
     HEALTHAPP_NONABSOLUTE_RE,
     APACHE_BRACKET_CLOCK_RE,
     MONTH_DAY_CLOCK_RE,
-    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
-    re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s+[+-]\d{2}:?\d{2})?"),
+    # Keep the entire explicit timezone for both ISO date/time separators.
+    # Dropping Z or an adjacent offset turns a resolvable instant into naive time.
+    # A following word such as "ZooKeeper" is not a Z timezone token.
+    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2})(?![\w:+-]))?"),
+    re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2})(?![\w:+-]))?"),
     re.compile(r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?"),
     re.compile(r"\d{1,2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?"),
 )

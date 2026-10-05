@@ -9,6 +9,7 @@ from parser_layer.parser_pipeline import ParserPipeline
 from template_layer.template_pipeline import TemplatePipeline
 from downstream_pipeline import DownstreamAIOpsPipeline
 from input_package_layer.package_loader import InputPackageLoader
+from time_quality import TimeQuality
 import os
 
 class FullAIOpsPipelineV2:
@@ -39,6 +40,7 @@ class FullAIOpsPipelineV2:
         intentionally bypassed because these inputs are structured records, not raw logs.
         """
         import hashlib
+        time_quality = TimeQuality.from_env()
         templated=[]
         trace_limit=200
         seg_trace=[]; parser_trace=[]; template_trace=[]
@@ -67,12 +69,17 @@ class FullAIOpsPipelineV2:
                 'source_order': source_order,
             }
             templated.append(event)
+            if time_quality is not None:
+                parsed_time = time_quality.parsed(src, 'structured_alarm', structured=True)
+                time_quality.downstream(event, parsed_time)
             if len(seg_trace)<trace_limit: seg_trace.append(str(src)[:1200])
             if len(parser_trace)<trace_limit: parser_trace.append(dict(event))
             if len(template_trace)<trace_limit: template_trace.append(dict(event))
         n=len(templated)
         print(f'[PIPELINE] Yapılandırılmış alarm fast-path | okunan={n} | kayıp=0')
         downstream=self.downstream.process(templated)
+        if time_quality is not None:
+            time_quality.report(downstream)
         downstream['stats']={**{'segmented':n,'parsed':n,'templated':n,'template_unreliable':0,'structured_alarm_fast_path':True},**downstream['stats']}
         downstream['pipeline_trace']={
             'sample_limit':trace_limit,
@@ -191,6 +198,7 @@ class FullAIOpsPipelineV2:
         self, logical_events: Iterable[str | AssembledEvent], *, event_provenance=None,
     ) -> Dict[str, Any]:
         """Shared existing parser/template/downstream flow; no policy preparation."""
+        time_quality = TimeQuality.from_env()
         templated: List[Dict[str,Any]]=[]
         trace_limit = 200
         trace = {'segmentation': [], 'parser': [], 'template': []}
@@ -200,7 +208,19 @@ class FullAIOpsPipelineV2:
             stats['segmented']+=1
             if len(trace['segmentation']) < trace_limit:
                 trace['segmentation'].append(raw)
-            event=self.parser.process(raw)
+            if time_quality is not None:
+                # process() delegates to this outcome contract. Older injected
+                # parsers can still use their existing process() method.
+                parse_with_outcome = getattr(self.parser, 'process_with_outcome', None)
+                if callable(parse_with_outcome):
+                    outcome = parse_with_outcome(raw)
+                    event = outcome.event
+                    parsed_time = time_quality.parsed(event, outcome.parser_id)
+                else:
+                    event = self.parser.process(raw)
+                    parsed_time = time_quality.parsed(event)
+            else:
+                event=self.parser.process(raw)
             if isinstance(logical, AssembledEvent):
                 provenance = self._assembled_provenance(logical)
                 event_provenance.append({'event_id': event.get('event_id') if event else None,
@@ -222,7 +242,10 @@ class FullAIOpsPipelineV2:
             if len(trace['parser']) < trace_limit:
                 trace['parser'].append(dict(event))
             result=self.templater.process(event)
-            if not result: continue
+            if not result:
+                if time_quality is not None:
+                    time_quality.not_delivered(parsed_time)
+                continue
             row=dict(event); row.update({'template_id':result.template_id,'template':result.template,'template_reliable':result.reliable})
             # Existing logical-event delivery order, scoped to this invocation.
             # Page retrieval tuples are opaque; preserve the session's supplied
@@ -230,10 +253,14 @@ class FullAIOpsPipelineV2:
             row['source_order'] = stats['segmented'] - 1
             decision=self.templater.last_decision or {}; row['template_source']=decision.get('source'); row['template_reason']=decision.get('validator_reason')
             templated.append(row); stats['templated']+=1; stats['template_unreliable']+=0 if result.reliable else 1
+            if time_quality is not None:
+                time_quality.downstream(row, parsed_time)
             if len(trace['template']) < trace_limit:
                 trace['template'].append(dict(row))
         print(f"[PIPELINE] Segmentasyon={stats['segmented']} | Ayrıştırma={stats['parsed']} | Şablonlama={stats['templated']}")
         downstream=self.downstream.process(templated)
+        if time_quality is not None:
+            time_quality.report(downstream)
         downstream['stats']={**stats,**downstream['stats']}
         downstream['pipeline_trace'] = {
             'sample_limit': trace_limit,

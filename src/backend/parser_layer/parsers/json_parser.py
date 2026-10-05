@@ -28,7 +28,12 @@ class JsonParser:
             # Geriye sadece bilinmeyen/dinamik ekstra alanlar kalacak.
             
             # 1. Zaman Damgası
-            raw_time = data.pop("timestamp", None) or data.pop("time", None) or data.pop("@timestamp", None)
+            raw_time = None
+            for key in ("timestamp", "time", "@timestamp"):
+                raw_time = data.pop(key, None)
+                # Preserve existing key priority and fallback, including epoch zero.
+                if raw_time or (type(raw_time) in (int, float) and raw_time == 0):
+                    break
             
             # 2. Seviye
             severity = data.pop("level", None) or data.pop("severity", None) or data.pop("status", "INFO")
@@ -46,7 +51,8 @@ class JsonParser:
 
             return {
                 # ÖNLEM 3: Normalizer ile zaman damgası UTC'ye standartlaştırılıyor
-                "timestamp": self.ts.normalize(str(raw_time)) if raw_time else None,
+                "timestamp": self.ts.normalize(str(raw_time)) if raw_time is not None else None,
+                "raw_timestamp": raw_time,
                 
                 # ÖNLEM 2 (Ekstra Temizlik): Çevrilmiş ve temizlenmiş seviyeyi ata
                 "severity": final_severity,

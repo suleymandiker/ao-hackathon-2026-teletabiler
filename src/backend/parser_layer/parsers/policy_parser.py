@@ -154,6 +154,7 @@ class PolicyParser:
 
         return {
             "timestamp": timestamp,
+            "raw_timestamp": raw_ts,
             "severity": self._normalize_severity(self._value(match, "severity_group")),
             "message": message,
             "host": self._value(match, "host_group"),
