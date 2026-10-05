@@ -10,6 +10,7 @@ from template_layer.template_pipeline import TemplatePipeline
 from downstream_pipeline import DownstreamAIOpsPipeline
 from input_package_layer.package_loader import InputPackageLoader
 from time_quality import TimeQuality
+from parser_layer.timestamp.source_policy import TimestampContext, TimestampSourcePolicy, resolve_event_time
 import os
 
 class FullAIOpsPipelineV2:
@@ -18,13 +19,13 @@ class FullAIOpsPipelineV2:
         self.segmenter=SegmentationPipeline(); self.parser=ParserPipeline()
         self.templater=TemplatePipeline(state_path=template_state,candidate_state_path=drain_state)
         self.downstream=DownstreamAIOpsPipeline(window_seconds, use_ai_rca=use_ai_rca)
-    def process_package(self, zip_path: str) -> Dict[str,Any]:
+    def process_package(self, zip_path: str, *, source_timezone=None) -> Dict[str,Any]:
         package = InputPackageLoader().load(zip_path)
         self.downstream.set_context(package['topology'])
         try:
             # Structured hackathon alarms are already records. Do NOT send JSONL through
             # multiline log segmentation: a JSON object per physical line is one alarm.
-            result = self.process_structured_alarms(package['normalized_alarms'])
+            result = self.process_structured_alarms(package['normalized_alarms'], source_timezone=source_timezone)
             result['package_summary'] = package['summary']
             return result
         finally:
@@ -32,7 +33,7 @@ class FullAIOpsPipelineV2:
             except OSError: pass
 
 
-    def process_structured_alarms(self, alarms: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def process_structured_alarms(self, alarms: List[Dict[str, Any]], *, source_timezone=None) -> Dict[str, Any]:
         """Lossless fast path for the hackathon alarm package.
 
         Every source alarm becomes exactly one canonical/template event.  The parser/template
@@ -40,6 +41,7 @@ class FullAIOpsPipelineV2:
         intentionally bypassed because these inputs are structured records, not raw logs.
         """
         import hashlib
+        timestamp_context = TimestampContext(TimestampSourcePolicy(source_timezone))
         time_quality = TimeQuality.from_env()
         templated=[]
         trace_limit=200
@@ -57,9 +59,11 @@ class FullAIOpsPipelineV2:
             alarm_type=str(src.get('alarm_type') or 'unknown')
             tid='alarm:'+hashlib.sha1(f'{service}|{alarm_type}'.encode()).hexdigest()[:12]
             sev=str(src.get('severity') or 'INFO').upper()
+            event_time = resolve_event_time(src.get('timestamp'), timestamp_context)
             event={
                 'schema_version':'2.0', 'event_id':str(src.get('alarm_id') or ''),
-                'timestamp':src.get('timestamp'), 'severity_text':sev,
+                'timestamp':event_time.timestamp, 'severity_text':sev,
+                'timestamp_provenance':event_time.provenance(),
                 'severity_number':severity_number.get(sev,6), 'message':str(src.get('message') or ''),
                 'service_name':service, 'host':src.get('host'),
                 'resource':{'service':service,'host':src.get('host')}, 'attributes':attrs,
@@ -70,7 +74,7 @@ class FullAIOpsPipelineV2:
             }
             templated.append(event)
             if time_quality is not None:
-                parsed_time = time_quality.parsed(src, 'structured_alarm', structured=True)
+                parsed_time = time_quality.parsed(event, 'structured_alarm', structured=True)
                 time_quality.downstream(event, parsed_time)
             if len(seg_trace)<trace_limit: seg_trace.append(str(src)[:1200])
             if len(parser_trace)<trace_limit: parser_trace.append(dict(event))
@@ -91,10 +95,11 @@ class FullAIOpsPipelineV2:
         print(f"[PIPELINE] Sinyal adayı={ds.get('signal_candidates',0)} | Nitelikli={ds.get('qualified_signals',0)} | Gürültü={ds.get('noise_suppressed',0)} | Korelasyon={ds.get('correlations',0)} | Olay={ds.get('incidents',0)} | RCA={ds.get('rca',0)}")
         return downstream
 
-    def process_file(self, path: str, *, topology=None) -> Dict[str,Any]:
+    def process_file(self, path: str, *, topology=None, source_timezone=None) -> Dict[str,Any]:
         # Raw analyses use only their explicitly supplied context.
+        timestamp_policy = TimestampSourcePolicy(source_timezone)
         self.downstream.set_context(topology)
-        return self._process_logical_events(self.segmenter.iter_events(path))
+        return self._process_logical_events(self.segmenter.iter_events(path), timestamp_policy=timestamp_policy)
 
     def process_ingested_pages(
         self,
@@ -102,6 +107,7 @@ class FullAIOpsPipelineV2:
         *,
         policy_provider: PolicyProvider,
         topology=None,
+        source_timezone=None,
     ) -> Dict[str, Any]:
         """Analyze one caller-bounded, finite sequence of already acquired pages.
 
@@ -128,6 +134,7 @@ class FullAIOpsPipelineV2:
         Explicit topology is applied for this invocation and cleared on exit.
         Like the existing pipeline, an instance is not a concurrent request API.
         """
+        timestamp_policy = TimestampSourcePolicy(source_timezone)
         session = SegmentationSession(policy_provider)
         diagnostics = {
             'pages_read': 0, 'records_read': 0,
@@ -162,7 +169,8 @@ class FullAIOpsPipelineV2:
         events = logical_events()
         try:
             self.downstream.set_context(topology)
-            result = self._process_logical_events(events, event_provenance=event_provenance)
+            result = self._process_logical_events(events, event_provenance=event_provenance,
+                                                  timestamp_policy=timestamp_policy)
         finally:
             events.close()
             if not session.closed:
@@ -180,6 +188,7 @@ class FullAIOpsPipelineV2:
             'source_reference': asdict(record.source_reference),
             'source_timestamp_raw': record.source_timestamp_raw,
             'source_timestamp': record.source_timestamp.isoformat() if record.source_timestamp else None,
+            'source_timestamp_field': record.source_timestamp_field,
             'retrieval_order': record.retrieval_order,
             'first_observed_at': record.first_observed_at.isoformat() if record.first_observed_at else None,
         }
@@ -195,7 +204,7 @@ class FullAIOpsPipelineV2:
         }
 
     def _process_logical_events(
-        self, logical_events: Iterable[str | AssembledEvent], *, event_provenance=None,
+        self, logical_events: Iterable[str | AssembledEvent], *, event_provenance=None, timestamp_policy=None,
     ) -> Dict[str, Any]:
         """Shared existing parser/template/downstream flow; no policy preparation."""
         time_quality = TimeQuality.from_env()
@@ -205,6 +214,17 @@ class FullAIOpsPipelineV2:
         stats={'segmented':0,'parsed':0,'templated':0,'template_unreliable':0}
         for logical in logical_events:
             raw = logical.text if isinstance(logical, AssembledEvent) else logical
+            parse_options = {}
+            if isinstance(logical, AssembledEvent):
+                # The record contributing the first retained line owns this
+                # event's source fallback. Never borrow a continuation's clock.
+                first = next(record for record, evidence in zip(logical.records, logical.evidence)
+                             if evidence.included)
+                parse_options['timestamp_context'] = TimestampContext(
+                    timestamp_policy or TimestampSourcePolicy(),
+                    first.source_timestamp, first.source_timestamp_raw, first.source_timestamp_field)
+            elif timestamp_policy is not None and timestamp_policy.zone is not None:
+                parse_options['timestamp_context'] = TimestampContext(timestamp_policy)
             stats['segmented']+=1
             if len(trace['segmentation']) < trace_limit:
                 trace['segmentation'].append(raw)
@@ -213,14 +233,14 @@ class FullAIOpsPipelineV2:
                 # parsers can still use their existing process() method.
                 parse_with_outcome = getattr(self.parser, 'process_with_outcome', None)
                 if callable(parse_with_outcome):
-                    outcome = parse_with_outcome(raw)
+                    outcome = parse_with_outcome(raw, **parse_options)
                     event = outcome.event
                     parsed_time = time_quality.parsed(event, outcome.parser_id)
                 else:
-                    event = self.parser.process(raw)
+                    event = self.parser.process(raw, **parse_options)
                     parsed_time = time_quality.parsed(event)
             else:
-                event=self.parser.process(raw)
+                event=self.parser.process(raw, **parse_options)
             if isinstance(logical, AssembledEvent):
                 provenance = self._assembled_provenance(logical)
                 event_provenance.append({'event_id': event.get('event_id') if event else None,

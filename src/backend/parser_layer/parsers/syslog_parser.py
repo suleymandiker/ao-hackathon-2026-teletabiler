@@ -163,6 +163,7 @@ class SyslogParser:
 
         return {
             "timestamp": self.ts.normalize(timestamp_raw) if timestamp_raw else None,
+            "raw_timestamp": timestamp_raw,
             "severity": severity,
             "message": f"{app_name.strip()}: {message_part.strip()}",
             "host": host.strip() if host else None,

@@ -23,6 +23,7 @@ REGEX = r"^\d{4}-\d{2}-\d{2}T"
 
 @pytest.fixture
 def harness(monkeypatch, tmp_path):
+    monkeypatch.setenv('AIOPS_TIME_DEBUG', 'false')
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "src" / "backend"))
 
     def forbidden(*args, **kwargs):
@@ -93,12 +94,12 @@ def harness(monkeypatch, tmp_path):
             super().__init__(ai_enabled=False)
             self.calls, self.outcomes = [], []
 
-        def process(self, raw):
+        def process(self, raw, **kwargs):
             self.calls.append(raw)
-            return super().process(raw)
+            return super().process(raw, **kwargs)
 
-        def process_with_outcome(self, raw):
-            outcome = super().process_with_outcome(raw)
+        def process_with_outcome(self, raw, **kwargs):
+            outcome = super().process_with_outcome(raw, **kwargs)
             self.outcomes.append(outcome)
             return outcome
 
@@ -321,9 +322,11 @@ def test_provenance_attribute_collision_preserves_source_values(harness):
 
 def test_provenance_does_not_change_event_ids_template_ids_or_parser_outcomes(harness):
     from parser_layer.contracts import Delivery, Recognition
+    from parser_layer.timestamp.source_policy import TimestampContext
 
     raw = "2026-01-02T03:04:05Z INFO operation started\n    ERROR continuation detail"
-    direct = harness.parser(ai_enabled=False).process_with_outcome(raw)
+    direct = harness.parser(ai_enabled=False).process_with_outcome(raw, timestamp_context=TimestampContext(
+        source_record_time=OBSERVED, source_record_raw=record(1).source_timestamp_raw))
     pipeline = harness.pipeline()
     pipeline.process_ingested_pages([page(record(1, raw))], policy_provider=provider)
     parsed = pipeline.templater.inputs[0]
@@ -390,6 +393,13 @@ def test_source_and_file_results_match_except_additive_provenance(harness, tmp_p
     for stage in ("parser", "template"):
         for event in actual["pipeline_trace"][stage]["items"]:
             event["attributes"].pop("source_provenance", None)
+            time_provenance = dict(event['timestamp_provenance'])
+            event['timestamp_provenance'] = time_provenance
+            assert time_provenance['basis'] == 'message_explicit'
+            assert time_provenance['source_record_time'] == OBSERVED.isoformat()
+            assert time_provenance['source_record_timestamp_raw'] == inputs[0].source_timestamp_raw
+            time_provenance['source_record_time'] = None
+            time_provenance['source_record_timestamp_raw'] = None
     assert actual == expected
 
 
@@ -534,7 +544,7 @@ def test_existing_none_results_are_skipped_but_provenance_remains(harness, monke
     target = pipeline.parser if stage == "parser" else pipeline.templater
     calls = []
 
-    def no_result(value):
+    def no_result(value, **kwargs):
         calls.append(value)
         return None
 

@@ -64,6 +64,9 @@ class KVParser:
         raw_time = fields.pop("timestamp", None)
         if raw_time is None:
             raw_time = fields.pop("time", None)
+        # Keep legacy message/attribute extraction, but occurrence time must
+        # come from an exact top-level header assignment, never a nested value.
+        raw_time = self._event_timestamp(log)
 
         severity = fields.pop("level", None)
         if severity is None:
@@ -99,3 +102,37 @@ class KVParser:
             "message": str(message).strip('"\' '),
             "attributes": fields,
         }
+
+    @staticmethod
+    def _event_timestamp(log):
+        header = log.partition('\n')[0]
+        assignment = re.compile(r'''(timestamp|time|@timestamp)=("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,\]\})]+)''')
+        values = {}
+        depth, quote, escaped = 0, None, False
+        index = 0
+        while index < len(header):
+            char = header[index]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == '\\':
+                    escaped = True
+                elif char == quote:
+                    quote = None
+            elif char in ('"', "'"):
+                quote = char
+            elif char in '{[(':
+                depth += 1
+            elif char in '}])':
+                depth = max(0, depth - 1)
+            elif depth == 0 and (index == 0 or header[index - 1].isspace()):
+                match = assignment.match(header, index)
+                if match:
+                    value = match.group(2)
+                    if value[:1] in ('"', "'"):
+                        value = value[1:-1]
+                    values.setdefault(match.group(1), value)
+                    index = match.end()
+                    continue
+            index += 1
+        return next((values[key] for key in ('timestamp', 'time', '@timestamp') if key in values), None)

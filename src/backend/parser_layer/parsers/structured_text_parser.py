@@ -275,7 +275,8 @@ class StructuredTextParser:
                 },
             }
 
-        timestamp, raw_timestamp = self.ts.extract(first_line)
+        timestamp, event_timestamp_raw = self.ts.extract(first_line)
+        raw_timestamp = self.ts.legacy_message_span(first_line)
         # A recognized source timestamp may be structurally useful even when it
         # cannot be normalized to an absolute CanonicalEvent timestamp. Example:
         # Apache "[Sun Dec 04 04:47:44 2005]" has no timezone. In that case
@@ -341,7 +342,7 @@ class StructuredTextParser:
 
         return {
             "timestamp": timestamp,
-            "raw_timestamp": raw_timestamp,
+            "raw_timestamp": event_timestamp_raw,
             "severity": severity,
             "message": message,
             **optional_fields,

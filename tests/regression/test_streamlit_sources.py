@@ -85,11 +85,11 @@ def ui(monkeypatch, tmp_path):
     payload = result_fixture()
 
     class Pipeline:
-        def process_file(self, path):
-            file_calls.append((Path(path).read_text(encoding='utf-8'), path))
+        def process_file(self, path, *, source_timezone=None):
+            file_calls.append((Path(path).read_text(encoding='utf-8'), path, source_timezone))
             return payload
-        def process_package(self, path):
-            package_calls.append((Path(path).read_bytes(), path))
+        def process_package(self, path, *, source_timezone=None):
+            package_calls.append((Path(path).read_bytes(), path, source_timezone))
             return payload
         def process_ingested_pages(self, *args, **kwargs):
             pytest.fail('Acquisition is mocked at the application boundary in UI tests')
@@ -328,6 +328,7 @@ def test_upload_routes_keep_conversion_package_bypass_and_cleanup(ui, monkeypatc
     assert not app.exception and not ui.sources
     calls = ui.packages if route == 'package' else ui.files
     assert len(calls) == 1 and not Path(calls[0][1]).exists()
+    assert calls[0][2] is None  # Unknown remains the safe per-upload default.
     if route == 'package':
         assert calls[0][0] == content and not ui.files
     elif name.endswith('.log'):
@@ -337,6 +338,29 @@ def test_upload_routes_keep_conversion_package_bypass_and_cleanup(ui, monkeypatc
         assert row['severity'] == 'CRITICAL' and row['source_severity'] == 5
     assert app.title[0].value == 'Investigation sonucu'
     assert_safe(app)
+
+
+def test_file_timezone_is_explicit_and_new_upload_resets_it(ui, monkeypatch):
+    upload = SimpleNamespace(name='sample.log', getvalue=lambda: b'2026-09-28 19:32:11 ERROR failure\n')
+    callbacks = []
+    def uploader(*args, **kwargs):
+        callbacks.append(kwargs['on_change'])
+        return upload
+    monkeypatch.setattr(ui.st, 'file_uploader', uploader)
+    app = ui.app()
+    app.button(key='start_file').click().run()
+    assert app.selectbox(key='file_source_timezone').value == 'Unknown'
+    app.selectbox(key='file_source_timezone').select('UTC').run()
+    app.button(key='run_analysis').click().run()
+    assert ui.files[-1][2] == 'UTC'
+    assert not app.exception
+    app.button(key='new_investigation_button').click().run()
+    # AppTest lacks file-upload mutation; exercise the registered callback with
+    # its session state and then rerun the actual selector.
+    monkeypatch.setattr(ui.st, 'session_state', app.session_state)
+    callbacks[-1]()
+    app.run()
+    assert app.selectbox(key='file_source_timezone').value == 'Unknown'
 
 
 def test_source_switch_isolates_results_across_all_exploration_pages(ui):

@@ -1,8 +1,9 @@
 from __future__ import annotations
 from collections import defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Iterable, List, Tuple
 from analysis_time import source_time_ms, order_key, signal_order
+from parser_layer.timestamp.source_policy import BASES
 import re
 
 
@@ -77,6 +78,7 @@ class SignalAggregate:
     environments: List[str]
     business_criticalities: List[str]
     source_order: int | None = None
+    timestamp_basis_counts: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -146,6 +148,8 @@ class SignalAggregator:
                 source_systems=vals('source_system'), data_centers=vals('data_center'), racks=vals('rack'),
                 environments=vals('environment'), business_criticalities=vals('business_criticality'),
                 source_order=rows[0].get('source_order'),
+                timestamp_basis_counts={basis: total for basis in BASES
+                    if (total := sum((r.get('timestamp_provenance') or {}).get('basis') == basis for r in rows))},
             ).to_dict())
         return sorted(out, key=lambda row: (row['window_start_ms'] is None,
                       row['window_start_ms'] or 0, *signal_order(row)))

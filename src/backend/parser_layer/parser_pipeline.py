@@ -124,11 +124,13 @@ class ParserPipeline:
             "ai_calls": ai_calls,
         }
 
-    def process(self, event):
+    def process(self, event, *, timestamp_context=None):
         """Return the existing canonical payload without outcome metadata."""
-        return self.process_with_outcome(event).event
+        if timestamp_context is None:
+            return self.process_with_outcome(event).event
+        return self.process_with_outcome(event, timestamp_context=timestamp_context).event
 
-    def process_with_outcome(self, event) -> ParseOutcome:
+    def process_with_outcome(self, event, *, timestamp_context=None) -> ParseOutcome:
         """Describe the existing parse path without changing extraction or routing."""
         if not event or not event.strip():
             return ParseOutcome(
@@ -136,6 +138,7 @@ class ParserPipeline:
             )
 
         t0 = time.perf_counter()
+        builder_options = {} if timestamp_context is None else {'timestamp_context': timestamp_context}
         format_type = "safe_fallback"
         parser_fallback = False
         try:
@@ -171,7 +174,7 @@ class ParserPipeline:
                 parser_fallback = True
                 parser_id = "safe_fallback"
 
-            result = self.builder.build(fields, event, format_type)
+            result = self.builder.build(fields, event, format_type, **builder_options)
 
             total_ms = (time.perf_counter() - t0) * 1000
             if total_ms > 20:
@@ -210,6 +213,7 @@ class ParserPipeline:
                 },
                 event,
                 "safe_fallback",
+                **builder_options,
             )
             return ParseOutcome(
                 result, Recognition.PARSER_ERROR, Delivery.FALLBACK,

@@ -245,7 +245,7 @@ def test_page_ingestion_preserves_source_time_and_order_without_observation_fall
     from template_layer.template_pipeline import TemplatePipeline
     parser, builder = JsonParser(), CanonicalEventBuilder()
     pipeline = FullAIOpsPipelineV2.__new__(FullAIOpsPipelineV2)
-    pipeline.parser = SimpleNamespace(process=lambda raw: builder.build(parser.parse(raw), raw))
+    pipeline.parser = SimpleNamespace(process=lambda raw, **kwargs: builder.build(parser.parse(raw), raw, **kwargs))
     pipeline.templater = TemplatePipeline(state_path=tmp_path / 'templates.json', candidate_state_path=tmp_path / 'drain.bin')
     pipeline.downstream = DownstreamAIOpsPipeline()
     records = tuple(IngestedLogRecord(
@@ -259,6 +259,10 @@ def test_page_ingestion_preserves_source_time_and_order_without_observation_fall
     result = pipeline.process_ingested_pages([SourcePage(records, True)],
         policy_provider=lambda *args: SegmentationPolicy('test', r'^\{', 'fixture'))
     assert result['analysis_time']['analysis_reference_time_ms'] == 1791158400000
-    assert [s['timestamp_resolved'] for s in result['signals']] == [True, False]
-    assert result['signals'][1]['first_seen_ms'] is None
+    # The second event now uses the explicitly authorized source-record fallback;
+    # the later observation clock must still never enter occurrence time.
+    assert [s['timestamp_resolved'] for s in result['signals']] == [True]
+    assert result['signals'][0]['count'] == 2
+    assert result['signals'][0]['first_seen_ms'] == 1791158400000
+    assert result['signals'][0]['timestamp_basis_counts'] == {'message_explicit': 1, 'source_record': 1}
     assert result['event_provenance'][0]['provenance']['contributors'][0]['retrieval_order'] == (0,)

@@ -69,13 +69,13 @@ def _uploaded_to_pipeline_text(upload):
     return text, suffix or '.log'
 
 
-def run_uploaded(upload):
+def run_uploaded(upload, *, source_timezone=None):
     if Path(upload.name).suffix.lower() == '.zip':
         with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as file:
             file.write(upload.getvalue())
             path = file.name
         try:
-            return get_pipeline().process_package(path)
+            return get_pipeline().process_package(path, source_timezone=source_timezone)
         finally:
             _remove_upload(path)
     content, suffix = _uploaded_to_pipeline_text(upload)
@@ -83,6 +83,6 @@ def run_uploaded(upload):
         file.write(content)
         path = file.name
     try:
-        return get_pipeline().process_file(path)
+        return get_pipeline().process_file(path, source_timezone=source_timezone)
     finally:
         _remove_upload(path)

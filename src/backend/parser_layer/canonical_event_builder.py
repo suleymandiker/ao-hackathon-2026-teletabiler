@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import xxhash
 from parser_layer.timestamp.timestamp_evidence import unresolved_timestamp_evidence
+from parser_layer.timestamp.source_policy import resolve_event_time
 
 
 class CanonicalEventBuilder:
@@ -17,13 +18,19 @@ class CanonicalEventBuilder:
     def __init__(self):
         self._counter = 0
 
-    def build(self, fields, raw, source=None):
+    def build(self, fields, raw, source=None, *, timestamp_context=None):
         fields = dict(fields or {})
         attributes = dict(fields.get("attributes") or {})
 
-        timestamp = fields.get("timestamp")
+        # Raw captures are supplied by each parser's event-time contract. The
+        # diagnostic raw-log scanner below is never an occurrence-time authority.
+        event_time = resolve_event_time(fields.get('raw_timestamp', fields.get('timestamp')), timestamp_context)
+        timestamp = event_time.timestamp
         if timestamp is None:
             evidence = unresolved_timestamp_evidence(raw, fields.get("raw_timestamp"))
+            if (event_time.context.policy.zone is not None
+                    and evidence['timestamp_status'] == 'timezone_missing'):
+                evidence['timestamp_status'] = 'source_timezone_unresolved'
             # Preserve source attributes with the same names without allowing
             # them to masquerade as parser-generated diagnostic evidence.
             for key, value in evidence.items():
@@ -79,6 +86,7 @@ class CanonicalEventBuilder:
             },
             "attributes": attributes,
             "raw": raw,
+            "timestamp_provenance": event_time.provenance(),
         }
 
     @staticmethod

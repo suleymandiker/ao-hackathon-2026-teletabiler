@@ -4,6 +4,7 @@ import os
 
 from analysis_time import signal_time, source_time_ms
 from parser_layer.timestamp.timestamp_evidence import unresolved_timestamp_evidence
+from parser_layer.timestamp.source_policy import BASES
 
 
 class TimeQuality:
@@ -12,7 +13,7 @@ class TimeQuality:
                          'positional_structured', 'plain_text', 'custom',
                          'safe_fallback', 'structured_alarm', 'unavailable'))
     STATUSES = ('resolved', 'missing', 'timezone_missing', 'year_missing',
-                'date_missing', 'unparsed', 'invalid', 'unknown')
+                'date_missing', 'unparsed', 'invalid', 'unknown', 'source_timezone_unresolved')
 
     def __init__(self):
         self.counts = dict.fromkeys((
@@ -26,6 +27,8 @@ class TimeQuality:
         ), 0)
         self.statuses = dict.fromkeys(self.STATUSES, 0)
         self.by_parser = Counter()
+        self.bases = dict.fromkeys(BASES, 0)
+        self.naive_headers_resolved = 0
 
     @classmethod
     def from_env(cls):
@@ -47,9 +50,17 @@ class TimeQuality:
             return None
         counts['parsed_events_total'] += 1
         timestamp = source_time_ms(event.get('timestamp'))
-        evidence = (unresolved_timestamp_evidence('', event.get('timestamp'))
+        provenance = event.get('timestamp_provenance') or {}
+        basis = provenance.get('basis')
+        if basis in self.bases:
+            self.bases[basis] += 1
+        if basis == 'message_source_timezone' and parser_id in (
+            'plain_text', 'structured_text', 'positional_structured', 'syslog', 'custom',
+        ):
+            self.naive_headers_resolved += 1
+        evidence = (unresolved_timestamp_evidence('', provenance.get('message_timestamp_raw', event.get('timestamp')))
                     if structured else event.get('attributes') or {})
-        raw = evidence.get('raw_timestamp')
+        raw = provenance.get('message_timestamp_raw', evidence.get('raw_timestamp'))
         present = timestamp is not None or (raw is not None and raw != '')
         counts['source_timestamp_present' if present else 'source_timestamp_not_detected'] += 1
         resolved = timestamp is not None
@@ -89,6 +100,8 @@ class TimeQuality:
         lines = ['[TIME QUALITY]']
         lines.extend(f'{key}={value}' for key, value in counts.items())
         lines.extend(f'timestamp_status_{key}={value}' for key, value in self.statuses.items())
+        lines.extend(f'timestamp_basis_{key}={value}' for key, value in self.bases.items())
+        lines.append(f'naive_header_resolved_by_source_policy={self.naive_headers_resolved}')
         lines.extend(f'parser_{parser}_{status}={count}'
                      for (parser, status), count in sorted(self.by_parser.items()))
         print('\n'.join(lines))

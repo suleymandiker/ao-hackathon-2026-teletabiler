@@ -1,153 +1,222 @@
-# Timestamp provenance and Citrix time-quality investigation
+# Event timestamp authority and source timezone policy
 
-The reported three Citrix runs of the same 16 MB file were deterministic:
-30,394 segmented/parsed/templated events, 8,089 candidates, 15 qualified signals,
-0 correlations, 15 incidents and 15 RCA results. Selected RCA evidence had zero
-known signal windows. The raw file and its timestamp examples were not supplied
-for this investigation. Local fixtures confirm the defects below, but do not
-establish that those defects occur in that file.
+This report supersedes the earlier timestamp investigation with the explicit
+source-time decision and authority rules. The working tree was clean when this
+implementation started; the prior 810-test timestamp/determinism baseline is
+preserved except for deliberately updated expectations described below.
 
-## Provenance through the current implementation
+## Three distinct kinds of time
 
-| Stage | Authoritative field/path | Finding |
-| --- | --- | --- |
-| Physical lines | `MultilineAssembler.iter_event_records()` | The file adapter removes line terminators, omits blank lines with boundary evidence, and joins retained lines with `\n`. The timestamp-bearing first line and continuation indentation survive. No segmentation change was needed. |
-| Logical event | `ParserPipeline.process_with_outcome(raw)` | Format detection chooses JSON, syslog, structured text, positional text, KV, plain text or a resident custom policy. `process()` delegates to this same outcome method. Outcome recognition/delivery describe parsing, not timestamp resolution. |
-| Extracted fields | `fields['timestamp']`, optional `fields['raw_timestamp']` | `TimestampNormalizer` is the existing timestamp authority. Explicit source values/header captures supply time; no second parser or clock is added. Parsers now pass their existing raw capture into the builder's already-supported diagnostic field. |
-| Canonical event | `event['timestamp']` | `CanonicalEventBuilder` copies the parsed value. For unresolved time, `attributes.raw_timestamp` and `attributes.timestamp_status` retain diagnostic evidence. `observed_timestamp` remains observation metadata only. |
-| Template result | `TemplatePipeline.process(event)` | Reads the message and returns `TemplateResult`; it does not replace the event or mutate its timestamp. |
-| Downstream input | `FullAIOpsPipelineV2`: `row = dict(event)` | Adds template fields and invocation-local `source_order`. Timestamp survives unchanged. Tests compare canonical and templated values and simulate a loss to verify diagnostics detect it. |
-| Aggregation | `SignalAggregator`, `analysis_time.source_time_ms()` | Consumes only `timestamp`. Valid values produce factual millisecond buckets; unresolved values enter an explicit `None` bucket. Observation/upload/retrieval clocks are ignored. |
-| Signal | `timestamp_resolved`, `first_seen_ms`, `last_seen_ms`, `window_start_ms`, `window_end_ms` | Timed signals have real bounds. Untimed bounds remain `None`, and the signal ID ends in `:untimed`. Qualification thresholds are unchanged. |
-| Correlation | `SignalCorrelator.correlate()` | Existing temporal predicates require valid first/last bounds. Untimed signals cannot enter pair comparisons. Resolved time makes comparison possible but does not guarantee an edge. |
-| RCA evidence | `RCAEvidenceSelector` | `signal_windows` counts distinct numeric windows of resolved member signals. Zero means no known window in that selected group; it does not establish that every raw event in the file lacks time. |
+- **Event time** is the occurrence time identified by an authoritative parser
+  header/field. Only this, or the authorized source fallback, drives correlation.
+- **Source-record time** is acquisition evidence, such as OpenSearch `@timestamp`.
+  It remains separately identified even when used as fallback event time.
+- **Business time** is payload data: expiry, start, activation, invoice or payment
+  dates. It must never silently become occurrence time.
 
-Structured alarm packages bypass text parsing and copy the source `timestamp`
-field into their canonical/template representation. Their diagnostics label this
-route `structured_alarm`. In page ingestion, `source_timestamp_raw` and
-`source_timestamp` on acquisition records remain separate `source_provenance`;
-they are not automatically promoted into canonical event time. Time-quality
-presence counts concern parsed logical-event evidence (or the structured alarm's
-timestamp field), not acquisition/observation metadata.
+All resolved occurrence times are timezone-aware UTC instants internally.
+`19:32Z == 22:32+03:00`. OpenShift displaying three hours behind Türkiye is not
+itself a timestamp defect. There is no manual +3-hour adjustment; display timezone
+is a presentation concern. Original header text, raw messages and raw acquisition
+timestamp evidence are retained separately from normalized values.
 
-## Confirmed defects and supported formats
+## Confirmed promotion defects
 
-Before production edits, four tests showed that `TimestampNormalizer.normalize()`
-could resolve a timestamp while `extract()` truncated its explicit timezone:
+`TimestampNormalizer.extract()` previously used `pattern.search(first_line)` and
+tried ISO `T` patterns before space-separated patterns. A line beginning with
+`2026-09-28 19:30:53,252` could therefore select an embedded
+`activationDate=2026-08-26T20:54:51.000+03:00`. A headerless payload date could also
+be selected. Both structured and plain parsing used that result as event time.
 
-- `2026-10-05 09:10:11Z`
-- `2026-10-05 12:10:11+03:00`
-- `2026-10-05 12:10:11+0300`
-- `2026-10-05T12:10:11 +03:00`
+KV extraction scanned the whole logical event and accepted matches inside nested
+containers, dotted payload keys and continuation lines. Five deterministic tests
+reproduced these promotion defects before their production fixes.
 
-The exact loss stage was **header extraction before canonical construction**.
-The existing ISO search patterns now retain the complete suffix. All four yield
-`2026-10-05T09:10:11+00:00`. No timezone is inferred. Three additional review
-regressions ensure a following word beginning with `Z`, or an offset-like prefix
-inside a longer token, cannot be mistaken for a complete timezone suffix.
+Event-time extraction now matches only the recognized header start (optionally
+bracketed or severity-prefixed), or the parser's explicitly defined timestamp
+field. KV time keys must be exact top-level assignments on the first line, outside
+quoted payloads and containers. Pattern ordering cannot choose a later business
+date in preference to a naive header.
 
-Three other failing tests showed that JSON's truthiness checks discarded epoch
-zero under `timestamp`, `time`, and `@timestamp`. Zero now survives with the
-existing key priority/fallback rules. It represents the actual Unix epoch.
+The structured parser also used its historical timestamp span for **message
+slicing**. Changing that slicing would change actual template identity, which is
+outside this task's authorization. `legacy_message_span()` retains that exact
+formatting behavior, with no normalization or occurrence-time authority. The
+independent authoritative capture supplies event time. A regression preserves
+the old message for the embedded-date example, and source-policy integration
+checks preserve template IDs. The legacy message-boundary defect is not repaired
+in this task; it cannot supply event time anymore.
 
-Seven tests reproduced incomplete unresolved-time diagnostics: severity-prefixed
-ISO, day-first slash dates, Apache brackets, a non-leading KV time, severity-prefixed
-month/day clocks, positional clocks and custom policy timestamp groups. Their
-existing raw captures now reach the builder, and diagnostic-only validation
-recognizes missing timezone/year evidence. These changes do not resolve naive time.
+The provided real-file counts (1,104 resolved records and approximately 1,104
+lines containing embedded offsets) are consistent with this defect, but no local
+raw-file audit establishes that every one of those 1,104 records followed it.
+The source file itself was not supplied locally.
 
-| Tested source shape | Parser route | Result |
-| --- | --- | --- |
-| `YYYY-MM-DDTHH:mm:ssZ`, `...+03:00`, `...-0400` | Structured text; also explicit JSON/KV fields and RFC5424 | UTC instant with the source offset respected. |
-| `YYYY-MM-DD HH:mm:ssZ`, `...+03:00`, `...+0300`, `... +03:00` | Structured text | UTC instant; adjacent suffix loss fixed. |
-| `YYYY-MM-DDTHH:mm:ss +03:00` | Structured text | UTC instant; spaced suffix loss fixed. |
-| `YYYY-MM-DD HH:mm:ss,fff+03:00` | Structured text | UTC instant with fractional seconds retained. |
-| `ERROR YYYY-MM-DDTHH:mm:ss+03:00 ...` | Structured text | UTC instant; prefix does not remove the time. Severity extraction itself is unchanged. |
-| `YYYY-MM-DD HH:mm:ss`, `YYYY-MM-DDTHH:mm:ss` | Structured text | `None`, `timezone_missing`. |
-| `DD/MM/YYYY HH:mm:ss` (including day > 12 and ambiguous day/month) | Structured text | Header span extracted, but `None`. Existing normalizer format list is month-first and naive; diagnostics also recognize day-first shape without choosing a locale or timezone. Offset-bearing slash formats are not newly supported. |
-| `Oct  5 HH:mm:ss host app: ...` | RFC3164 syslog | `None`, `year_missing`; timezone is missing too. |
-| `ERROR MM-DD HH:mm:ss [worker] ...` | Plain-text fallback from structured detection | `None`, `year_missing`; segmentation recognizing this header does not make it absolute time. |
-| `[Sun Dec 04 04:47:44 2005] ...` | Structured text | `None`, `timezone_missing`; raw diagnostic capture preserved. |
-| `DD/Mon/YYYY:HH:mm:ss +0300` in an access-log bracket | Structured text | UTC instant. |
-| JSON epoch milliseconds and zero; explicit KV/JSON ISO timestamp | JSON/KV | Factual UTC instant. |
-| Positional `YYYY-MM-DD-HH.mm.ss.fff`; custom captured `YYYYMMDD-H:M:S:fff` | Positional/custom | `None`, `timezone_missing`, with original capture retained. |
-| Missing time or malformed calendar date | Existing parser/fallback | `None`, respectively `missing` or `invalid`. |
+## Authority and normalization contract
 
-Repository documentation (`docs/mimari.md`, `docs/fazlar.md`) specifies unresolved
-time when year/timezone evidence is absent. No source-local timezone convention
-was found for these text logs. The existing normalizer's legacy handling of
-programmatic naive `datetime` objects is unchanged; this task does not extend that
-behavior to naive strings.
+`resolve_event_time()` implements this precedence:
 
-## Opt-in diagnostics
+1. Authoritative message/header timestamp with an explicit timezone/offset, or
+   an explicitly supported epoch value: `message_explicit`.
+2. Authoritative naive message/header timestamp plus the source's explicit
+   timezone policy: `message_source_timezone`.
+3. An absolute timestamp on the source record associated with this event:
+   `source_record`.
+4. Otherwise `None`: `untimed`.
 
-Set `AIOPS_TIME_DEBUG=true`; default is false. `1`, `true`, `yes`, and `on` are
-accepted case-insensitively with surrounding whitespace ignored. The flag is read
-at each full-pipeline invocation and is independent of `RCA_DEBUG`.
+A diagnostic timestamp search never supplies occurrence time. A missing year,
+missing date or date without a clock is not filled in. Ambiguous/nonexistent DST
+local clocks stay unresolved rather than selecting a fold or shifting the time.
+Invalid source timezone names fail explicitly. Programmatic naive `datetime`
+values also require source policy; the old implicit UTC assignment is removed.
 
-The collector lives only within that invocation and retains fixed counters, not
-events, raw values or unbounded per-format labels. It prints one `[TIME QUALITY]`
-block after downstream processing. Disabled mode creates no collector and prints
-no additional lines. No diagnostic fields are added to the pipeline result.
-Standalone `DownstreamAIOpsPipeline.process()` has no parser-stage diagnostics;
-instrumentation belongs to the full file/page/package orchestration path.
-
-| Fields | Meaning |
+| Parser | Authorized location |
 | --- | --- |
-| `events_total`, `parsed_events_total`, `parser_no_event` | Logical inputs, delivered canonical records and inputs with no canonical record. For structured alarms, the first two count source records. |
-| `source_timestamp_present`, `source_timestamp_not_detected` | Delivered events with resolved time or a nonempty raw timestamp capture, versus events with no detected timestamp. Presence includes malformed and source-local values; nondetection is not proof that an unsupported format contains no time. |
-| `parsed_timestamp_resolved`, `parsed_timestamp_unresolved` | Canonical values convertible by the same authority aggregation uses. |
-| `downstream_events_total`, `downstream_timestamp_resolved`, `downstream_timestamp_unresolved` | Exact templated rows supplied to downstream and their time quality, before aggregate filtering. |
-| `parsed_events_not_delivered`, `parsed_resolved_not_delivered` | Canonical records rejected by templating, including those carrying resolved time. |
-| `parsed_to_downstream_timestamp_lost`, `parsed_to_downstream_timestamp_changed` | Delivered rows whose resolved time disappeared, or whose normalized time changed (including loss/gain). Both should be zero. |
-| `signal_candidates_timed`, `signal_candidates_untimed` | Candidate signals with/without usable temporal bounds. |
-| `qualified_signals_timed`, `qualified_signals_untimed` | The subset eligible/ineligible for existing temporal pair comparisons. |
-| `timestamp_status_<status>` | Delivered-event counts for `resolved`, `missing`, `timezone_missing`, `year_missing`, `date_missing`, `unparsed`, `invalid`, `unknown`. `unparsed` means resolvable diagnostic evidence was not promoted by the selected parser. `invalid` also covers unsupported timestamp syntax. |
-| `parser_<parser_id>_<status>` | The same counts by delivering parser, using fixed labels from the existing outcome contract. Older injected parsers without outcomes are labeled `unavailable`. |
+| Plain/structured generic text | Header start, optionally bracketed or severity-prefixed. Other producer-prefix layouts require an explicit parser/policy contract. |
+| Structured format-specific paths | Existing Windows/Zookeeper/HealthApp header fields or access-log timestamp brackets. |
+| Syslog | Existing RFC5424 timestamp field; RFC3164 yearless clocks remain unresolved without another absolute source fallback. |
+| Positional | Existing validated positional timestamp column, with date consistency checks unchanged. |
+| JSON | Existing top-level `timestamp`, `time`, `@timestamp` keys in existing priority order. No recursive value scan. |
+| KV | Exact top-level `timestamp`, `time`, `@timestamp` assignments on the header line. Nested/dotted/continuation occurrences are not event fields. |
+| Policy parser | The explicitly declared `timestamp_group` in its existing first-line policy contract. Arbitrary attributes are not promoted. |
+| Structured alarms | The existing canonical `timestamp` source field; no text parser is introduced. |
 
-Only code-owned labels and integer counts are printed. No examples, full logs,
-timestamp values, API keys, Authorization, headers, credentials, policy contents
-or general environment contents are printed. Existing RCA prompt debugging is
-unchanged and is not needed for these diagnostics.
+The previous ISO suffix and epoch-zero fixes remain. Explicit `Z`, `+03:00`,
+`+0300`, negative offsets, fractional seconds and access-log offsets retain their
+absolute meaning. Source policy resolves supported complete naive dates, including
+the real `YYYY-MM-DD HH:mm:ss,fff` header. Slash-date locale interpretation is
+unchanged; no new day/month convention is invented. Yearless syslog/clock-only
+values remain unresolved even when the source timezone is known.
 
-## Interpretation and compatibility
+## Source-scoped configuration and provenance
 
-No downstream propagation defect was reproduced. A synthetic eight-event analysis
-has six detected timestamps: four resolved, two timezone-missing, plus two events
-with no time. All four resolved timestamps reach aggregation; no value changes.
-It yields two timed and two untimed qualified signals. The timed pair shares a
-service and differs by one second, naturally producing one existing `.58` edge.
-The two untimed groups retain `signal_windows=0`; each timed group has one window.
+`TimestampSourcePolicy(source_timezone=None)` and `TimestampContext` are frozen
+value objects under `parser_layer/timestamp/source_policy.py`. They express a
+source-provided normalization contract, independent of ingestion technology.
+The full-pipeline entry point creates them per invocation and passes them through
+the existing parser/outcome contract into canonical construction. Neither the
+cached pipeline nor parser stores a mutable/current timezone.
 
-For the real file, parsing/extraction failure and insufficient source time both
-remain possible. The observed zeros alone cannot distinguish them. No claim is
-made that the real file has any of the reproduced suffix/epoch defects. If all
-qualified signals remain untimed, zero temporal correlations is correct under the
-current predicates. If some become timed but there are still no edges, inspect
-the unchanged service/topology/gap predicates; time alone is insufficient.
+Backend file invocation for this source:
 
-There is no change to segmentation boundaries, correlation algorithms/scores,
-qualification thresholds, incident rules, RCA grouping/prompts/budgets/schema,
-equal-time tie-breaking or the rule that equal time is not temporal precedence.
-No machine/upload/observation-time fallback is restored. Missing factual time
-remains `None`.
+```python
+result = pipeline.process_file(path, source_timezone="UTC")
+```
 
-The canonical schema, parser outcome signature, template algorithm, policy
-signatures and persisted state formats are unchanged. Raw timestamp captures use
-an existing builder field and can improve unresolved diagnostic attributes.
-Correctly resolved timestamps change affected event IDs (time is part of their
-seed), window/incident identities and natural downstream decisions. Where a
-truncated timezone suffix previously leaked into a message with no following
-severity, consuming the complete timestamp can also change normalized message
-text and thus template IDs. Existing learning remains readable and reusable for
-unchanged messages; old entries are retained. No state is reset or migrated.
+Other sources can explicitly use `source_timezone="Europe/Istanbul"`. Omitting
+it leaves naive timestamps unresolved. File, structured-alarm/package and finite
+page entry points accept the optional keyword. A page invocation's policy applies
+to the explicitly supplied source scope; callers must separate sources requiring
+different timezone policies. No policy is inferred from environment, machine,
+user, browser, upload time or file modification time.
 
-## Citrix three-run procedure
+For this file, the user explicitly established UTC as its source timezone:
 
-1. Use the same repository revision, 16 MB input, topology, window size and UI
-   settings as the completed smoke. Keep the verified policy and template/Drain
-   state; do not delete/reset them. Stop Streamlit before enabling the flag.
-2. In the Citrix PowerShell terminal, from the repository root:
+```text
+2026-09-28 19:32:11,408 + source_timezone=UTC
+    -> 2026-09-28T19:32:11.408+00:00
+2026-09-28 19:32:11,408 + source_timezone=Europe/Istanbul
+    -> 2026-09-28T16:32:11.408+00:00
+```
+
+Windows/Citrix uses stdlib `zoneinfo` with `tzdata` now declared in requirements.
+Use equivalent IANA timezone data versions when comparing runs across machines.
+
+Canonical events have additive `timestamp_provenance` metadata:
+
+```json
+{"basis":"message_source_timezone","message_timestamp_raw":"2026-09-28 19:32:11,408","source_timezone":"UTC","source_record_time":null,"source_record_timestamp_raw":null,"source_record_field":null}
+```
+
+All four bases are explicit, including untimed events. Provenance accompanies the
+canonical event into the templated downstream row; signals retain bounded
+`timestamp_basis_counts`. This metadata is not used for scores/ranking. Legacy
+standalone aggregate inputs without provenance have an empty basis-count mapping.
+
+## Source-record fallback and OpenSearch
+
+OpenSearch acquisition continues to preserve its configured timestamp field as
+`IngestedLogRecord.source_timestamp_raw`, without performing parsing in the
+adapter. The additive `source_timestamp_field` records the actual configured
+field name (normally `@timestamp`). Acquisition still has no parser dependency.
+
+For an assembled event, the **first included record** owns the source fallback.
+Omitted blanks and continuation records cannot lend their timestamps to an event.
+Use that record's normalized `source_timestamp` if it is a valid absolute instant;
+otherwise attempt its `source_timestamp_raw`. Never use `first_observed_at`,
+retrieval order or the machine clock. Source timezone policy resolves message
+clocks only; it does not guess a timezone for naive acquisition timestamps.
+
+If message time resolves, it wins even when source-record time differs. Both the
+normalized source-record instant and original source evidence remain available
+in provenance. If message time cannot resolve and source time is absolute, event
+time uses the source instant with `basis=source_record`. No skew rejection,
+correlation adjustment or automatic time shift is introduced.
+
+## Time-quality diagnostics
+
+`AIOPS_TIME_DEBUG` remains opt-in, false by default, accepting `1`, `true`, `yes`
+and `on` case-insensitively. `RCA_DEBUG` is independent and need not be enabled.
+All new output remains counts only; no raw headers, business values, source field
+values, payloads, credentials, HTTP headers or general environment contents print.
+
+Added counters:
+
+- `timestamp_basis_message_explicit`
+- `timestamp_basis_message_source_timezone`
+- `timestamp_basis_source_record`
+- `timestamp_basis_untimed`
+- `naive_header_resolved_by_source_policy` (line/header parser routes; JSON/KV and
+  structured-alarm fields are counted in the broader message-policy basis)
+
+Existing event/source-presence, parsed/downstream resolved/unresolved,
+not-delivered, lost/changed, candidate/qualified timed/untimed and parser/status
+counters remain. Presence means detected timestamp evidence or a resolved instant;
+for pages this can include source-record fallback. A configured but unresolved
+local clock is labeled `source_timezone_unresolved`; missing policy remains
+`timezone_missing`. Status labels are diagnostic, not authority or scoring rules.
+
+All collectors are invocation-local, with fixed labels and bounded storage. The
+four basis counts sum to delivered canonical events on the real parser paths.
+`parsed_to_downstream_timestamp_lost` and `..._changed` should both remain zero.
+No diagnostic fields are added to the top-level pipeline result.
+
+## Compatibility and validation
+
+Segmentation boundaries, raw event text, message/template generation and actual
+template IDs are preserved. Persistent template/Drain state and policy signatures
+are unchanged: no reset, invalidation or migration. Corrected occurrence time can
+change canonical event IDs (timestamp is part of their seed), factual windows,
+signal/incident identities and the resulting decisions naturally.
+
+Canonical schema version and the frozen `ParseOutcome` envelope remain compatible;
+provenance and source-field metadata are additive. Old callers can omit all new
+keywords. Parser overrides receiving source context should forward the optional
+`timestamp_context` keyword. Exact canonical snapshots now assert the added
+metadata. The old page determinism test explicitly expecting an untimed event
+despite valid source-record time was updated to assert the authorized fallback,
+its basis and the unchanged prohibition on observation-time substitution.
+
+No qualification weights, correlation scores/evidence, incident grouping,
+deterministic RCA ranking or equal-time ordering/precedence rule changed.
+RCA prompts, evidence grouping, budgets, schemas, debug mode and fallback are
+untouched. No wall-clock occurrence-time fallback is restored.
+
+Local tests exercise embedded business values, header/field authority, both source
+timezones, DST ambiguity, explicit offset equivalence, source-record precedence,
+provenance through aggregation, real ProgrammingError/soap/BALANCE header shapes,
+repeated analyses and a fresh pipeline using the same temporary learned state.
+The ProgrammingError fixture uses repeated occurrences to qualify under the
+existing threshold; no production signal count is hardcoded. New tests block
+network/LLM/SQLite access and use temporary learning state. UI tests use the real
+Streamlit AppTest runner with fake analysis/acquisition boundaries.
+
+## Exact Citrix three-run smoke
+
+1. Keep the same policies, template/Drain learning state, topology, window size and
+   16 MB file. Install the updated requirements in the normal Citrix environment
+   if needed; do not reset learning state. Stop Streamlit.
+2. From the repository root in that environment:
 
    ```powershell
    $env:AIOPS_TIME_DEBUG = 'true'
@@ -155,73 +224,75 @@ unchanged messages; old entries are retained. No state is reset or migrated.
    python -B -m streamlit run src/frontend/streamlit_app.py
    ```
 
-   Use the same Python environment normally used for that deployment. Leave the
-   existing expert setting enabled to produce `[RCA CONTEXT]`; that aggregate
-   line does not require printing prompts with `RCA_DEBUG`.
-3. Analyze the same file twice through the same cached Streamlit pipeline. Label
-   the terminal results Run 1 and Run 2. For each run retain both `[PIPELINE]`
-   summary lines, the complete `[TIME QUALITY]` integer block, and `[RCA CONTEXT]`.
-4. Stop Streamlit with Ctrl+C. Run the same launch command again in the same
-   terminal (the flags remain set), and analyze the same file once as Run 3.
-5. Compare all three runs. With unchanged boundaries the expected first summary
-   is `Segmentasyon=30394 | Ayrıştırma=30394 | Şablonlama=30394` and
-   `events_total=parsed_events_total=downstream_events_total=30394`.
-   Require these accounting checks:
+3. Open **Dosya / Paket Analizi**, upload
+   `aicc-mcp-gateway-http-7fb879fc5f-9tpkw-aicc-mcp-gateway-http.log`, then select
+   **Timestamp timezone: UTC**. Select UTC after uploading: a new upload resets
+   the selector to Unknown. Leave the expert setting as before so aggregate
+   `[RCA CONTEXT]` remains available. Analyze and label the result Run 1.
+4. Start another file investigation in the same Streamlit process. Use the same
+   file and explicitly confirm **UTC** again. Analyze as Run 2; the pipeline
+   instance and intentional learning remain cached.
+5. Stop Streamlit with Ctrl+C and relaunch the same command in the same terminal.
+   Upload the same file, select **UTC** again, and analyze as Run 3. The selector
+   safely defaults to Unknown after restart.
+6. Retain both `[PIPELINE]` summaries, the complete `[TIME QUALITY]` integer block
+   and `[RCA CONTEXT]` from every run. Compare all counts with the same source
+   policy. Expected interpretation, conditional on parser support for all headers:
 
    ```text
-   source_timestamp_present + source_timestamp_not_detected = parsed_events_total
-   parsed_timestamp_resolved + parsed_timestamp_unresolved = parsed_events_total
-   downstream_timestamp_resolved + downstream_timestamp_unresolved = downstream_events_total
-   parsed_to_downstream_timestamp_lost = 0
-   parsed_to_downstream_timestamp_changed = 0
-   parsed_events_not_delivered = 0
-   qualified_signals_timed + qualified_signals_untimed = [PIPELINE] Nitelikli
+   events_total=30394
+   source_timestamp_present approximately 30391
+   parsed_timestamp_resolved approaches 30391
+   timestamp_basis_message_source_timezone approaches 30391
+   parsed_timestamp_unresolved approaches 3
+   timestamp_basis_untimed approaches 3
+   timestamp_basis_source_record=0          (this is a file upload)
+   downstream_timestamp_resolved=parsed_timestamp_resolved
+   downstream_timestamp_unresolved=parsed_timestamp_unresolved
+   parsed_to_downstream_timestamp_lost=0
+   parsed_to_downstream_timestamp_changed=0
    ```
 
-   All diagnostic counts and deterministic pipeline/RCA context selection counts
-   should match across the three runs when learning/configuration are equivalent.
-   Record any policy/template learning change separately. Expert wording need not
-   match. The prior 1,825 prompt tokens and 4,461 evidence characters are comparison
-   data, not targets after newly recovered time changes selected evidence.
-6. Interpret the actual counts, without presupposing their values:
-   - `source_timestamp_present=30394`, `timestamp_status_timezone_missing=30394`,
-     `downstream_timestamp_resolved=0` means detected calendar clocks without an
-     absolute timezone, not propagation loss. With the same 15 qualified signals,
-     timed/untimed would be `0/15`, and no known signal windows are expected.
-   - Large `timestamp_status_missing`/nondetection counts mean no timestamp was
-     detected by the chosen paths. Use parser breakdowns to request a tiny locally
-     sanitized header example if the source owner believes time exists.
-   - `timestamp_status_unparsed>0` identifies resolvable evidence that its selected
-     parser did not promote. `invalid>0` needs source-format validation.
-   - Resolved parser and downstream counts matching above zero, with zero
-     lost/changed counts, rule out a timestamp drop at templating for those rows.
-   - `qualified_signals_timed>0` enables temporal comparisons. Correlation/incident
-     counts must emerge from factual time and existing predicates. Do not target
-     the historical 105 correlations or one incident.
-7. Disable diagnostics and restart after collecting results:
+   These are smoke expectations, never production assertions. The three headerless
+   startup events must not acquire business or observation timestamps. The prior
+   1,104 resolved values are not trusted targets: without source policy, rejecting
+   embedded dates can reduce that number; with UTC policy, authoritative headers
+   should instead account for almost all resolved events.
+7. Qualified real errors should become timed when their header parser succeeds.
+   If they remain untimed, inspect `parser_<route>_<status>`, `timezone_missing`,
+   `source_timezone_unresolved` and retained header evidence. Do not tune downstream
+   rules. Real windows may change qualification counts, correlations and incidents.
+   Do not target 105 correlations, one incident, or the previous 0/15 timed split.
+8. Require matching deterministic counts/time-quality distributions across the
+   three runs under the same configuration and relevant learning state. Record
+   any learning change separately. RCA context selection should be deterministic;
+   expert wording is not required to match, and previous prompt tokens are not a
+   target. After collecting results, stop Streamlit, set
+   `$env:AIOPS_TIME_DEBUG = 'false'`, and restart.
 
-   ```powershell
-   $env:AIOPS_TIME_DEBUG = 'false'
-   python -B -m streamlit run src/frontend/streamlit_app.py
-   ```
+The real Citrix smoke remains an operator step. Local tests establish the source
+policy and authority semantics, not a measured distribution for the unavailable
+real file.
 
-The real three-run time-quality smoke remains to be performed by the Citrix
-operator; no real-file timestamp distribution or post-fix count is claimed here.
+## Validation results
 
-## Local validation
-
-- Timestamp/provenance suite: **47 passed**. Defect reproductions failed before
-  their production fixes (14 cases total), then passed.
-- Three additional suffix-token regressions failed during implementation review
-  and passed after requiring a complete timezone token.
-- Existing downstream determinism suite: **27 passed**.
-- RCA expert/evidence/density suites: **158 passed**.
-- Parser outcomes, multiline boundary, context isolation and ingested pipeline:
-  **71 passed**.
+- New authority/source-timezone suite: **41 passed**; existing timestamp/provenance
+  suite: **47 passed** (combined **88**).
+- Existing determinism suite: **27 passed**, including the deliberate source-record
+  fallback expectation update described above.
+- Parser outcomes, multiline/context boundaries, finite ingestion and OpenSearch
+  acquisition: **253 passed**.
+- Focused RCA expert/evidence/density: **158 passed**.
+- Authority plus Streamlit source/UI checks: **85 passed** (41 authority + 44 UI).
 - Full `python -B -m pytest -q -p no:cacheprovider tests/regression`:
-  **810 passed** (30.92 s), preserving the 763-test baseline plus 47 new cases.
-- New tests block sockets, HTTP, LLM calls and SQLite before constructing parser
-  dependencies; real template persistence uses temporary paths only.
-- Changed files: `.env.example`, `full_pipeline_v2.py`, new `time_quality.py`,
-  JSON/KV/plain/structured/positional/policy parsers, `timestamp_normalizer.py`,
-  `timestamp_evidence.py`, new `test_timestamp_provenance.py`, and this report.
+  **852 passed** in 30.62 seconds, versus the 810-test baseline.
+- Complete diff reviewed. Tracked and new-file whitespace checks pass. No real
+  network/LLM calls, production SQLite or production learning state used in tests.
+- Nothing staged, committed or pushed.
+
+Changed files: `requirements.txt`; `full_pipeline_v2.py`; ingestion contracts and
+OpenSearch source mapping; canonical builder and parser pipeline; KV/structured/
+syslog parsers and timestamp normalizer; new `timestamp/source_policy.py`;
+`time_quality.py`; aggregation's additive basis counters; frontend upload runtime
+and Streamlit selector; new `test_timestamp_authority.py`; updated parser outcome,
+ingestion, determinism and Streamlit source regressions; this report.

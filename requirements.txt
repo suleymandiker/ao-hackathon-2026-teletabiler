@@ -11,3 +11,6 @@ python-dotenv>=1.0.1
 # Hizli hash ve log template mining
 xxhash>=3.4.1
 drain3>=0.9.11,<1.0
+
+# IANA source timezone rules on Windows/Citrix (stdlib zoneinfo data provider).
+tzdata>=2024.1

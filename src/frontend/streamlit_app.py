@@ -50,6 +50,10 @@ def select_source():
     show_form()
 
 
+def reset_file_timezone():
+    st.session_state['file_source_timezone'] = 'Unknown'
+
+
 try:
     connection = openshift.load_connection()
 except openshift.ApplicationError:
@@ -100,6 +104,7 @@ def new_investigation():
         st.session_state['analysis_source'] = source
     selected_source = st.radio('Kaynak', [OPENSHIFT, FILES], key='analysis_source', horizontal=True, on_change=select_source)
     upload = request = None
+    source_timezone = None
     target = ''
     form, guide = st.columns([1.7, 1], gap='large')
     with form, st.container(border=True):
@@ -125,7 +130,12 @@ def new_investigation():
                     st.info('Namespace, workload ve zaman aralığını tamamlayın.')
             target = redact(f'{namespace} / {workload}')
         else:
-            upload = st.file_uploader('Dosya veya alarm paketi', type=['zip', 'csv', 'json', 'txt', 'md', 'log'], key='upload')
+            upload = st.file_uploader('Dosya veya alarm paketi', type=['zip', 'csv', 'json', 'txt', 'md', 'log'],
+                                      key='upload', on_change=reset_file_timezone)
+            zone = st.selectbox('Timestamp timezone', ['Unknown', 'UTC', 'Europe/Istanbul'],
+                                key='file_source_timezone',
+                                help='Saat dilimi içermeyen olay zamanları için kaynak ayarı. Unknown: zaman dilimi varsayılmaz.')
+            source_timezone = None if zone == 'Unknown' else zone
             st.caption('ZIP: alarm verisi, inventory ve servis bağımlılıkları. Tekil LOG / TXT / MD / JSON / CSV dosyaları da desteklenir.')
             target = redact(upload.name) if upload else ''
         run = st.button('Analizi Başlat', key='run_analysis', type='primary', width='stretch',
@@ -135,10 +145,10 @@ def new_investigation():
         st.caption('Önce sistemin ne bulduğunu görün. Ardından pattern, sinyal ve incident kanıtlarını inceleyin.')
         st.markdown('1. Kaynağı ve kapsamı seçin.\n2. Analizi başlatın.\n3. Sonuç ve kanıtları birlikte değerlendirin.')
     if run:
-        execute(selected_source, target, upload, request)
+        execute(selected_source, target, upload, request, source_timezone=source_timezone)
 
 
-def execute(selected_source, target, upload, request):
+def execute(selected_source, target, upload, request, *, source_timezone=None):
     lock = get_analysis_lock()
     if not lock.acquire(blocking=False):
         st.warning(openshift.MESSAGES['busy'])
@@ -150,7 +160,7 @@ def execute(selected_source, target, upload, request):
         with st.status('Analiz çalışıyor', expanded=True) as status:
             st.write('Veriler alınıyor ve analiz ediliyor. Tamamlandığında sonuç ve karar kanıtları gösterilecek.')
             raw_result = (openshift.run_analysis(get_pipeline, request, automatic=True)
-                          if selected_source == OPENSHIFT else run_uploaded(upload))
+                          if selected_source == OPENSHIFT else run_uploaded(upload, source_timezone=source_timezone))
             model = InvestigationPresenter(redact).build(raw_result, source=selected_source, target=target)
             st.session_state['result'] = model
             st.session_state['result_source'] = selected_source

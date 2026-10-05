@@ -99,6 +99,7 @@ class IngestedLogRecord:
     framing: Framing = Framing.UNKNOWN
     metadata: tuple[tuple[str, Scalar], ...] = ()
     mapping_version: str | None = None
+    source_timestamp_field: str | None = None
 
     def __post_init__(self):
         _require_type(self.raw_text, (str,), "raw_text")
@@ -120,6 +121,7 @@ class IngestedLogRecord:
             _require_type(item[0], (str,), "metadata key")
             _require_type(item[1], _SCALAR_TYPES, "metadata value")
         _require_type(self.mapping_version, _OPTIONAL_TEXT_TYPES, "mapping_version")
+        _require_type(self.source_timestamp_field, _OPTIONAL_TEXT_TYPES, "source_timestamp_field")
 
 
 @dataclass(frozen=True, slots=True)

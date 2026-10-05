@@ -81,6 +81,12 @@ def expected_event(raw, event_id, *, timestamp=None, severity=None, message=None
             "raw_timestamp": None, "timestamp_status": "missing",
         },
         "raw": raw,
+        "timestamp_provenance": {
+            "basis": "message_explicit" if timestamp is not None else "untimed",
+            "message_timestamp_raw": "2026-01-02T03:04:05Z" if timestamp is not None else None,
+            "source_timezone": None, "source_record_time": None,
+            "source_record_timestamp_raw": None, "source_record_field": None,
+        },
     }
 
 

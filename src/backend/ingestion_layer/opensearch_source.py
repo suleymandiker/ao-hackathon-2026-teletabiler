@@ -236,6 +236,7 @@ class OpenSearchSource:
             metadata.append(("pod_owner", owner))
         return contracts.IngestedLogRecord(
             raw_text=values["message"], source_timestamp_raw=timestamp,
+            source_timestamp_field=self._config.field_mapping.timestamp,
             source_reference=contracts.SourceReference(
                 source_scope=self._config.source_scope, source_partition=hit["_index"],
                 record_id=hit["_id"], version=version,
