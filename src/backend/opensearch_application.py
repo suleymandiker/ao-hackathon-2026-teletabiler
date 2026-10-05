@@ -18,7 +18,7 @@ from pathlib import Path
 import re
 import sqlite3
 
-from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+from opensearch_connection import load_opensearch_connection
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
 from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
 from segmentation_layer.contracts import SegmentationPolicy
@@ -56,31 +56,10 @@ def error_message(error):
 
 def load_connection(page_size=100):
     """Read configuration without opening a client or exposing values on error."""
-    def required(name):
-        value = os.environ.get(name)
-        if not value or not value.strip():
-            raise ValueError('missing configuration')
-        return value
-
-    def boolean(name):
-        value = required(name).strip().lower()
-        if value not in ('true', 'false'):
-            raise ValueError('invalid boolean')
-        return value == 'true'
-
     try:
         if type(page_size) is not int or not 1 <= page_size <= MAX_PAGE_SIZE:
             raise ValueError('invalid page size')
-        return OpenSearchConfig(
-            hosts=tuple(part.strip() for part in required('OPENSEARCH_HOSTS').split(',')),
-            username=required('OPENSEARCH_USERNAME'), password=required('OPENSEARCH_PASSWORD'),
-            use_ssl=boolean('OPENSEARCH_USE_SSL'), verify_certs=boolean('OPENSEARCH_VERIFY_CERTS'),
-            source_scope=required('OPENSEARCH_SOURCE_SCOPE'), index_expression=required('OPENSEARCH_INDEX'),
-            connect_timeout=float(os.environ.get('OPENSEARCH_CONNECT_TIMEOUT_SECONDS', '5')),
-            request_timeout=float(os.environ.get('OPENSEARCH_REQUEST_TIMEOUT_SECONDS', '15')),
-            ca_bundle=os.environ.get('OPENSEARCH_CA_BUNDLE') or None,
-            field_mapping=OpenSearchFieldMapping(), page_size_limit=page_size,
-        )
+        return load_opensearch_connection(page_size)
     except Exception:
         raise ApplicationError('configuration_error') from None
 

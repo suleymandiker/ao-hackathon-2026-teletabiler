@@ -52,6 +52,105 @@ must equal `OPENSEARCH_SOURCE_SCOPE`; the configured index belongs to that profi
 Do not repoint a profile to a different cluster/index generation and reuse its
 monitor watermark. Create a new monitor/profile for a different source history.
 
+## UTC daily-index profiles
+
+A subsequent Citrix smoke established that `gocpbmgpup1*` includes historical
+indices without an `@timestamp` mapping, while the relevant concrete daily index
+passes pagination/replay checks. To avoid querying those unrelated indices,
+configure this source profile once in the untracked repository `.env`:
+
+```dotenv
+OPENSEARCH_INDEX=gocpbmgpup1*
+OPENSEARCH_INDEX_STRATEGY=daily_utc
+```
+
+Restart UI/worker after changing the profile settings. The default strategy is
+`literal`, preserving existing aliases, literal indices and arbitrary wildcard
+expressions for sources that have not declared a daily-index convention.
+`daily_utc` explicitly declares `<base>*` → `<base>-YYYY.MM.DD`; it rejects other
+pattern shapes rather than guessing. To manually target a literal historical
+index instead, use `OPENSEARCH_INDEX_STRATEGY=literal` with that exact index.
+
+The pure resolver is
+`src/backend/ingestion_layer/opensearch_indices.py::resolve_index_expression`.
+It returns a comma-separated list of concrete indices in ascending UTC date order.
+It uses only the supplied acquisition bounds, never the machine timezone, clock
+or monitor's message timestamp timezone. No index discovery request is made.
+
+| Actual acquisition interval `[start,end)` | Suffixes selected |
+| --- | --- |
+| Oct 5 10:00Z–10:15Z | `2026.10.05` |
+| Oct 5 23:55Z–Oct 6 00:10Z | `2026.10.05,2026.10.06` |
+| Oct 5 23:45Z–Oct 6 00:00Z | `2026.10.05` only |
+| Oct 5 23:59Z–Oct 6 00:16Z | `2026.10.05,2026.10.06` |
+
+Monitoring supplies both its existing lookback and lookahead to the resolver.
+Thus a logical Oct 6 00:00Z–00:15Z run with 60-second overlap retrieves
+Oct 5 23:59Z–Oct 6 00:16Z and selects both days. Lookahead near midnight can also
+require the next day even when the logical end is exactly midnight. Multi-day
+bounded smoke intervals enumerate all touched dates; monitor catch-up still uses
+the existing separate bounded windows, with no widened backlog query.
+
+`OpenSearchSource.read_page` uses the resolved target for the HTTP search path
+and cursor binding. Sort, `search_after`, page limits, timeouts, shard validation,
+actual hit `_index`/`_id` source references, overlap/dedupe and at-least-once behavior
+are unchanged. No `unmapped_type`, ignored shard failures or unavailable-index
+override was added: a missing/broken relevant daily index still fails acquisition
+and leaves the watermark unchanged.
+
+Monitors/runs continue persisting their source profile, not today's date. Neither
+SQLite schema nor existing monitor definitions change. Each successful result's
+`source_summary` now includes `index_expression`, `index_strategy`, `resolved_index`,
+`namespace`, `workload`, `container`, and the existing exact retrieval bounds.
+The profile wildcard stays configured; tomorrow's target resolves automatically.
+
+The manual smoke CLI calls `application_environment.load_environment()` before
+configuration, using the same repository `.env` bootstrap as UI/worker. Connection
+parsing is shared through `opensearch_connection.load_opensearch_connection`;
+process variables retain precedence. No `runpy` or external `load_dotenv` wrapper
+is needed. Smoke output includes the configured and resolved index targets, and
+continues excluding credentials and raw messages.
+
+For the real Citrix check, configure the two profile settings above, keep the
+existing credentials in the secure environment/untracked `.env`, and run:
+
+```powershell
+Set-Location D:\Dev\hackathon\ao-hackathon-2026-teletabiler
+$env:OPENSEARCH_INDEX = 'gocpbmgpup1*'
+$env:OPENSEARCH_INDEX_STRATEGY = 'daily_utc'
+$env:OPENSEARCH_SMOKE_END = '2026-10-05T21:30:00Z'
+$env:OPENSEARCH_SMOKE_LOOKBACK_MINUTES = '15'
+$env:OPENSEARCH_SMOKE_PAGE_SIZE = '3'
+.venv\Scripts\python.exe -B tools\opensearch_smoke.py
+```
+
+Use the already validated exact `OPENSEARCH_SMOKE_NAMESPACE`,
+`OPENSEARCH_SMOKE_WORKLOAD` and optional `OPENSEARCH_SMOKE_CONTAINER` settings;
+adjust the explicit historical end to a known populated interval if needed.
+Verify `resolved_index=gocpbmgpup1-2026.10.05`, PASS, stable page-1 replay and a
+nonempty page 2. No unrelated July indices should appear in the target.
+
+Then follow the one-disabled-monitor smoke procedure below, with the daily profile
+strategy configured in both processes. Enable only that monitor and run:
+
+```powershell
+.venv\Scripts\python.exe -B tools\monitor_worker.py --once --max-runs 1
+```
+
+In its persisted investigation, open **Window, source policy and boundary
+diagnostics**. Verify `resolved_index` against `retrieval_start`/`retrieval_end`,
+including both overlaps, and verify namespace/workload/container against the
+monitor definition. Check SUCCESS and the exact watermark advancement, then pause
+the monitor. A failed relevant-index query must remain FAILED without advancement.
+The automated regressions verify the actual HTTP path and all exact query filters
+through fake transport; a successful live run's diagnostics use that same resolver.
+
+Daily-index correction validation: 309 focused OpenSearch/monitoring/smoke/UI
+tests passed, 273 timestamp/determinism/RCA tests passed, and the full regression
+suite passed **930 tests** (896 baseline + 34 new). `git diff --check` and whitespace
+checks for new files passed. No live OpenSearch calls were made during this
+correction; the commands above are the Citrix validation procedure.
+
 ## Domain and persistence
 
 `monitoring/domain.py` defines immutable typed objects:
@@ -336,7 +435,7 @@ overlap/multistream dedupe, real downstream signal counts, bounded pages/receipt
 sanitized logging/results, OS worker lock, CLI once mode, and real Streamlit controls.
 Existing upload, timestamp, determinism, RCA and ingestion regressions also run.
 
-Local validation for this implementation:
+Initial deployment-monitoring validation (before the daily-index correction):
 
 | Selection | Result |
 | --- | --- |

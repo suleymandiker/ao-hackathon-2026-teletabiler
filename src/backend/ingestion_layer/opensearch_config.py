@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field, fields
 import math
 from urllib.parse import urlsplit
+from ingestion_layer.opensearch_indices import validate_index_strategy
 
 
 def _text(value, name):
@@ -85,10 +86,12 @@ class OpenSearchConfig:
     field_mapping: OpenSearchFieldMapping
     page_size_limit: int
     ca_bundle: str | None = None
+    index_strategy: str = 'literal'
 
     def __post_init__(self):
         for name in ("username", "password", "index_expression", "source_scope"):
             _text(getattr(self, name), name)
+        validate_index_strategy(self.index_expression, self.index_strategy)
         for name in ("use_ssl", "verify_certs"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a bool")

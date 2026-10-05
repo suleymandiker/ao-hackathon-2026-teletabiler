@@ -17,6 +17,7 @@ Optional environment variables:
     OPENSEARCH_CA_BUNDLE               CA file; requires SSL and verification
     OPENSEARCH_CONNECT_TIMEOUT_SECONDS 5
     OPENSEARCH_REQUEST_TIMEOUT_SECONDS 15
+    OPENSEARCH_INDEX_STRATEGY           literal (default) or daily_utc for <base>*
     OPENSEARCH_SMOKE_LOOKBACK_MINUTES   15 (positive integer)
     OPENSEARCH_SMOKE_END                UTC now, sampled once; or an aware ISO time
     OPENSEARCH_SMOKE_NAMESPACE          ai-voice
@@ -45,8 +46,10 @@ sys.path.insert(0, str(ROOT / "src" / "backend"))
 
 from ingestion_layer.contracts import Framing
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
-from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
 from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
+from ingestion_layer.opensearch_indices import resolve_index_expression
+from application_environment import load_environment
+from opensearch_connection import load_opensearch_connection, OpenSearchConfigurationError
 
 
 WIDEN = (
@@ -69,12 +72,6 @@ def required_env(name):
     value = os.environ.get(name)
     require(value is not None and bool(value.strip()), "Missing environment variable: " + name)
     return value
-
-
-def boolean_env(name):
-    value = required_env(name).strip().lower()
-    require(value in ("true", "false"), name + " must be true or false")
-    return value == "true"
 
 
 def emit(metadata):
@@ -151,19 +148,7 @@ def load_configuration():
     require(minutes > 0, "OPENSEARCH_SMOKE_LOOKBACK_MINUTES must be positive")
     start = end - timedelta(minutes=minutes)
     size = int(os.environ.get("OPENSEARCH_SMOKE_PAGE_SIZE", "3"))
-    config = OpenSearchConfig(
-        hosts=tuple(part.strip() for part in required_env("OPENSEARCH_HOSTS").split(",")),
-        username=required_env("OPENSEARCH_USERNAME"),
-        password=required_env("OPENSEARCH_PASSWORD"),
-        use_ssl=boolean_env("OPENSEARCH_USE_SSL"),
-        verify_certs=boolean_env("OPENSEARCH_VERIFY_CERTS"),
-        index_expression=required_env("OPENSEARCH_INDEX"),
-        connect_timeout=float(os.environ.get("OPENSEARCH_CONNECT_TIMEOUT_SECONDS", "5")),
-        request_timeout=float(os.environ.get("OPENSEARCH_REQUEST_TIMEOUT_SECONDS", "15")),
-        source_scope=required_env("OPENSEARCH_SOURCE_SCOPE"),
-        field_mapping=OpenSearchFieldMapping(), page_size_limit=size,
-        ca_bundle=os.environ.get("OPENSEARCH_CA_BUNDLE") or None,
-    )
+    config = load_opensearch_connection(size)
     selection = dict(
         start=start, end=end, page_size=size,
         namespace=os.environ.get("OPENSEARCH_SMOKE_NAMESPACE", "ai-voice"),
@@ -176,7 +161,9 @@ def load_configuration():
 def run_smoke():
     config, selection = load_configuration()
     start, end, size = selection["start"], selection["end"], selection["page_size"]
-    emit({"index": config.index_expression, "start": start.isoformat(),
+    emit({"index": config.index_expression, "index_strategy": config.index_strategy,
+          "resolved_index": resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy),
+          "start": start.isoformat(),
           "end": end.isoformat(), "page_size": size})
     with OpenSearchClient(config) as client:
         source = OpenSearchSource(client)
@@ -218,9 +205,10 @@ def main(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     ).parse_args(argv)
     try:
+        load_environment()
         run_smoke()
         return 0
-    except (SmokeFailure, OpenSearchClientError, OpenSearchSourceError) as exc:
+    except (SmokeFailure, OpenSearchClientError, OpenSearchSourceError, OpenSearchConfigurationError) as exc:
         # These classes contain fixed checks or sanitized production diagnostics.
         print("FAIL: " + str(exc), file=sys.stderr)
     except Exception:

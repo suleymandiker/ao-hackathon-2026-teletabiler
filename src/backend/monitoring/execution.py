@@ -10,6 +10,7 @@ import os
 import opensearch_application as application
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
 from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
+from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.errors import MonitoringError
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
@@ -130,8 +131,12 @@ class OpenSearchMonitorExecutor:
             raise MonitoringError('OPENSEARCH_CONFIG')
         overlap = timedelta(seconds=definition.overlap_seconds)
         start, end = run.window.start - overlap, run.window.end + overlap
+        resolved_index = resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy)
         summary = dict(start=run.window.start.isoformat(), end=run.window.end.isoformat(),
                        retrieval_start=start.isoformat(), retrieval_end=end.isoformat(),
+                       index_expression=config.index_expression, index_strategy=config.index_strategy,
+                       resolved_index=resolved_index, namespace=definition.namespace,
+                       workload=definition.workload, container=definition.container,
                        source_timezone=definition.source_timezone, source_profile=definition.source_profile,
                        cluster_id=definition.cluster_id, pages_read=0, records_read=0, unique_records=0,
                        duplicate_records=0, budget_reached=False, stop_reason='interval_exhausted',

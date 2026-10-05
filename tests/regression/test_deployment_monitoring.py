@@ -534,3 +534,54 @@ def test_schema_initialization_refuses_unrelated_or_newer_state(tmp_path, case):
     with pytest.raises(ValueError):
         SQLiteMonitorRepository(path)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('start', [BASE.replace(hour=0), BASE.replace(hour=23, minute=45)])
+@pytest.mark.parametrize('shard_failure', [False, True])
+def test_worker_daily_indices_use_both_overlaps_and_preserve_profile(repo, pipeline, start, shard_failure):
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.execution import OpenSearchMonitorExecutor
+    from monitoring.worker import MonitorWorker
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'reader', 'synthetic-password', True, True,
+                              'daily-cluster*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100, index_strategy='daily_utc')
+    calls = []
+    class Client:
+        def __init__(self, supplied):
+            self.config = supplied
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post_json(self, path, query):
+            calls.append((path, query))
+            return {'timed_out': False, '_shards': {'failed': int(shard_failure)}, 'hits': {'hits': []}}
+    executor = OpenSearchMonitorExecutor(lambda: pipeline, connection_loader=lambda size: config, client_factory=Client,
+                                         policy_loader=lambda: pytest.fail('Empty acquisition must not read policies'))
+    monitor = repo.create(definition(initial_start=start, container='main'), enabled=True, now=start)
+    assert MonitorWorker(repo, executor, clock=lambda: start + timedelta(minutes=17), log=lambda *a, **k: None).tick() == int(not shard_failure)
+    expected = ('daily-cluster-2026.10.04,daily-cluster-2026.10.05' if start.hour == 0
+                else 'daily-cluster-2026.10.05,daily-cluster-2026.10.06')
+    path, query = calls[0]
+    assert len(calls) == 1 and path == '/' + expected + '/_search'
+    assert query['query']['bool']['filter'] == [
+        {'range': {'@timestamp': {'gte': (start - timedelta(seconds=60)).isoformat(),
+                                 'lt': (start + timedelta(minutes=16)).isoformat()}}},
+        {'term': {'kubernetes.namespace_name.keyword': 'ns'}},
+        {'term': {'kubernetes.labels.app.keyword': 'app'}},
+        {'term': {'kubernetes.container_name.keyword': 'main'}},
+        {'term': {'openshift.cluster_id.keyword': 'cluster'}},
+    ]
+    assert config.index_expression == 'daily-cluster*'  # immutable profile configuration
+    assert repo.get(monitor.id).definition == monitor.definition
+    run = repo.history(monitor.id)[0]
+    assert run.definition.source_profile == 'test-profile'
+    if shard_failure:
+        assert run.status.value == 'FAILED' and run.error_category == 'OPENSEARCH_QUERY'
+        assert repo.get(monitor.id).last_successful_end is None
+        assert repo.result(run.id) is None
+    else:
+        summary = repo.result(run.id)['source_summary']
+        assert summary['resolved_index'] == expected and summary['index_expression'] == 'daily-cluster*'
+        assert summary['index_strategy'] == 'daily_utc'
+        assert (summary['namespace'], summary['workload'], summary['container']) == ('ns', 'app', 'main')
+        assert repo.get(monitor.id).last_successful_end == start + timedelta(minutes=15)

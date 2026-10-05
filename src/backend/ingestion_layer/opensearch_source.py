@@ -20,6 +20,7 @@ from urllib.parse import quote
 from ingestion_layer import contracts
 from ingestion_layer.opensearch_client import OpenSearchClient
 from ingestion_layer.opensearch_config import _host_url
+from ingestion_layer.opensearch_indices import resolve_index_expression
 
 
 class OpenSearchSourceError(ValueError):
@@ -128,6 +129,8 @@ class OpenSearchSource:
         if type(size) is not int or not 0 < size <= self._config.page_size_limit:
             raise OpenSearchSourceError("Page size must be positive and within the configured limit")
 
+        index_expression = resolve_index_expression(
+            self._config.index_expression, start, end, strategy=self._config.index_strategy)
         mapping = self._config.field_mapping
         filters = [
             {"range": {mapping.timestamp: {
@@ -154,7 +157,7 @@ class OpenSearchSource:
             "source_scope": self._config.source_scope,
             "hosts": [_host_url(host, self._config.use_ssl) for host in self._config.hosts],
             "username": self._config.username,
-            "index": self._config.index_expression,
+            "index": index_expression,
             "mapping": asdict(mapping),
             "query": query["query"],
             "sort": query["sort"],
@@ -162,7 +165,7 @@ class OpenSearchSource:
         if cursor is not None:
             query["search_after"] = list(self._decode_cursor(cursor, binding))
 
-        index = quote(self._config.index_expression, safe="*,.-_")
+        index = quote(index_expression, safe="*,.-_")
         payload = self._client.post_json(f"/{index}/_search", query)
         if type(payload) is not dict or payload.get("timed_out") is not False:
             raise OpenSearchSourceError("Search timed out or lacks completion evidence")

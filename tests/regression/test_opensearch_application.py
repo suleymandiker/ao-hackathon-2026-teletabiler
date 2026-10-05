@@ -211,6 +211,19 @@ def test_tls_ca_and_timeout_settings_are_preserved(app, monkeypatch):
     assert app.module.load_connection().verify_certs is False
 
 
+def test_daily_index_strategy_is_explicit_profile_configuration(app, monkeypatch):
+    assert app.module.load_connection().index_strategy == 'literal'
+    monkeypatch.setenv('OPENSEARCH_INDEX', 'synthetic-cluster*')
+    monkeypatch.setenv('OPENSEARCH_INDEX_STRATEGY', 'daily_utc')
+    config = app.module.load_connection()
+    assert config.index_expression == 'synthetic-cluster*' and config.index_strategy == 'daily_utc'
+    monkeypatch.setenv('OPENSEARCH_INDEX_STRATEGY', 'synthetic-secret-invalid-strategy')
+    with pytest.raises(app.module.ApplicationError) as caught:
+        app.module.load_connection()
+    assert caught.value.code == 'configuration_error'
+    assert 'synthetic-secret' not in str(caught.value)
+
+
 def test_verified_catalog_is_read_only_and_does_not_leak_regex_or_signature(app):
     app.seed([('private-signature', REGEX), ('broken', '['), ('empty', '')])
     before = app.database.read_bytes()
