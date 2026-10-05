@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List
 from ai_engine import call_ai_agent, load_prompt, safe_usage, MODELS_CONFIG
 from rca_layer.evidence import RCAEvidenceSelector, EvidenceBudgetError, serialize
 from rca_layer.expert_output import RCAExpertOutputValidator, ExpertOutputError, response_format
+from analysis_time import time_key, order_key
 
 
 class DeterministicRCAEngine:
@@ -35,9 +36,10 @@ class DeterministicRCAEngine:
                 signal_ids,
                 key=lambda sid: (
                     int(signal_map.get(sid, {}).get("severity_min", 7)),
-                    int(signal_map.get(sid, {}).get("first_seen_ms", 0)),
+                    time_key(signal_map.get(sid, {})),
                     -outgoing.get(sid, 0),
                     -float(signal_map.get(sid, {}).get("qualification_score", 0)),
+                    order_key(signal_map.get(sid, {})), sid,
                 ),
             )
 

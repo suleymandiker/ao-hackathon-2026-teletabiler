@@ -43,7 +43,7 @@ class FullAIOpsPipelineV2:
         trace_limit=200
         seg_trace=[]; parser_trace=[]; template_trace=[]
         severity_number={'CRITICAL':2,'ERROR':3,'WARNING':4,'WARN':4,'INFO':6,'DEBUG':7}
-        for src in alarms:
+        for source_order, src in enumerate(alarms):
             attrs={
                 'alarm_id':src.get('alarm_id'), 'source_system':src.get('source_system'),
                 'alarm_type':src.get('alarm_type'), 'source_severity':src.get('source_severity'),
@@ -64,6 +64,7 @@ class FullAIOpsPipelineV2:
                 'template_id':tid, 'template':f'[{service}] {alarm_type}: {str(src.get("message") or "")[:240]}',
                 'template_reliable':True, 'template_source':'structured-alarm-schema',
                 'template_reason':'service+alarm_type deterministic identity',
+                'source_order': source_order,
             }
             templated.append(event)
             if len(seg_trace)<trace_limit: seg_trace.append(str(src)[:1200])
@@ -223,6 +224,10 @@ class FullAIOpsPipelineV2:
             result=self.templater.process(event)
             if not result: continue
             row=dict(event); row.update({'template_id':result.template_id,'template':result.template,'template_reliable':result.reliable})
+            # Existing logical-event delivery order, scoped to this invocation.
+            # Page retrieval tuples are opaque; preserve the session's supplied
+            # completion order instead of reinterpreting provider metadata.
+            row['source_order'] = stats['segmented'] - 1
             decision=self.templater.last_decision or {}; row['template_source']=decision.get('source'); row['template_reason']=decision.get('validator_reason')
             templated.append(row); stats['templated']+=1; stats['template_unreliable']+=0 if result.reliable else 1
             if len(trace['template']) < trace_limit:

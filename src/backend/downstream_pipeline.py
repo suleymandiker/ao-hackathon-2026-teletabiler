@@ -7,6 +7,7 @@ from incident_candidate_layer.builder import IncidentCandidateBuilder
 from context_enrichment_layer.enricher import ContextEnricher
 from rca_layer.rca_engine import ExpertRCAEngine
 from learning_planning_layer.planner import LearningPlanner
+from analysis_time import AnalysisTimeContext, source_time_ms
 
 class DownstreamAIOpsPipeline:
     """Basit final akış: Sinyal adayı -> Gürültü kapısı -> Korelasyon -> Olay -> RCA -> Plan."""
@@ -27,13 +28,27 @@ class DownstreamAIOpsPipeline:
         self.incidents = IncidentCandidateBuilder(topology=topology)
 
     def process(self, templated_events: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
-        signals = self.noise_gate.qualify(self.aggregator.aggregate(templated_events))
+        reference = None
+
+        def observed_events():
+            nonlocal reference
+            for event in templated_events:
+                timestamp = source_time_ms(event.get('timestamp'))
+                if timestamp is not None:
+                    reference = timestamp if reference is None else max(reference, timestamp)
+                yield event
+
+        signals = self.noise_gate.qualify(self.aggregator.aggregate(observed_events()))
+        # No current downstream feature needs recency/decay. Retain the factual
+        # reference as local diagnostics, never fill missing event coordinates.
+        analysis_time = AnalysisTimeContext(reference)
         qualified = [s for s in signals if s.get('qualified')]
         correlations = self.correlator.correlate(qualified)
         incidents = self.enricher.enrich(self.incidents.build(signals, correlations), signals)
         rca = self.rca.analyze(incidents, correlations, signals)
         plans = self.planner.plan(incidents, rca)
         return {
+            'analysis_time': analysis_time.to_dict(),
             'case_analysis': self.rca.last_case_analysis,
             'case_analysis_error': self.rca.last_ai_error,
             'signals': signals, 'qualified_signals': qualified, 'correlations': correlations,

@@ -73,10 +73,11 @@ class RCAExpertOutputValidator:
         if (not evidence_refs or len(set(evidence_refs)) != len(evidence_refs)
                 or not all(ref in signals and set(memberships[ref]) & set(incident_refs) for ref in evidence_refs)):
             raise ExpertOutputError('invalid_evidence_reference')
-        # Keep existing Turkish public fields. New evidence IDs identify the exact
-        # representative of each aggregate; all members remain in the internal pack.
+        # Keep existing Turkish fields and resolve an accepted group reference to
+        # every underlying signal. The alias/member mapping never enters a prompt.
         value['etkilenen_olaylar'] = [incidents[ref] for ref in incident_refs]
-        value['kanit_sinyal_idleri'] = [signals[ref] for ref in evidence_refs]
+        members = dict(pack.signal_members)
+        value['kanit_sinyal_idleri'] = list(dict.fromkeys(sid for ref in evidence_refs for sid in members[ref]))
         del value['kanit_referanslari']
         return value
 

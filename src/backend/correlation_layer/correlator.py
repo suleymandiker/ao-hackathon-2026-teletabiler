@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any, Dict, Iterable, List
+from analysis_time import signal_time, signal_order
 
 NETWORK={'network_down','pkt_loss','conn_refused'}
 DATABASE={'disk_full','db_write_fail','db_conn_pool'}
@@ -18,7 +19,10 @@ class SignalCorrelator:
     @staticmethod
     def _gap(a,b): return max(0,int(b.get('first_seen_ms',0))-int(a.get('last_seen_ms',0)))
     def correlate(self,signals:Iterable[Dict[str,Any]])->List[Dict[str,Any]]:
-        rows=sorted(list(signals),key=lambda x:int(x.get('first_seen_ms',0))); edges=[]
+        # Every existing correlation rule requires a temporal bound. Untimed
+        # signals remain qualified but cannot satisfy those temporal predicates.
+        rows=sorted((s for s in signals if signal_time(s) is not None
+                     and signal_time(s, 'last_seen_ms') is not None),key=signal_order); edges=[]
         for i,a in enumerate(rows):
             for b in rows[i+1:]:
                 gap=self._gap(a,b)
@@ -58,7 +62,9 @@ class SignalCorrelator:
                             topo_score=.82 if hops==1 else .74 if hops==2 else .66
                             if topo_score>score:
                                 score=topo_score; direction=(root_sig,dep_sig)
-                                evidence=['servis_bağımlılığı',f'{hops}_hop','nedensel_zaman_sırası']
+                                evidence=['servis_bağımlılığı',f'{hops}_hop']
+                                if int(root_sig['first_seen_ms']) < int(dep_sig['first_seen_ms']):
+                                    evidence.append('nedensel_zaman_sırası')
                                 if root_t in DATABASE|MEMORY|EXTERNAL|NETWORK: evidence.append('kök_alarm_tipi')
                                 if dep_t in PROPAGATION: evidence.append('türev_semptom')
                 if score>=.55:

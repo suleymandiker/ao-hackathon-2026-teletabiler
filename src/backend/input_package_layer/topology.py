@@ -27,7 +27,7 @@ class TopologyContext:
         while q:
             node,path=q.popleft()
             if len(path)-1 >= max_hops: continue
-            for nxt in self.depends_on.get(node, ()):
+            for nxt in sorted(self.depends_on.get(node, ())):
                 if nxt == root: return path+[nxt]
                 if nxt not in seen:
                     seen.add(nxt); q.append((nxt,path+[nxt]))

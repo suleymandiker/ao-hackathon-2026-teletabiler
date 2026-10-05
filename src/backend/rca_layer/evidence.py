@@ -107,9 +107,12 @@ class RCAEvidenceSelector:
         probable = {row.get('probable_root', {}).get('signal_id') for row in selected_incidents}
         grouped = defaultdict(list)
         for sid, row in sorted(by_id.items()):
-            # Exact template and component identity, excluding only the time bucket.
+            # Reuse authoritative template identity, never derive a new family
+            # from display-text similarity. Members must belong to the same
+            # selected incidents so every reference resolves to relevant evidence.
             key = (row.get('template_id') or sid,) + tuple(row.get(name) or '' for name in
-                   ('service_name', 'component', 'namespace', 'cluster_name', 'scope', 'alarm_type'))
+                   ('service_name', 'component', 'namespace', 'cluster_name', 'scope', 'alarm_type')) + (
+                       tuple(sorted(memberships[sid])),)
             grouped[key].append(row)
         groups, sid_group = {}, {}
         for key, rows in grouped.items():
@@ -160,8 +163,14 @@ class RCAEvidenceSelector:
         for key in chosen:
             rows, representative = groups[key]['rows'], groups[key]['representative']
             summary, truncated = pattern(representative.get('template'), limits.max_pattern_chars)
+            windows = {(row.get('window_start_ms'), row.get('window_end_ms')) for row in rows
+                       if row.get('timestamp_resolved') is True
+                       and number(row.get('window_start_ms')) is not None
+                       and number(row.get('window_end_ms')) is not None}
             item = dict(ref=aliases[key], incident_refs=sorted({ref for row in rows for ref in memberships[row['signal_id']]}),
-                        signal_windows=len(rows))
+                        signal_windows=len(windows))
+            if len(rows) != len(windows):
+                item['represented_signal_count'] = len(rows)
             if summary:
                 item.update(pattern=summary, pattern_truncated=truncated)
             counts = [number(row.get('count')) for row in rows]
@@ -254,16 +263,30 @@ class RCAEvidenceSelector:
             if path := self._path(edge.get('dependency_path')):
                 item['dependency_path'] = path
             # One strongest, deterministic representative per directed group pair.
-            priority = (-(number(edge.get('score')) or 0), -bool(path), -len(item['evidence']), serialize(item))
+            priority = (-(number(edge.get('score')) or 0), -bool(path), -len(item['evidence']),
+                        item.get('time_gap_ms', math.inf), serialize(item))
             pair = (source, target)
             if pair not in best or priority < best[pair][0]:
-                best[pair] = (priority, item)
+                best[pair] = (priority, item, tuple(sorted({value for value in edge.get('evidence', [])
+                                                          if isinstance(value, str)})))
+        # A cap is not a fill target. Equivalent evidence between the same
+        # directed service/component/scope/incident groups adds no new fact just
+        # because its signal alias or gap differs. Preserve distinct dependency
+        # paths and root roles; choose the strongest/shortest stable representative.
+        families = {}
+        for pair, entry in best.items():
+            item = entry[1]
+            family = (pair[0][1:], pair[1][1:], entry[2], tuple(item.get('dependency_path', [])),
+                      pair[0] in roots, pair[1] in roots)
+            if family not in families or (entry[0], pair) < (best[families[family]][0], families[family]):
+                families[family] = pair
+        best = {pair: best[pair] for pair in families.values()}
         selected, reasons, components = [], set(), set()
         while best and len(selected) < self.limits.max_correlations:
             def priority(pair):
                 item = best[pair][1]
                 service_pair = (pair[0][1:3], pair[1][1:3])
-                return (not any(key in roots for key in pair), not bool(item.get('dependency_path')),
+                return (not bool(item.get('dependency_path')), not any(key in roots for key in pair),
                         not bool(set(item['evidence']) - reasons), service_pair in components,
                         -(item.get('score') or 0), item.get('time_gap_ms', math.inf), pair)
             pair = min(best, key=priority)

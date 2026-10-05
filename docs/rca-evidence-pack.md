@@ -31,7 +31,8 @@ interpretation per case remains, with at most one HTTP 400 format compatibility 
   qualified signals belonging to those incidents are eligible.
 - Grouping uses exact template, service, component, namespace, cluster, scope and
   alarm-type identity, excluding the time bucket. Distinct IDs are not rewritten.
-  Equivalent windows contribute occurrence sums, window counts, minimum severity
+  Groups also require exact selected-incident membership. Equivalent windows
+  contribute occurrence sums, distinct known window counts, minimum severity
   and maximum qualification score. First/last time is included only when every
   contributing signal has resolved timestamps.
 - Existing deterministic candidate order reserves the first meaningful distinct
@@ -42,8 +43,8 @@ interpretation per case remains, with at most one HTTP 400 format compatibility 
 - `S1…` aliases identify group representatives; the internal immutable pack retains
   both exact representative IDs and every member ID. `I1…` maps to incident IDs.
   Mappings are not sent, logged or persisted. Accepted incident references map back
-  into `etkilenen_olaylar`; `kanit_sinyal_idleri` contains representative real signal
-  IDs. Representative event IDs are never included.
+  into `etkilenen_olaylar`; `kanit_sinyal_idleri` contains all underlying real signal
+  IDs of accepted groups in stable order. Representative event IDs are never included.
 - Edges must have selected endpoints sharing an incident. Self-edges within one
   aggregate disappear. One strongest deterministic edge represents each directed
   group pair; bounded selection prioritizes root relationships, declared dependency
@@ -315,3 +316,15 @@ each attempt and creates no request or persistent learning state. No prompt,
 evidence, schema, budget, request option, fallback or RCA decision is changed.
 With the flag absent or disabled, production logging is unchanged. Console I/O or
 encoding failures while printing the debug block do not prevent the RCA request.
+
+## Determinism and evidence density hardening
+
+Untimed events now keep unknown source time and explicit untimed aggregation;
+execution clocks never create source-time evidence. Equivalent expert edge families
+are represented once, so the correlation maximum is a cap rather than a fill target.
+Grouping still requires authoritative template identity; text similarity or dynamic
+duration values alone do not establish equivalence. See the [implementation report
+and Citrix three-run procedure](downstream-determinism-blocker.md) for exact time,
+ordering, identity, traceability and compatibility semantics, before/after synthetic
+measurements and the remaining real-file smoke. Prompt/schema, token limits, strict
+validation and RCA_DEBUG remain unchanged.

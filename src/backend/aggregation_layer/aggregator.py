@@ -1,23 +1,13 @@
 from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Tuple
+from analysis_time import source_time_ms, order_key, signal_order
 import re
 
 
-def _ts_ms(value: Any) -> int:
-    if isinstance(value, datetime):
-        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
-    if isinstance(value, (int, float)):
-        return int(value if value > 10_000_000_000 else value * 1000)
-    if isinstance(value, str) and value:
-        try:
-            return int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp() * 1000)
-        except ValueError:
-            pass
-    return int(datetime.now(timezone.utc).timestamp() * 1000)
+def _ts_ms(value: Any) -> int | None:
+    return source_time_ms(value)
 
 
 def _resource(e: Dict[str, Any], key: str) -> str:
@@ -63,11 +53,11 @@ class SignalAggregate:
     template_id: str
     template: str
     scope: str
-    window_start_ms: int
-    window_end_ms: int
+    window_start_ms: int | None
+    window_end_ms: int | None
     count: int
-    first_seen_ms: int
-    last_seen_ms: int
+    first_seen_ms: int | None
+    last_seen_ms: int | None
     severity_min: int
     service_name: str
     component: str
@@ -86,6 +76,7 @@ class SignalAggregate:
     racks: List[str]
     environments: List[str]
     business_criticalities: List[str]
+    source_order: int | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -104,9 +95,9 @@ class SignalAggregator:
             tid = str(e.get('template_id') or '').strip()
             if not tid:
                 continue
-            resolved = e.get('timestamp') not in (None, '')
-            ts = _ts_ms(e.get('timestamp') or e.get('observed_timestamp'))
-            bucket = ts - ts % self.window_ms
+            ts = _ts_ms(e.get('timestamp'))
+            resolved = ts is not None
+            bucket = ts - ts % self.window_ms if resolved else None
             service, component = _infer_identity(e)
             namespace = str(e.get('namespace') or (e.get('resource') or {}).get('namespace') or 'unknown')
             cluster = str(e.get('cluster_name') or (e.get('resource') or {}).get('cluster_name') or 'unknown')
@@ -122,7 +113,9 @@ class SignalAggregator:
                                                         _namespace=namespace, _cluster=cluster, _host=host))
 
         out: List[Dict[str, Any]] = []
-        for (semantic_key, tid, identity, bucket), rows in sorted(groups.items(), key=lambda item: item[0][-1]):
+        for (semantic_key, tid, identity, bucket), rows in groups.items():
+            # Preserve explicit source order; otherwise use stable event identity.
+            rows.sort(key=order_key)
             times = [r['_signal_ts_ms'] for r in rows]
             count = len(rows)
             reliable = sum(bool(r.get('template_reliable', r.get('reliable', True))) for r in rows) / count
@@ -138,10 +131,11 @@ class SignalAggregator:
                 except (TypeError,ValueError): pass
             def vals(key): return sorted({str(a.get(key)) for a in attrs if a.get(key) not in (None,'')})
             out.append(SignalAggregate(
-                signal_id=f"sig:{tid}:{identity}:{bucket}", template_id=tid,
+                signal_id=f"sig:{tid}:{identity}:{bucket if bucket is not None else 'untimed'}", template_id=tid,
                 template=str(rows[0].get('template') or ''), scope=scope,
-                window_start_ms=bucket, window_end_ms=bucket + self.window_ms,
-                count=count, first_seen_ms=min(times), last_seen_ms=max(times),
+                window_start_ms=bucket, window_end_ms=bucket + self.window_ms if bucket is not None else None,
+                count=count, first_seen_ms=min(times) if bucket is not None else None,
+                last_seen_ms=max(times) if bucket is not None else None,
                 severity_min=min(_severity_number(r) for r in rows),
                 service_name=service, component=component, namespace=namespace, cluster_name=cluster, host=host,
                 hosts=sorted({str(r.get('_host')) for r in rows if r.get('_host') not in (None,'unknown','')}),
@@ -151,5 +145,7 @@ class SignalAggregator:
                 alarm_type=alarm_type, source_severity_max=max(source_sevs) if source_sevs else 0,
                 source_systems=vals('source_system'), data_centers=vals('data_center'), racks=vals('rack'),
                 environments=vals('environment'), business_criticalities=vals('business_criticality'),
+                source_order=rows[0].get('source_order'),
             ).to_dict())
-        return out
+        return sorted(out, key=lambda row: (row['window_start_ms'] is None,
+                      row['window_start_ms'] or 0, *signal_order(row)))

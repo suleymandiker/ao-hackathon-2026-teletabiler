@@ -363,13 +363,14 @@ def test_existing_parser_fallback_and_custom_outcomes_are_unchanged(harness, mon
     assert pipeline.templater.inputs[0]["event_id"] == outcome.event["event_id"]
 
 
-def test_file_path_matches_prechange_result_contract(harness, tmp_path):
+def test_file_path_preserves_result_contract_with_explicit_analysis_time(harness, tmp_path):
     pipeline = harness.pipeline()
     log_path = tmp_path / "legacy.log"
     log_path.write_text("2026-01-02T03:04:05Z INFO operation started\n    ERROR continuation detail\n", encoding="utf-8")
     result = pipeline.process_file(str(log_path))
     assert set(result) == {"case_analysis", "case_analysis_error", "signals", "qualified_signals", "correlations",
-                           "incidents", "rca", "plans", "stats", "pipeline_trace"}
+                           "incidents", "rca", "plans", "stats", "pipeline_trace", "analysis_time"}
+    assert result['analysis_time'] == {'analysis_reference_time_ms': 1767323045000, 'timestamp_basis': 'source'}
     assert result["stats"]["segmented"] == result["stats"]["parsed"] == result["stats"]["templated"] == 1
     assert result["pipeline_trace"]["sample_limit"] == 200
     assert result["pipeline_trace"]["parser"]["items"][0]["event_id"] == "19a9130bc0afe"
