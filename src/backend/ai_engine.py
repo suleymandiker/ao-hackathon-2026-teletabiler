@@ -187,6 +187,33 @@ def _rca_error_diagnostics(response):
     return result
 
 
+def _debug_rca_request(payload):
+    """Opt-in console inspection of final messages and allowlisted request fields."""
+    if os.getenv('RCA_DEBUG', 'false').strip().lower() not in ('1', 'true', 'yes', 'on'):
+        return
+    messages = payload['messages']
+    system_prompt = next(message['content'] for message in messages if message['role'] == 'system')
+    user_content = next(message['content'] for message in messages if message['role'] == 'user')
+    mode = payload.get('response_format', {}).get('type', 'none')
+    thinking = payload.get('chat_template_kwargs', {}).get('enable_thinking', 'absent')
+    try:
+        print(
+            f'[RCA DEBUG] SYSTEM PROMPT\n{system_prompt}\n\n'
+            f'[RCA DEBUG] EVIDENCE PACK\n{user_content}\n\n'
+            '[RCA DEBUG] REQUEST CONFIG\n'
+            f'model={payload.get("model", "absent")}\n'
+            f'temperature={payload.get("temperature", "absent")}\n'
+            f'max_tokens={payload.get("max_tokens", "absent")}\n'
+            f'response_mode={mode}\n'
+            f'enable_thinking={thinking}\n'
+            f'include_reasoning={payload.get("include_reasoning", "absent")}',
+            flush=True,
+        )
+    except (OSError, UnicodeError):
+        # Local/Citrix console failures must not prevent the RCA request.
+        pass
+
+
 def _post_rca(session, url, headers, payload):
     """One no-format retry only for an explicit unsupported-format HTTP 400."""
     initial = payload.get('response_format')
@@ -204,6 +231,7 @@ def _post_rca(session, url, headers, payload):
         if attempt > 1:
             print(f'[AI] RETRY | {detail}')
         print(f'[AI] ATTEMPT | {detail}')
+        _debug_rca_request(payload)
         response = session.post(url, headers=headers, json=payload, verify=False, timeout=(60, 180))
         diagnostics = _rca_error_diagnostics(response) if response.status_code != 200 else {}
         suffix = ''.join(f' | {key}={value}' for key, value in diagnostics.items())

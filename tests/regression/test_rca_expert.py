@@ -19,6 +19,7 @@ def gateway(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, gateway):
+    monkeypatch.delenv('RCA_DEBUG', raising=False)
 
     def forbidden(*args, **kwargs):
         pytest.fail('Real network, LLM and persistent state are forbidden')
@@ -205,7 +206,7 @@ def test_budget_failure_skips_gateway_and_preserves_deterministic_result(isolate
     assert engine.last_expert_diagnostics['status'] == 'required_evidence_exceeds_budget'
 
 
-def fake_gateway(monkeypatch, gateway, responses):
+def fake_gateway(monkeypatch, gateway, responses, on_post=None):
     module, call = gateway
     monkeypatch.setitem(module.MODELS_CONFIG, 'Ajan_2_RCA_Expert',
                         dict(module.MODELS_CONFIG['Ajan_2_RCA_Expert'],
@@ -219,6 +220,8 @@ def fake_gateway(monkeypatch, gateway, responses):
         trust_env = True
 
         def post(self, url, **kwargs):
+            if on_post is not None:
+                on_post(kwargs)
             requests.append(deepcopy(kwargs['json']))
             response = responses.pop(0)
             if isinstance(response, Exception):
@@ -241,6 +244,146 @@ def fake_gateway(monkeypatch, gateway, responses):
 def response_body(finish='stop', reply=None):
     return dict(choices=[dict(message={'content': json.dumps(answer()) if reply is None else reply}, finish_reason=finish)],
                 usage={'prompt_tokens': 101, 'completion_tokens': 42, 'total_tokens': 143})
+
+
+@pytest.mark.parametrize('flag', [None, '', 'false', 'FALSE', '0', 'no', 'off', 'invalid'])
+def test_rca_debug_disabled_keeps_exact_production_logging(gateway, monkeypatch, capsys, flag):
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())])
+    monkeypatch.setattr(gateway[0].time, 'time', lambda: 10.0)
+    if flag is not None:
+        monkeypatch.setenv('RCA_DEBUG', flag)
+    call('Ajan_2_RCA_Expert', 'private-prompt', 'private-evidence')
+    assert len(requests) == 1
+    assert capsys.readouterr().out == (
+        '[AI] CALL | agent=Ajan_2_RCA_Expert\n'
+        '[AI] ATTEMPT | agent=Ajan_2_RCA_Expert | attempt=1 | response_mode=none\n'
+        '[AI] HTTP_200 | agent=Ajan_2_RCA_Expert | attempt=1 | response_mode=none\n'
+        '[AI] SUCCESS | agent=Ajan_2_RCA_Expert | duration=0.00s | tokens=143 | finish_reason=stop\n'
+    )
+
+
+@pytest.mark.parametrize('flag', ['1', 'true', 'yes', 'on', ' TRUE ', 'YeS', 'ON'])
+def test_rca_debug_prints_exact_final_request_before_send(gateway, monkeypatch, capsys, flag):
+    from rca_layer.expert_output import response_format
+    sent = []
+    at_send = []
+
+    def observe(kwargs):
+        sent.append(deepcopy(kwargs))
+        at_send.append(capsys.readouterr().out)
+
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())], on_post=observe)
+    monkeypatch.setenv('RCA_DEBUG', flag)
+    monkeypatch.setenv('UNRELATED_PRIVATE_CONFIG', 'synthetic-environment-secret')
+    monkeypatch.setattr(gateway[0], 'QWEN_RCA_INCLUDE_REASONING', True)
+    prompt = gateway[0].load_prompt('rca_expert.md')
+    evidence = '{"pattern":"Bağlantı hatası", "detail":"line\\n  indented"}\n'
+    schema = response_format()
+    extra = {'model': 'effective-model', 'temperature': 0.0, 'max_tokens': 1600,
+             'include_reasoning': True, 'private_option': 'synthetic-body-secret'}
+    before = deepcopy((schema, extra))
+    reply, _ = call('Ajan_2_RCA_Expert', prompt, evidence, temperature=.5, max_tokens=999,
+                    response_format=schema, extra_body=extra)
+    assert reply == json.dumps(answer())
+    assert (schema, extra) == before
+    assert requests[0]['messages'] == [dict(role='system', content=prompt), dict(role='user', content=evidence)]
+    assert requests[0]['response_format'] == schema
+    assert 'include_reasoning' not in requests[0]
+    assert sent[0]['headers']['Authorization'] == 'Bearer synthetic-api-key'
+    assert at_send[0].endswith(
+        f'[RCA DEBUG] SYSTEM PROMPT\n{prompt}\n\n'
+        f'[RCA DEBUG] EVIDENCE PACK\n{evidence}\n\n'
+        '[RCA DEBUG] REQUEST CONFIG\n'
+        'model=effective-model\ntemperature=0.0\nmax_tokens=1600\n'
+        'response_mode=json_schema\nenable_thinking=False\ninclude_reasoning=absent\n'
+    )
+    output = at_send[0] + capsys.readouterr().out
+    for secret in ('synthetic-api-key', 'Authorization', 'Bearer', 'Content-Type', 'Accept',
+                   'example.invalid', 'UNRELATED_PRIVATE_CONFIG', 'synthetic-environment-secret',
+                   'private_option', 'synthetic-body-secret'):
+        assert secret not in output
+
+
+@pytest.mark.parametrize('mode,thinking,reasoning', [
+    ('json_schema', True, False), ('json_object', False, True), ('none', None, None),
+])
+def test_rca_debug_reports_effective_capabilities(gateway, monkeypatch, capsys, mode, thinking, reasoning):
+    from rca_layer.expert_output import response_format
+    call, requests, _ = fake_gateway(monkeypatch, gateway, [(200, response_body())])
+    monkeypatch.setenv('RCA_DEBUG', 'true')
+    monkeypatch.setattr(gateway[0], 'QWEN_RCA_ENABLE_THINKING', thinking)
+    monkeypatch.setattr(gateway[0], 'QWEN_RCA_INCLUDE_REASONING', reasoning)
+    monkeypatch.setitem(gateway[0].MODELS_CONFIG['Ajan_2_RCA_Expert'], 'capabilities', {
+        'supports_enable_thinking': thinking is not None,
+        'supports_include_reasoning': reasoning is not None,
+        'supports_json_schema': mode == 'json_schema',
+        'supports_json_object': mode != 'none',
+    })
+    call('Ajan_2_RCA_Expert', 'system', 'evidence', response_format=response_format())
+    output = capsys.readouterr().out
+    assert f'response_mode={mode}\n' in output
+    assert f'enable_thinking={thinking if thinking is not None else "absent"}\n' in output
+    assert f'include_reasoning={reasoning if reasoning is not None else "absent"}\n' in output
+    assert 'max_tokens=absent\n' in output and 'max_tokens' not in requests[0]
+
+
+@pytest.mark.parametrize('responses', [
+    [(200, response_body())],
+    [(400, {'error': {'code': 'unsupported_response_format'}}), (200, response_body())],
+    [(200, response_body(reply='invalid-json'))],
+    [(200, response_body(finish='length'))],
+    [(400, {'error': {'code': 'unsupported_response_format'}}), (400, {})],
+    [RuntimeError('Authorization: synthetic-api-key')],
+])
+def test_rca_debug_preserves_requests_results_and_fallback(isolated, gateway, monkeypatch, capsys, responses):
+    monkeypatch.setattr(gateway[0].time, 'time', lambda: 10.0)
+    monkeypatch.setenv('QWEN_RCA_MAX_TOKENS', '2200')
+    runs = []
+    for enabled in ('false', 'true'):
+        monkeypatch.setenv('RCA_DEBUG', enabled)
+        at_send = []
+        call, requests, closed = fake_gateway(monkeypatch, gateway, deepcopy(responses),
+            on_post=lambda kwargs: at_send.append(capsys.readouterr().out))
+        monkeypatch.setattr(isolated, 'call_ai_agent', call)
+        engine = isolated.ExpertRCAEngine()
+        result = engine.analyze(*case())
+        runs.append((result, engine.last_case_analysis, engine.last_ai_error,
+                     engine.last_expert_diagnostics, requests, closed))
+        output = ''.join(at_send) + capsys.readouterr().out
+        for secret in ('synthetic-api-key', 'Authorization', 'Bearer', 'Content-Type', 'example.invalid'):
+            assert secret not in output
+        assert output.count('[RCA DEBUG] REQUEST CONFIG') == (len(requests) if enabled == 'true' else 0)
+        if enabled == 'true':
+            for request, preceding in zip(requests, at_send):
+                mode = request.get('response_format', {}).get('type', 'none')
+                assert f'response_mode={mode}\n' in preceding
+                assert preceding.endswith('include_reasoning=absent\n')
+                assert '[RCA DEBUG] SYSTEM PROMPT\n' + request['messages'][0]['content'] + '\n\n' in preceding
+                assert '[RCA DEBUG] EVIDENCE PACK\n' + request['messages'][1]['content'] + '\n\n' in preceding
+                assert request['max_tokens'] == 1600
+    assert runs[0] == runs[1]
+
+
+@pytest.mark.parametrize('error', [OSError('console unavailable'),
+    UnicodeEncodeError('ascii', 'ı', 0, 1, 'console cannot encode prompt')])
+def test_rca_debug_console_failure_does_not_change_result(gateway, monkeypatch, error):
+    import builtins
+    call, requests, closed = fake_gateway(monkeypatch, gateway, [(200, response_body())])
+    monkeypatch.setenv('RCA_DEBUG', 'true')
+    original_print = builtins.print
+    attempted = []
+
+    def failing_console(*args, **kwargs):
+        if args and str(args[0]).startswith('[RCA DEBUG]'):
+            attempted.append(True)
+            raise error
+        return original_print(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'print', failing_console)
+    reply, _ = call('Ajan_2_RCA_Expert', 'system', 'evidence')
+    assert attempted == [True]
+    assert reply == json.dumps(answer())
+    assert len(requests) == 1 and closed == [True]
 
 
 @pytest.mark.parametrize('failures', [0, 1])
@@ -491,12 +634,14 @@ def test_retry_starts_at_actual_requested_format(isolated, gateway, monkeypatch,
 
 @pytest.mark.parametrize('agent,family', [('Parser_Discovery', 'deepseek'), ('Segmentation_Discovery', 'deepseek'),
                                         ('Other_Expert', 'qwen')])
-def test_non_rca_format_fallback_remains_unchanged(isolated, gateway, monkeypatch, agent, family):
+def test_non_rca_format_fallback_remains_unchanged(isolated, gateway, monkeypatch, capsys, agent, family):
     from rca_layer.expert_output import response_format
     call, requests, _ = fake_gateway(monkeypatch, gateway, [(400, {}), (200, response_body())])
+    monkeypatch.setenv('RCA_DEBUG', 'true')
     monkeypatch.setitem(gateway[0].MODELS_CONFIG, agent,
                         dict(url='https://example.invalid', key='synthetic-api-key', model_id='test-model', family=family))
     call(agent, 'system', 'evidence', response_format=response_format())
+    assert '[RCA DEBUG]' not in capsys.readouterr().out
     assert [request.get('response_format') for request in requests] == [response_format(), None]
     for request in requests:
         if family == 'qwen':

@@ -285,3 +285,33 @@ Re-smoke in the existing Citrix Python 3.14.8 / Streamlit 1.65.0 environment:
 
 No post-fix live gateway smoke was run locally; the supplied live matrix is the
 compatibility evidence, and this re-smoke confirms the integrated production path.
+
+## Opt-in local/Citrix prompt debugging
+
+`RCA_DEBUG` defaults to `false`. Values `1`, `true`, `yes` and `on` enable it
+(case-insensitive, surrounding whitespace ignored); all other values disable it.
+For a local/Citrix session, set the flag before starting Streamlit:
+
+```powershell
+$env:RCA_DEBUG = 'true'
+python -B -m streamlit run src/frontend/streamlit_app.py
+```
+
+Immediately before each `Ajan_2_RCA_Expert` HTTP attempt, the console prints
+`[RCA DEBUG] SYSTEM PROMPT`, `[RCA DEBUG] EVIDENCE PACK` and
+`[RCA DEBUG] REQUEST CONFIG`. The first two contain the exact final system/user
+message strings, including whitespace and the existing evidence redaction. The
+config contains only `model`, `temperature`, `max_tokens`, `response_mode`,
+`enable_thinking` and `include_reasoning`, read after deployment capability
+filtering. Absent optional fields are shown as `absent`. The current GLM deployment
+reports `include_reasoning=absent`; a format retry reports `response_mode=none`.
+Credentials, headers, endpoints, other body fields and unrelated environment
+variables are excluded from the debug output.
+
+This flag deliberately exposes prompt/evidence content in the local console;
+the earlier aggregate-only logging guidance remains the default. To disable it,
+stop Streamlit, set `$env:RCA_DEBUG = 'false'`, and restart it. The flag is read on
+each attempt and creates no request or persistent learning state. No prompt,
+evidence, schema, budget, request option, fallback or RCA decision is changed.
+With the flag absent or disabled, production logging is unchanged. Console I/O or
+encoding failures while printing the debug block do not prevent the RCA request.
