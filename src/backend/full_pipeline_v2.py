@@ -108,6 +108,7 @@ class FullAIOpsPipelineV2:
         policy_provider: PolicyProvider,
         topology=None,
         source_timezone=None,
+        assembled_event_filter=None,
     ) -> Dict[str, Any]:
         """Analyze one caller-bounded, finite sequence of already acquired pages.
 
@@ -116,6 +117,9 @@ class FullAIOpsPipelineV2:
         Existing resident parser configuration and template learning are reused.
         Input is consumed once, in supplied order, without cursor interpretation,
         sorting or deduplication. Iterable exhaustion is explicit analysis end.
+        An optional source-neutral assembled_event_filter selects complete
+        assembly outputs before parsing/learning. Monitoring uses this seam for
+        window ownership; omitted filters preserve existing batch behavior.
 
         One local session emits events in completion order, followed by close
         tails in first-seen stream order. Dispositions are counted with the first
@@ -162,9 +166,11 @@ class FullAIOpsPipelineV2:
                                 'framing': output.record.framing.value,
                                 'record': self._record_provenance(output.record),
                             })
-                    else:
+                    elif assembled_event_filter is None or assembled_event_filter(output):
                         yield output
-            yield from session.close()
+            for output in session.close():
+                if assembled_event_filter is None or assembled_event_filter(output):
+                    yield output
 
         events = logical_events()
         try:

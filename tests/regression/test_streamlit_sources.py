@@ -240,7 +240,7 @@ def test_overview_loads_exact_logo_and_task_navigation(ui, monkeypatch):
     app = ui.app()
     assert not app.exception and app.title[0].value == 'AI-IN-AI Operations'
     assert loaded == [(logo, 161)]
-    assert app.radio(key='navigation').options == ['Overview', 'Investigations', 'Log Patterns', 'Incidents']
+    assert app.radio(key='navigation').options == ['Overview', 'Deployment Monitors', 'Investigations', 'Log Patterns', 'Incidents']
     assert not ui.sources and not ui.files and not ui.packages
     assert not app.get('file_uploader')
 

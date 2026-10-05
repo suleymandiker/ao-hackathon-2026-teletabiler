@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Durable operational monitoring state (separate from learning state)
+src/data/monitoring/

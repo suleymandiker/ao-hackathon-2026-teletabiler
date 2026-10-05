@@ -8,6 +8,7 @@ import io
 from pathlib import Path
 import socket
 import sqlite3
+import sys
 
 import pytest
 
@@ -225,11 +226,17 @@ def test_import_and_construction_do_not_access_files_or_processing_state(contrac
         pytest.fail("Contract import/construction must not access application files")
 
     # Network/SQLite and processing imports are already blocked by the fixture.
-    # Reload ensures the import path is exercised even after earlier tests.
+    # Execute a fresh module to exercise imports even after earlier tests.
+    # Reloading the shared module replaces enum/classes still referenced by
+    # previously imported pipeline/resolver modules and leaks test-only state.
+    original_framing = contracts.Framing
+    spec = importlib.util.spec_from_file_location('_isolated_ingestion_contracts', contracts.__file__)
+    module = importlib.util.module_from_spec(spec)
     with monkeypatch.context() as guard:
+        guard.setitem(sys.modules, spec.name, module)
         guard.setattr(builtins, "open", forbidden)
         guard.setattr(io, "open", forbidden)
-        module = importlib.reload(contracts)
+        spec.loader.exec_module(module)
         reference = module.SourceReference("test-source", "partition", "source-id")
         record = module.IngestedLogRecord(
             "raw", reference, stream_identity=module.StreamIdentity("test-source"),
@@ -238,3 +245,4 @@ def test_import_and_construction_do_not_access_files_or_processing_state(contrac
         assert page.records == (record,)
         assert record.first_observed_at is None
         assert not hasattr(record, "event_id")
+    assert contracts.Framing is original_framing

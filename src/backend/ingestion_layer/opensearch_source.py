@@ -99,6 +99,7 @@ class OpenSearchSource:
         self, *, start: datetime, end: datetime,
         namespace: str, workload: str,
         container: str | None = None,
+        cluster_id: str | None = None,
         cursor: str | bytes | None = None,
         page_size: int | None = None,
     ) -> contracts.SourcePage:
@@ -121,6 +122,8 @@ class OpenSearchSource:
                 raise OpenSearchSourceError("Namespace and workload must be nonempty strings")
         if container is not None and not _nonempty_text(container):
             raise OpenSearchSourceError("Container must be a nonempty string")
+        if cluster_id is not None and not _nonempty_text(cluster_id):
+            raise OpenSearchSourceError("Cluster must be a nonempty string")
         size = self._config.page_size_limit if page_size is None else page_size
         if type(size) is not int or not 0 < size <= self._config.page_size_limit:
             raise OpenSearchSourceError("Page size must be positive and within the configured limit")
@@ -136,6 +139,8 @@ class OpenSearchSource:
         ]
         if container is not None:
             filters.append({"term": {mapping.container_exact: container}})
+        if cluster_id is not None:
+            filters.append({"term": {mapping.cluster_id_exact: cluster_id}})
         query = {
             "size": size,
             "query": {"bool": {"filter": filters}},

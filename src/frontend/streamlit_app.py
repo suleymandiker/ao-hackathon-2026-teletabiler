@@ -14,6 +14,9 @@ for directory in (ROOT / 'src' / 'backend', Path(__file__).resolve().parent):
         sys.path.insert(0, str(directory))
 
 import opensearch_application as openshift
+from application_environment import load_environment
+load_environment()
+
 from analysis_runtime import get_analysis_lock, get_pipeline, run_uploaded
 from presentation import InvestigationPresenter
 import investigation_views as views
@@ -64,7 +67,7 @@ with st.sidebar:
     st.image(str(LOGO), width=161)
     st.caption('Operations')
     st.divider()
-    page = st.radio('Gezinme', ['Overview', 'Investigations', 'Log Patterns', 'Incidents'],
+    page = st.radio('Gezinme', ['Overview', 'Deployment Monitors', 'Investigations', 'Log Patterns', 'Incidents'],
                     key='navigation', label_visibility='collapsed')
     st.divider()
     st.caption('Tek oturum · Sonlu analiz')
@@ -78,6 +81,12 @@ views.html(theme.header(page, 'OpenShift yapılandırıldı' if connection else 
 
 def overview():
     st.title('AI-IN-AI Operations')
+    st.subheader('Deployment Monitors')
+    st.caption('Continuous deployment monitoring runs in a separate worker. Configure monitors and inspect persisted history.')
+    def open_monitors():
+        st.session_state['navigation'] = 'Deployment Monitors'
+    st.button('Manage Deployment Monitors', key='start_monitors', type='primary', on_click=open_monitors)
+    st.subheader('Manual Investigation / Test / Smoke')
     views.html(theme.intro('OpenShift loglarını analiz edin; önemli olayları, ilişkileri ve olası kök nedenleri keşfedin.'))
     left, right = st.columns(2, gap='medium')
     with left, st.container(border=True):
@@ -188,6 +197,9 @@ elif page == 'Investigations':
         views.investigation(view)
     else:
         new_investigation()
+elif page == 'Deployment Monitors':
+    import monitoring_views
+    monitoring_views.render(connection, redact)
 elif page == 'Log Patterns':
     views.patterns(view)
 elif page == 'Incidents':
