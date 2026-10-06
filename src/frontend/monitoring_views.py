@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 from monitoring.domain import MonitorDefinition
+from monitoring.boundary_quality import BOUNDARY_DIAGNOSTIC_LIMIT
 from monitoring.repository import SQLiteMonitorRepository
 from monitoring.runtime import database_path
 from presentation import InvestigationPresenter
@@ -16,6 +17,46 @@ def repository():
 
 def now():
     return datetime.now(timezone.utc)
+
+
+def boundary_details(summary, logical_events, redact):
+    quality = summary.get('boundary_quality')
+    cuts = summary.get('window_assembly', {})
+    if quality is None:
+        if 'boundary_tail_events' not in cuts:
+            st.caption('Boundary completeness was not recorded for this historical run.')
+            return
+        # Historical monitoring retained the exact owned analysis-end count,
+        # but discarded per-event provenance. Do not invent event-level rows.
+        possible = cuts['boundary_tail_events']
+        total, confirmed, analysis_end = logical_events, 0, possible
+    else:
+        total = quality['total_events']
+        possible, confirmed = (quality['counts'][key] for key in ('possible_incomplete', 'confirmed_truncated'))
+        analysis_end = quality['analysis_end_events']
+    message = (f'Boundary completeness: {possible} of {total} logical events are marked possible_incomplete '
+               f'({analysis_end} emitted at analysis end). Confirmed truncation: {confirmed} recorded.')
+    if confirmed:
+        st.error(message)
+    elif possible:
+        st.warning(message)
+    else:
+        st.caption(message)
+    if quality is None:
+        st.caption('Historical run: counts use recorded analysis-end tails. Event-level boundary details were not stored; history is unchanged.')
+    elif quality['affected_events']:
+        with st.expander('Boundary-affected events (metadata only)'):
+            columns = ('event_ordinal', 'event_id', 'boundary_status', 'emission_reason', 'stream_id',
+                       'pod_instance', 'container_instance', 'channel', 'source_start_time', 'last_source_time',
+                       'physical_record_count', 'first_record_reference', 'last_record_reference')
+            rows = [{key: redact(str(row[key])) if isinstance(row.get(key), str) else row.get(key)
+                     for key in columns} for row in quality['affected_events'][:BOUNDARY_DIAGNOSTIC_LIMIT]]
+            st.caption(f'Showing {len(rows)} of {possible + confirmed} affected events. '
+                       'Pod/container instances identify the stream; source references are hashes. Raw log bodies are omitted.')
+            st.dataframe(rows, hide_index=True, width='stretch')
+    if cuts.get('orphan_events', 0) or cuts.get('overlap_conflicts', 0):
+        st.info(f"Window assembly: {cuts.get('orphan_events', 0)} orphan events excluded; "
+                f"{cuts.get('overlap_conflicts', 0)} overlap conflicts. These counters do not establish confirmed truncation.")
 
 
 def monitor_form(repo, connection, redact, monitor=None):
@@ -135,10 +176,11 @@ def render(connection, redact):
         if result is not None:
             summary = result.get('source_summary', {})
             with st.expander('Window, source policy and boundary diagnostics'):
-                st.json(summary)
-            cuts = summary.get('window_assembly', {})
-            if any(cuts.get(key, 0) for key in ('boundary_tail_events', 'orphan_events', 'overlap_conflicts')):
-                st.warning('Bounded assembly encountered a tail or retrieval boundary. Inspect diagnostics; long events may be incomplete.')
+                # The full per-event status contract is persisted, but this
+                # general view must not bypass the affected-event display cap.
+                st.json({key: value for key, value in summary.items() if key != 'boundary_quality'})
+            run = next(item for item in successful if item.id == run_id)
+            boundary_details(summary, run.counts.logical_events, redact)
             model = InvestigationPresenter(redact).build(result, source='Deployment Monitor',
                                                          target=redact(monitor.definition.namespace + ' / ' + monitor.definition.workload))
             views.investigation(model)

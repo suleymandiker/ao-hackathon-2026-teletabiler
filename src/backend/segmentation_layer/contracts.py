@@ -118,6 +118,16 @@ class AssemblyStep:
 
 
 EmissionReason = Literal["next_header", "explicit_stream_close", "analysis_end"]
+BoundaryStatus = Literal["complete", "possible_incomplete", "confirmed_truncated"]
+
+
+def boundary_allows_baseline_evidence(status: BoundaryStatus | None) -> bool:
+    """Boundary-only guard for FUTURE deployment baseline and NEW/RARE evidence.
+
+    Complete is necessary, not sufficient. Unknown/missing quality fails closed.
+    This does not govern today's template learning, signals or Investigation.
+    """
+    return status == "complete"
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,13 @@ class AssembledEvent:
     evidence: tuple[LineEvidence, ...]
     policy: SegmentationPolicy
     emission_reason: EmissionReason
+
+    @property
+    def boundary_status(self) -> BoundaryStatus:
+        # Existing explicit close is a lifecycle cut, not authoritative EOF.
+        # No current emission carries positive cross-boundary continuation
+        # evidence, so confirmed_truncated is reserved and never inferred.
+        return "complete" if self.emission_reason == "next_header" else "possible_incomplete"
 
     def __post_init__(self):
         if type(self.text) is not str:

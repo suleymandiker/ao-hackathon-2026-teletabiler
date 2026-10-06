@@ -117,7 +117,7 @@ class FullAIOpsPipelineV2:
         Existing resident parser configuration and template learning are reused.
         Input is consumed once, in supplied order, without cursor interpretation,
         sorting or deduplication. Iterable exhaustion is explicit analysis end.
-        An optional source-neutral assembled_event_filter selects complete
+        An optional source-neutral assembled_event_filter selects emitted
         assembly outputs before parsing/learning. Monitoring uses this seam for
         window ownership; omitted filters preserve existing batch behavior.
 
@@ -203,6 +203,7 @@ class FullAIOpsPipelineV2:
         return {
             'stream_key': asdict(assembled.stream_key),
             'emission_reason': assembled.emission_reason,
+            'boundary_status': assembled.boundary_status,
             'contributors': [
                 {**self._record_provenance(record), 'ordinal': evidence.ordinal, 'included': evidence.included}
                 for record, evidence in zip(assembled.records, assembled.evidence)

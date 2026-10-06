@@ -209,6 +209,8 @@ def test_one_page_runs_the_real_chain_and_explicit_close_once(harness):
     assert Path(pipeline.templater.state_path).exists()
     assert Path(pipeline.templater.candidate_state_path).exists()
     assert [provenance(event)["emission_reason"] for event in pipeline.downstream.inputs] == ["next_header", "analysis_end"]
+    assert [provenance(event)['boundary_status'] for event in pipeline.downstream.inputs] == ['complete', 'possible_incomplete']
+    assert [entry['provenance']['boundary_status'] for entry in result['event_provenance']] == ['complete', 'possible_incomplete']
     assert len(harness.sessions) == 1
     session = harness.sessions[0]
     assert session.pages == [input_page]

@@ -116,3 +116,85 @@ def test_manual_upload_navigation_remains_available(monitoring_ui):
     assert not app.exception
     assert app.radio(key='analysis_source').value == 'Dosya / paket'
     assert app.selectbox(key='file_source_timezone').value == 'Unknown'
+
+
+@pytest.mark.parametrize('possible,confirmed', [(2, 0), (0, 0), (1, 2)])
+def test_boundary_warning_quantifies_possible_incomplete_without_claiming_truncation(monitoring_ui, possible, confirmed):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.domain import RunCounts
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    # Confirmed rows exercise future display support; the current session does
+    # not manufacture this status from any of its lifecycle emission reasons.
+    summary = dict(window_assembly=dict(boundary_tail_events=possible), boundary_quality=dict(
+        total_events=198, counts=dict(complete=198 - possible - confirmed, possible_incomplete=possible, confirmed_truncated=confirmed),
+        analysis_end_events=possible, event_statuses=[], affected_events=[], sample_limit=200))
+    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
+    repo.succeed(run, safe, RunCounts(logical_events=198), {}, now=BASE + timedelta(minutes=17))
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    assert not app.exception
+    elements = app.error if confirmed else app.warning if possible else app.caption
+    text = next(item.value for item in elements if 'Boundary completeness' in item.value)
+    assert f'{possible} of 198' in text and 'possible_incomplete' in text
+    assert f'Confirmed truncation: {confirmed}' in text
+    assert 'long events may be incomplete' not in text
+    if not confirmed:
+        assert not app.error
+    if not possible and not confirmed:
+        assert not app.warning
+
+
+@pytest.mark.parametrize('tails', [0, 2])
+def test_reopening_historical_boundary_counts_does_not_rewrite_run_or_invent_details(monitoring_ui, tails):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.domain import RunCounts
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    summary = dict(window_assembly=dict(boundary_tail_events=tails, orphan_events=1, overlap_conflicts=1))
+    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
+    repo.succeed(run, safe, RunCounts(logical_events=198), {}, now=BASE + timedelta(minutes=17))
+    original = repo.result(run.id)
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    assert not app.exception and not app.error
+    elements = app.warning if tails else app.caption
+    text = next(item.value for item in elements if 'Boundary completeness' in item.value)
+    assert f'{tails} of 198' in text and 'Confirmed truncation: 0 recorded' in text
+    assert any('Event-level boundary details were not stored' in item.value for item in app.caption)
+    assert any('1 orphan events excluded; 1 overlap conflicts' in item.value for item in app.info)
+    if not tails:
+        assert not app.warning
+    assert not any(item.label == 'Boundary-affected events (metadata only)' for item in app.expander)
+    assert repo.result(run.id) == original and repo.get(monitor.id).last_successful_end == run.window.end
+
+
+def test_boundary_event_table_is_bounded_allowlisted_and_redacted(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.boundary_quality import BOUNDARY_DIAGNOSTIC_LIMIT
+    from monitoring.domain import RunCounts
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    count = BOUNDARY_DIAGNOSTIC_LIMIT + 5
+    rows = [dict(event_ordinal=i + 1, event_id=f'event-{i}', boundary_status='possible_incomplete',
+                 emission_reason='analysis_end', pod_instance='pod-uid', container_instance='container-uid', channel='stdout',
+                 raw='private-payload', Authorization='Bearer private-auth', arbitrary_field='private-extra') for i in range(count)]
+    rows[0]['pod_instance'] = 'pod password=private-password'
+    summary = dict(boundary_quality=dict(total_events=count, counts=dict(complete=0, possible_incomplete=count, confirmed_truncated=0),
+                   analysis_end_events=count, event_statuses=rows, affected_events=rows, sample_limit=BOUNDARY_DIAGNOSTIC_LIMIT))
+    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
+    repo.succeed(run, safe, RunCounts(logical_events=count), {}, now=BASE + timedelta(minutes=17))
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    assert not app.exception
+    table = next(item.value for item in app.dataframe if 'boundary_status' in item.value)
+    assert len(table) == BOUNDARY_DIAGNOSTIC_LIMIT
+    assert table.iloc[0]['event_id'] == 'event-0' and table.iloc[0]['pod_instance'] == 'pod [redacted]'
+    assert table.iloc[-1]['event_ordinal'] == BOUNDARY_DIAGNOSTIC_LIMIT
+    assert not {'raw', 'Authorization', 'arbitrary_field'} & set(table.columns)
+    # The general JSON expander must not bypass the dedicated table's row cap.
+    assert all('event_statuses' not in item.value and 'affected_events' not in item.value for item in app.json)
+    assert any(f'Showing {BOUNDARY_DIAGNOSTIC_LIMIT} of {count}' in item.value for item in app.caption)
+    for secret in ('private-payload', 'private-auth', 'private-extra', 'private-password'):
+        assert secret not in str(table)
+    assert_safe(app)

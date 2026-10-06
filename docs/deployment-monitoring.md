@@ -353,7 +353,8 @@ A leading continuation with no header is excluded and counted in `orphan_events`
 An event containing previously consumed contributors is not analyzed again; any
 new contributors in that reconstruction increment `overlap_conflicts`. Very long
 traces spanning more than the overlap can therefore have incomplete tail evidence.
-All three conditions are persisted and prominently warned about in run inspection.
+All three conditions are persisted; run inspection distinguishes possible
+incompleteness from excluded orphans and overlap conflicts.
 Use a suitable overlap for the source; durable assembler checkpoints or explicit
 late-event correction would require a later design, not silent re-counting.
 
@@ -371,6 +372,125 @@ policy as volume grows. OpenSearch still has no PIT/snapshot or late-arrival
 guarantee. Records indexed after the delay/horizon are not retrospectively added to
 successful windows. Index-generation reuse and nonunique cross-index sort keys
 remain source-profile constraints from the existing adapter.
+
+## Boundary completeness and future eligibility
+
+The former broad warning came from `monitoring/execution.py::WindowOwnership`:
+owned `analysis_end` events incremented `window_assembly.boundary_tail_events`.
+`monitoring_views.py` displayed the same warning whenever that counter,
+`orphan_events`, or `overlap_conflicts` was nonzero. None of those counters alone
+proved truncation. The real run with 378 physical records / 198 logical events
+and completed requests before the 06:39 retrieval boundary provides no positive
+evidence of a truncated event; this patch does not classify it as confirmed loss.
+
+`segmentation_layer/contracts.py` adds the typed `BoundaryStatus` literal and an
+immutable derived `AssembledEvent.boundary_status` property. Existing emission
+reasons remain unchanged:
+
+| Existing emission reason | Boundary status | Evidence |
+| --- | --- | --- |
+| `next_header` | `complete` | The next valid header in the same stream closes this event. |
+| `analysis_end` | `possible_incomplete` | The bounded analysis ended; producer completion is unproven. |
+| `explicit_stream_close` | `possible_incomplete` | The existing contract defines a lifecycle cut, not authoritative producer EOF. |
+
+`confirmed_truncated` is reserved for positive continuation evidence beyond a
+boundary. No current emission produces it; cross-run continuation evidence is
+not available. No completion is inferred from an HTTP success message or elapsed
+time. No truncation is inferred from search exhaustion or an analysis-end tail.
+
+**A page boundary is not an event boundary.** `feed_page()` continues pending
+state across `search_after` pages, including empty pages and all page/cycle limit
+flags. Only existing header/explicit-close/analysis-end behavior emits events.
+Repeated close remains empty. Overlap can reduce boundary risk but cannot prove
+completion, and increasing it only moves the final retrieval cut. The existing
+60-second default overlap, logical windows, scheduling, dedupe, watermark rules
+and OpenSearch queries are unchanged.
+
+Propagation is additive:
+
+```text
+AssembledEvent.boundary_status
+  -> FullAIOpsPipelineV2._assembled_provenance
+  -> canonical attributes.source_provenance + result.event_provenance
+  -> monitoring.boundary_quality.build_boundary_quality
+  -> redacted source_summary.boundary_quality
+  -> persisted MonitorRun Investigation
+```
+
+Status attaches after the canonical builder assigns event identity. The monitor
+projection covers only selected/owned logical events, including a parser-None
+output if one occurs. Context-only, duplicate and excluded orphan events do not
+inflate the denominator. The envelope retains:
+
+- exact `total_events`, counts for all three statuses, and `analysis_end_events`;
+- compact `event_statuses` for **every** owned event, including complete events;
+- up to **200** `affected_events`, matching the existing diagnostic sample budget.
+
+Each compact entry has a one-based `event_ordinal`, canonical `event_id` (possibly
+None), and status. Use run ID plus ordinal to identify an occurrence: event ID
+alone need not be unique. The detail sample must never substitute for the full
+status contract when making future eligibility decisions.
+
+The metadata-only table shows ordinal/ID, status, emission reason, a stream hash,
+pod/container **instance IDs**, channel, first included and last source-record
+times, physical contributor count (including retained blank provenance), and
+hashed first/last source references. It does not copy raw text, arbitrary metadata,
+raw timestamp captures, headers, cursors, or sensitive request payloads. Source
+times use the existing resolver for display without changing timestamp authority.
+The existing OpenSearch credential/text redaction and `SAKA_API_KEY` redaction run
+before persistence; display redacts strings again. The general JSON view excludes
+the per-event envelope so it cannot bypass the 200-row table limit. Detailed rows
+are not added to worker logs. Per-event status storage remains proportional to
+the existing finite, bounded monitoring batch; no cross-run assembly state is added.
+
+UI text now reports actual counts, for example:
+
+```text
+Boundary completeness: X of 198 logical events are marked possible_incomplete
+(X emitted at analysis end). Confirmed truncation: 0 recorded.
+```
+
+`X` comes from event metadata. Possible incompleteness uses a caution; positive
+confirmed counts use an error-style diagnostic. Zero possible/confirmed events
+produce a neutral caption, not a warning. Orphans and overlap conflicts have a
+separate informational message and are not called confirmed truncation.
+
+`boundary_allows_baseline_evidence(status)` in the segmentation contract is a
+**future boundary-only guard**: only `complete` returns true, meaning potentially
+eligible if every other future condition is satisfied. `possible_incomplete`,
+`confirmed_truncated`, missing and unknown status return false for future
+deployment baseline learning and NEW/RARE evidence. No baseline, NEW_PATTERN,
+RARE_PATTERN or FREQUENCY_ANOMALY feature is implemented. The helper is not wired
+into current template learning, qualification, correlation, incidents or RCA;
+possibly incomplete events retain their current analysis and Investigation visibility.
+
+Existing stored runs are not rewritten. Reopening an older run uses its recorded
+`boundary_tail_events` count as the count of possible analysis-end tails and shows
+zero **recorded** confirmed truncations. A caption explains that event-level
+details were not stored. An old result without even that counter shows quality as
+unrecorded. No event IDs/status lists are invented for historical results, and
+missing historical status must not pass the future eligibility guard. SQLite
+schema, learned templates, parser policies and policy signatures need no migration.
+
+To inspect the reported run in Citrix:
+
+1. Restart the Streamlit process with this patch and the same `AIOPS_MONITOR_DB`.
+   No worker execution is needed merely to reopen history.
+2. Open **Deployment Monitors**, select the existing aihub-foya-stt monitor, and
+   choose the successful run around `[2026-10-06T06:23:00Z,06:38:00Z)` under
+   **Open investigation**. Confirm the stored 198 logical / 378 physical counts.
+3. Read the quantified boundary message. Its possible count must match the
+   recorded `boundary_tail_events` under **Window, source policy and boundary
+   diagnostics**. Expect zero recorded confirmed truncations and the historical
+   metadata limitation caption; do not infer an actual truncated request.
+4. For event-level details, allow the same monitor's next normal bounded run with
+   the patched worker (`.venv\Scripts\python.exe -B tools\monitor_worker.py --once --max-runs 1`
+   when enabled and due). Keep the existing overlap/window/filter settings.
+   Refresh, select the new SUCCESS, and inspect **Boundary-affected events
+   (metadata only)**. Verify counts against the run, safe stream/event identifiers,
+   source times and the sample limit. If no events are affected, expect no caution.
+5. Confirm the prior run/history is unchanged and the new run follows the existing
+   watermark. Do not reset or replay the old window just to populate diagnostics.
 
 ## Timestamp and learning state compatibility
 
@@ -510,6 +630,15 @@ do not scale SQLite/advisory-lock workers across pods and call it HA. PostgreSQL
 repository/leases are the intended migration path.
 
 ## Validation and next phase
+
+Boundary-completeness validation: five regression cases first failed for missing
+classification/projection and the broad warning. After the additive patch,
+**255 focused boundary/session/pipeline/monitoring/UI tests** and **273
+timestamp/determinism/RCA tests** passed. The full offline regression suite passed
+**968 tests** (951 baseline + 17 new cases). `git diff --check` and the separate
+no-index whitespace check for the new boundary projection module passed. No real
+OpenSearch/LLM calls or live Citrix smoke were performed for this patch; use the
+history inspection procedure above. Nothing was staged, committed or pushed.
 
 Source-identity correction validation: the alias filter, returned-UUID rejection
 and incorrect technical index display were first reproduced as three failing

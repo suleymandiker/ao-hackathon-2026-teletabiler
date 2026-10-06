@@ -370,6 +370,77 @@ def test_long_boundary_orphan_and_tail_are_explicit_and_not_recounted(repo, pipe
     assert result.counts.logical_events == 2
 
 
+def test_boundary_quality_survives_owned_event_provenance_and_persistence(repo, pipeline):
+    from monitoring.worker import MonitorWorker
+    records = [record('context', -50, 'ERROR: context'), record('a', 1, 'ERROR: first'),
+               record('b', 2, '    continuation'), record('c', 3, 'ERROR: tail')]
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    executor, _ = executor_for(pipeline, records)
+    assert MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17), log=lambda *a, **k: None).tick() == 1
+    run = repo.history(monitor.id)[0]
+    quality = repo.result(run.id)['source_summary']['boundary_quality']
+    assert quality['counts'] == dict(complete=1, possible_incomplete=1, confirmed_truncated=0)
+    assert quality['total_events'] == run.counts.logical_events == 2
+    assert [row['boundary_status'] for row in quality['event_statuses']] == ['complete', 'possible_incomplete']
+    assert [row['attributes']['source_provenance']['boundary_status'] for row in pipeline.rows] == ['complete', 'possible_incomplete']
+    affected, = quality['affected_events']
+    assert affected['event_id'] == pipeline.rows[-1]['event_id']
+    assert affected['event_ordinal'] == 2 and affected['emission_reason'] == 'analysis_end'
+    assert affected['pod_instance'] == 'pod-id' and affected['container_instance'] == 'container-id'
+    assert affected['channel'] == 'stdout' and affected['physical_record_count'] == 1
+    assert affected['source_start_time'] == affected['last_source_time'] == (BASE + timedelta(seconds=3)).isoformat()
+    assert repo.get(monitor.id).last_successful_end == run.window.end
+
+
+def test_boundary_details_are_bounded_but_statuses_and_analysis_keep_every_event(repo, pipeline):
+    from monitoring.boundary_quality import BOUNDARY_DIAGNOSTIC_LIMIT
+    count = BOUNDARY_DIAGNOSTIC_LIMIT + 5
+    records = [record(str(i), i, 'ERROR: independent event', pod=str(i)) for i in range(count)]
+    pages = [page(records[i:i + 100], exhausted=i + 100 >= count, cursor=str(i + 100)) for i in range(0, count, 100)]
+    executor, _ = executor_for(pipeline, lambda query: pages.pop(0))
+    repo.create(definition(), enabled=True, now=BASE)
+    result = executor.execute(repo.claim(BASE + timedelta(minutes=17)), set())
+    quality = result.presentation['source_summary']['boundary_quality']
+    assert quality['counts'] == dict(complete=0, possible_incomplete=count, confirmed_truncated=0)
+    assert quality['total_events'] == result.counts.logical_events == len(pipeline.rows) == count
+    assert len(quality['event_statuses']) == count
+    assert len(quality['affected_events']) == quality['sample_limit'] == BOUNDARY_DIAGNOSTIC_LIMIT
+    assert quality['event_statuses'][-1]['event_ordinal'] == count
+    assert len({row['stream_id'] for row in quality['affected_events']}) == BOUNDARY_DIAGNOSTIC_LIMIT
+
+
+def test_boundary_diagnostics_never_copy_payloads_credentials_or_raw_references(repo, pipeline, monkeypatch, capsys):
+    from monitoring.execution import reference_key
+    from monitoring.worker import MonitorWorker
+    monkeypatch.setenv('SAKA_API_KEY', 'synthetic-boundary-ai-key')
+    secret_text = 'Authorization: Bearer synthetic-auth; api_key=private-api-key; customer_payload=private-body'
+    records = [record('a', 1, 'ERROR: ' + secret_text), record('b', 2, 'ERROR: independent'),
+               record('private-source-id', 3, 'ERROR: ' + secret_text, pod='test-password'),
+               record('c', 4, '   private continuation', pod='test-password')]
+    records[-1] = replace(records[-1], metadata=(('Authorization', 'Bearer secret-metadata'),))
+    jwt = 'eyJboundary.eyJcustomer.private-signature'
+    records[-2:] = [replace(row, stream_identity=replace(row.stream_identity,
+                       container_instance='synthetic-boundary-ai-key', channel='Bearer private-channel; ' + jwt)) for row in records[-2:]]
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    executor, _ = executor_for(pipeline, records)
+    assert MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17)).tick() == 1
+    quality = repo.result(repo.history(monitor.id)[0].id)['source_summary']['boundary_quality']
+    affected = quality['affected_events'][-1]
+    assert affected['pod_instance'] == affected['container_instance'] == '[redacted]'
+    assert affected['channel'] == '[redacted]; [redacted]'
+    assert affected['first_record_reference'] == reference_key(records[-2])
+    assert affected['last_record_reference'] == reference_key(records[-1])
+    assert affected['physical_record_count'] == 2
+    assert affected['source_start_time'] == (BASE + timedelta(seconds=3)).isoformat()
+    assert affected['last_source_time'] == (BASE + timedelta(seconds=4)).isoformat()
+    captured = capsys.readouterr()
+    inspected = str(quality) + captured.out + captured.err
+    for secret in ('Authorization', 'private-api-key', 'private-body', 'synthetic-auth', 'private-source-id',
+                   'secret-metadata', 'test-password', 'synthetic-boundary-ai-key', 'private-channel', 'private continuation', jwt):
+        assert secret not in inspected
+    assert 'event_statuses' not in captured.out and 'affected_events' not in captured.out
+
+
 @pytest.mark.parametrize('failure,category', [('timeout', 'OPENSEARCH_TIMEOUT'), ('auth', 'OPENSEARCH_AUTH'),
                                              ('cap', 'ACQUISITION_LIMIT'), ('malformed', 'OPENSEARCH_QUERY')])
 def test_acquisition_failures_persist_without_watermark_or_pipeline(repo, failure, category):
@@ -738,6 +809,8 @@ def test_correctly_scoped_quiet_window_succeeds_and_advances_watermark(repo, pip
     run = repo.history(monitor.id)[0]
     assert run.status.value == 'SUCCESS' and run.counts.events_retrieved == 0
     assert repo.result(run.id)['source_summary']['document_cluster_id'] is None
+    assert repo.result(run.id)['source_summary']['boundary_quality']['counts'] == dict(
+        complete=0, possible_incomplete=0, confirmed_truncated=0)
     assert repo.get(monitor.id).last_successful_end == run.window.end
     assert pipeline.rows == []
 

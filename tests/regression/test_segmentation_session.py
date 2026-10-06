@@ -101,6 +101,24 @@ def page(api, *records, **changes):
     return api.ingestion.SourcePage(tuple(records), **({"interval_exhausted": False} | changes))
 
 
+@pytest.mark.parametrize('closure,status', [
+    ('next_header', 'complete'), ('analysis_end', 'possible_incomplete'),
+    ('explicit_stream_close', 'possible_incomplete'),
+])
+def test_boundary_status_uses_closure_evidence(api, policy, closure, status):
+    subject = session(api, policy)
+    first = record(api)
+    subject.feed(first)
+    if closure == 'next_header':
+        event, = subject.feed(record(api, NEXT, number=2))
+    elif closure == 'explicit_stream_close':
+        event, = subject.close_stream(api.contracts.StreamKey.from_identity(first.stream_identity))
+    else:
+        event, = subject.close()
+    assert event.boundary_status == status
+    assert event.text == first.raw_text and event.records == (first,)
+
+
 def test_event_spans_pages_and_next_header_is_not_previous_contributor(api, policy):
     subject = session(api, policy)
     first = record(api)
@@ -116,10 +134,12 @@ def test_event_spans_pages_and_next_header_is_not_previous_contributor(api, poli
     assert event.records == (first, continuation)
     assert event.records[0] is first and event.records[1] is continuation
     assert event.emission_reason == "next_header"
+    assert event.boundary_status == "complete"  # earlier page cuts carry no quality penalty
     assert event.policy is policy
     assert all(not hasattr(item, "line_no") for item in event.evidence)
     assert subject.pending_record_count == 1
-    assert subject.close()[0].records == (next_header,)
+    tail, = subject.close()
+    assert tail.records == (next_header,) and tail.boundary_status == 'possible_incomplete'
 
 
 @pytest.mark.parametrize("empty", [False, True])
@@ -135,7 +155,9 @@ def test_page_flags_and_empty_pages_never_flush(api, policy, empty, interval, pa
                                       page_limit_reached=page_limit, cycle_budget_reached=cycle_limit,
                                       next_cursor=cursor))) == []
     assert subject.pending_record_count == (1 if empty else 2)
-    assert len(subject.close()) == 1
+    tail, = subject.close()
+    assert tail.boundary_status == 'possible_incomplete'
+    assert subject.close() == ()
 
 
 @pytest.mark.parametrize("changes", [
@@ -341,11 +363,13 @@ def test_close_stream_and_analysis_close_are_explicit_ordered_and_idempotent(api
     key = api.contracts.StreamKey.from_identity(rows[1].stream_identity)
     output, = subject.close_stream(key)
     assert output.records == (rows[1],) and output.emission_reason == "explicit_stream_close"
+    assert output.boundary_status == 'possible_incomplete'
     assert subject.close_stream(key) == ()
     assert subject.active_stream_count == subject.pending_record_count == 2
     outputs = subject.close()
     assert [item.records for item in outputs] == [(rows[0],), (rows[2],)]
     assert all(item.emission_reason == "analysis_end" for item in outputs)
+    assert all(item.boundary_status == 'possible_incomplete' for item in outputs)
     assert subject.active_stream_count == subject.pending_record_count == 0
     assert subject.closed is True
     assert subject.close() == ()
@@ -354,6 +378,14 @@ def test_close_stream_and_analysis_close_are_explicit_ordered_and_idempotent(api
         subject.feed(rows[0])
     with pytest.raises(RuntimeError, match="closed"):
         subject.feed_page(page(api))
+
+
+@pytest.mark.parametrize('status,eligible', [
+    ('complete', True), ('possible_incomplete', False), ('confirmed_truncated', False),
+    (None, False), ('unknown', False),
+])
+def test_future_baseline_boundary_guard_requires_complete_evidence(api, status, eligible):
+    assert api.contracts.boundary_allows_baseline_evidence(status) is eligible
 
 
 def test_explicitly_closed_stream_can_start_fresh_without_old_context(api, policy):

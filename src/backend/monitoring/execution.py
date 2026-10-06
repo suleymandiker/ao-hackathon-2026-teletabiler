@@ -12,6 +12,7 @@ from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClient
 from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
+from monitoring.boundary_quality import build_boundary_quality
 from monitoring.errors import MonitoringError
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
 from verified_policy_resolver import VerifiedPolicyResolver, PolicyResolutionError
@@ -225,6 +226,8 @@ class OpenSearchMonitorExecutor:
                 if any(count for reason, count in reasons.items() if reason != 'blank_context'):
                     raise MonitoringError('POLICY')
             summary['window_assembly'] = ownership.diagnostics
+            if 'event_provenance' in result:
+                summary['boundary_quality'] = build_boundary_quality(result['event_provenance'])
             stats = result['stats']
             counts = RunCounts(summary['records_read'], len(seen), stats.get('segmented', 0),
                                stats.get('parsed', 0), stats.get('templated', 0),
