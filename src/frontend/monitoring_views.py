@@ -23,9 +23,13 @@ def monitor_form(repo, connection, redact, monitor=None):
     key = monitor.id if monitor else 'new'
     with st.form('monitor_form_' + key):
         name = st.text_input('Monitor name', value=old.name if old else '', key='monitor_name_' + key)
-        profile = st.text_input('Source profile', value=old.source_profile if old else (connection.source_scope if connection else ''),
+        profile = st.text_input('Source profile / scope', value=old.source_profile if old else (connection.source_scope if connection else ''),
                                 help='Must match OPENSEARCH_SOURCE_SCOPE. Connection and index settings stay in application configuration.')
-        cluster = st.text_input('Cluster', value=old.cluster_id if old else '')
+        cluster_alias = st.text_input('Logical cluster alias', value=old.cluster_alias if old else (connection.source_scope if connection else ''),
+                                      help='Logical source name, retained for existing monitors. This does not filter document cluster UUIDs.')
+        document_cluster_id = st.text_input('Document OpenShift cluster UUID (optional)',
+                                            value=(old.document_cluster_id or '') if old else '',
+                                            help='Only enter a verified openshift.cluster_id from documents. Leave blank to omit this filter; never infer it from the alias or index.')
         namespace = st.text_input('Namespace', value=old.namespace if old else '')
         workload = st.text_input('Deployment / workload', value=old.workload if old else '',
                                  help='Exact configured workload label; do not use an ephemeral pod name.')
@@ -50,9 +54,10 @@ def monitor_form(repo, connection, redact, monitor=None):
         submitted = st.form_submit_button('Save monitor', key='save_monitor_' + key)
     if submitted:
         try:
-            definition = MonitorDefinition(name, profile, cluster, namespace, workload,
+            definition = MonitorDefinition(name, profile, cluster_alias, namespace, workload,
                                            datetime.fromisoformat(start.replace('Z', '+00:00')), container or None,
-                                           interval, window, delay, overlap, zone or None, page_size, max_pages)
+                                           interval, window, delay, overlap, zone or None, page_size, max_pages,
+                                           document_cluster_id=document_cluster_id or None)
             if monitor:
                 repo.update(monitor.id, definition, revision=monitor.revision, now=now())
                 if enabled != monitor.enabled:
@@ -90,7 +95,8 @@ def render(connection, redact):
     for monitor in monitors:
         latest = repo.history(monitor.id, limit=1)
         run = latest[0] if latest else None
-        rows.append(dict(Name=redact(monitor.definition.name), Cluster=redact(monitor.definition.cluster_id),
+        rows.append(dict(Name=redact(monitor.definition.name), Source_scope=redact(monitor.definition.source_profile),
+                         Cluster_alias=redact(monitor.definition.cluster_alias),
                          Namespace=redact(monitor.definition.namespace), Deployment=redact(monitor.definition.workload),
                          Container=redact(monitor.definition.container or ''), Enabled=monitor.enabled, Status=monitor.status.value,
                          Interval=monitor.definition.interval_seconds, Last_run=run.status.value if run else '',

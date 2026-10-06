@@ -106,6 +106,8 @@ class OpenSearchSource:
     ) -> contracts.SourcePage:
         """Read [start, end); fail the entire page on any incomplete evidence.
 
+        ``cluster_id`` is an optional document-level openshift.cluster_id value,
+        never the configured source_scope, logical cluster alias or index prefix.
         Endpoints must be timezone-aware datetimes (never relative date math).
         A full page is not exhausted, even if a subsequent read will be empty.
         Page size may change between reads; cursor binding excludes this limit,

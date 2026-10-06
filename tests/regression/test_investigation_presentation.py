@@ -35,6 +35,31 @@ def build(presenter, result=None):
     return presenter.build(result or result_fixture(), source='OpenShift logları', target='ns / checkout')
 
 
+def test_technical_details_show_resolved_index_and_base_pattern(presenter):
+    result = result_fixture()
+    result['source_summary'].update(index_expression='gocpbmgpup1*', resolved_index='gocpbmgpup1-2026.10.05')
+    details = dict(build(presenter, result).technical)
+    assert details['İndeks'] == 'gocpbmgpup1-2026.10.05'
+    assert details['Kaynak indeks deseni'] == 'gocpbmgpup1*'
+
+
+def test_legacy_technical_details_keep_base_index_without_inventing_resolved_scope(presenter):
+    result = result_fixture()
+    result['source_summary'].update(index_expression='gocpbmgpup1*')
+    details = dict(build(presenter, result).technical)
+    assert details['İndeks'] == 'gocpbmgpup1*'
+    assert 'Kaynak indeks deseni' not in details
+    assert 'Document OpenShift cluster UUID' not in details
+
+
+def test_technical_details_show_explicit_document_uuid(presenter):
+    result = result_fixture()
+    result['source_summary'].update(source_scope='logical-alias', document_cluster_id='11111111-2222-4333-8444-555555555555')
+    details = dict(build(presenter, result).technical)
+    assert details['Kaynak kapsamı'] == 'logical-alias'
+    assert details['Document OpenShift cluster UUID'] == '11111111-2222-4333-8444-555555555555'
+
+
 def test_pipeline_counts_are_real_and_suppression_is_attention(presenter):
     view = build(presenter)
     assert [stage.value for stage in view.stages] == ['9', '5', '5', '1', '2 → 0', '0', '0', '0']

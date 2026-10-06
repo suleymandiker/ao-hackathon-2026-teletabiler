@@ -4,11 +4,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import socket
 import sqlite3
+import json
 from types import SimpleNamespace
 
 import pytest
 
 BASE = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
+DOCUMENT_UUID = '11111111-2222-4333-8444-555555555555'
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +92,8 @@ def test_create_read_edit_and_schema_is_separate(repo):
     {'window_seconds': 0}, {'interval_seconds': -1}, {'overlap_seconds': 901},
     {'page_size': 501}, {'max_pages': 21}, {'ingestion_delay_seconds': -1},
     {'cluster_id': ''}, {'name': 'bad\nname'}, {'window_seconds': 86400},
+    {'document_cluster_id': ''}, {'document_cluster_id': '  '}, {'document_cluster_id': 123},
+    {'document_cluster_id': 'invalid\nvalue'}, {'document_cluster_id': 'x' * 201},
 ])
 def test_definition_validation(changes):
     with pytest.raises(ValueError):
@@ -234,6 +238,8 @@ def test_scope_immutable_after_run_but_name_interval_editable(repo):
     monitor = repo.get(monitor.id)
     with pytest.raises(ValueError, match='first run'):
         repo.update(monitor.id, definition(workload='new-app'), revision=monitor.revision, now=BASE)
+    with pytest.raises(ValueError, match='first run'):
+        repo.update(monitor.id, definition(document_cluster_id=DOCUMENT_UUID), revision=monitor.revision, now=BASE)
     edited = repo.update(monitor.id, definition(name='renamed', interval_seconds=1800), revision=monitor.revision, now=BASE)
     assert edited.last_successful_end == monitor.last_successful_end
 
@@ -319,7 +325,7 @@ def test_monitor_pipeline_timestamp_fallback_is_per_event_and_timezone_propagate
         assert provenance['basis'] == 'source_record' and provenance['source_record_field'] == '@timestamp'
     assert queries[0]['start'] == BASE - timedelta(seconds=60)
     assert queries[0]['end'] == BASE + timedelta(minutes=16)
-    assert queries[0]['cluster_id'] == 'cluster' and queries[0]['workload'] == 'app'
+    assert queries[0]['cluster_id'] is None and queries[0]['workload'] == 'app'
 
 
 def test_overlap_multiline_is_assembled_once_across_windows_and_restart(repo, pipeline):
@@ -399,8 +405,8 @@ def test_empty_window_succeeds_without_policy_and_config_error_is_safe(repo, pip
     assert caught.value.category == 'OPENSEARCH_CONFIG' and 'test-secret' not in str(caught.value)
 
 
-def test_exact_opensearch_query_cluster_binding_and_sort():
-    from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
+def test_exact_opensearch_query_document_cluster_filter_and_sort():
+    from ingestion_layer.opensearch_source import OpenSearchSource
     from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
     queries = []
     config = OpenSearchConfig(('https://fake.invalid',), 'fake', 'secret', True, True, 'logs-*', 1, 1,
@@ -408,10 +414,10 @@ def test_exact_opensearch_query_cluster_binding_and_sort():
     client = SimpleNamespace(config=config, post_json=lambda path, query: queries.append(query) or
                               {'timed_out': False, '_shards': {'failed': 0}, 'hits': {'hits': []}})
     source = OpenSearchSource(client)
-    source.read_page(start=BASE, end=BASE + timedelta(minutes=15), namespace='ns', workload='app', cluster_id='cluster')
+    source.read_page(start=BASE, end=BASE + timedelta(minutes=15), namespace='ns', workload='app', cluster_id=DOCUMENT_UUID)
     filters = queries[0]['query']['bool']['filter']
     assert filters[0] == {'range': {'@timestamp': {'gte': BASE.isoformat(), 'lt': (BASE + timedelta(minutes=15)).isoformat()}}}
-    assert {'term': {'openshift.cluster_id.keyword': 'cluster'}} in filters
+    assert {'term': {'openshift.cluster_id.keyword': DOCUMENT_UUID}} in filters
     assert {'term': {'kubernetes.labels.app.keyword': 'app'}} in filters
     assert queries[0]['sort'] == [{'@timestamp': 'asc'}, {'openshift.sequence': 'asc'}]
 
@@ -465,8 +471,11 @@ def test_worker_output_and_persisted_projection_exclude_legacy_secrets(repo, pip
         result['case_analysis'] = {'description': 'synthetic-ai-key test-password', 'synthetic-ai-key': 'untrusted field name'}
         return result
     pipeline.process_ingested_pages = process
-    monitor = repo.create(definition(), enabled=True, now=BASE)
-    executor, _ = executor_for(pipeline, [record('a', 1, 'ERROR: failure'), record('b', 2, 'ERROR: failure')])
+    namespace = 'test-password Authorization: Bearer synthetic-ai-key'
+    monitor = repo.create(definition(namespace=namespace), enabled=True, now=BASE)
+    records = [record('a', 1, 'ERROR: failure'), record('b', 2, 'ERROR: failure')]
+    records = [replace(row, stream_identity=replace(row.stream_identity, namespace=namespace)) for row in records]
+    executor, _ = executor_for(pipeline, records)
     previous_disable = logging.root.manager.disable
     assert MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17)).tick() == 1
     captured = capsys.readouterr()
@@ -474,6 +483,7 @@ def test_worker_output_and_persisted_projection_exclude_legacy_secrets(repo, pip
     for secret in ('Authorization', 'synthetic-ai-key', 'test-password', 'raw private log'):
         assert secret not in captured.out + captured.err + stored
     assert '[MONITOR]' in captured.out and 'SUCCESS' in captured.out
+    assert '[redacted]' in repo.result(repo.history(monitor.id)[0].id)['source_summary']['namespace']
     assert logging.root.manager.disable == previous_disable
 
 
@@ -569,7 +579,6 @@ def test_worker_daily_indices_use_both_overlaps_and_preserve_profile(repo, pipel
         {'term': {'kubernetes.namespace_name.keyword': 'ns'}},
         {'term': {'kubernetes.labels.app.keyword': 'app'}},
         {'term': {'kubernetes.container_name.keyword': 'main'}},
-        {'term': {'openshift.cluster_id.keyword': 'cluster'}},
     ]
     assert config.index_expression == 'daily-cluster*'  # immutable profile configuration
     assert repo.get(monitor.id).definition == monitor.definition
@@ -585,3 +594,184 @@ def test_worker_daily_indices_use_both_overlaps_and_preserve_profile(repo, pipel
         assert summary['index_strategy'] == 'daily_utc'
         assert (summary['namespace'], summary['workload'], summary['container']) == ('ns', 'app', 'main')
         assert repo.get(monitor.id).last_successful_end == start + timedelta(minutes=15)
+
+
+@pytest.fixture
+def source_scope_executor(pipeline):
+    """Real query builder and hit mapping; fake transport applies document filters."""
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.execution import OpenSearchMonitorExecutor
+    from opensearch_application import VerifiedPolicy
+    from segmentation_layer.contracts import SegmentationPolicy
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'synthetic-reader', 'synthetic-password', True, True,
+                              'gocpbmgpup1*', 1, 1, 'gocpbmgpup1', OpenSearchFieldMapping(), 100,
+                              index_strategy='daily_utc')
+    document_id = DOCUMENT_UUID
+    scope = {'openshift.cluster_id.keyword': document_id,
+             'kubernetes.namespace_name.keyword': 'ai-voice',
+             'kubernetes.labels.app.keyword': 'aihub-foya-stt-apis-http',
+             'kubernetes.container_name.keyword': 'aihub-foya-stt-apis-http'}
+    calls, hits = [], []
+    start = BASE.replace(hour=21, minute=38)
+    for sequence in (1, 2):
+        timestamp = (start + timedelta(seconds=sequence)).isoformat()
+        hits.append({'_index': 'gocpbmgpup1-2026.10.05', '_id': str(sequence), 'sort': [timestamp, sequence],
+                     '_source': {'@timestamp': timestamp, 'message': 'ERROR: synthetic failure',
+                                 'openshift': {'cluster_id': document_id, 'sequence': sequence},
+                                 'kubernetes': {'namespace_name': 'ai-voice', 'labels': {'app': 'aihub-foya-stt-apis-http'},
+                                                'pod_name': 'synthetic-pod', 'pod_id': 'synthetic-pod-id',
+                                                'container_name': 'aihub-foya-stt-apis-http',
+                                                'container_id': 'synthetic-container-id', 'container_iostream': 'stdout'}}})
+    class Client:
+        def __init__(self, supplied):
+            assert supplied is config
+            self.config = supplied
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post_json(self, path, query):
+            calls.append((path, query))
+            matches = all(scope[key] == value for item in query['query']['bool']['filter']
+                          for key, value in item.get('term', {}).items())
+            return {'timed_out': False, '_shards': {'failed': 0}, 'hits': {'hits': hits if matches else []}}
+    policy = VerifiedPolicy('policy-safe', SegmentationPolicy('id', r'^ERROR:', 'verified-fixture'))
+    executor = OpenSearchMonitorExecutor(lambda: pipeline, connection_loader=lambda size: config, client_factory=Client,
+                                         policy_loader=lambda: (policy,))
+    monitor_definition = definition(source_profile=config.source_scope, cluster_id=config.source_scope,
+                                    namespace='ai-voice', workload='aihub-foya-stt-apis-http',
+                                    container='aihub-foya-stt-apis-http', initial_start=start)
+    return SimpleNamespace(executor=executor, calls=calls, hits=hits, definition=monitor_definition,
+                           document_id=document_id, config=config)
+
+
+@pytest.mark.parametrize('explicit_uuid', [False, True])
+def test_worker_source_alias_does_not_filter_document_uuid_and_advances_window(
+        repo, pipeline, source_scope_executor, explicit_uuid, capsys):
+    from monitoring.worker import MonitorWorker
+    fixture = source_scope_executor
+    configured = replace(fixture.definition, document_cluster_id=fixture.document_id) if explicit_uuid else fixture.definition
+    monitor = repo.create(configured, enabled=True, now=BASE)
+    scheduler = MonitorWorker(repo, fixture.executor, clock=lambda: fixture.definition.initial_start + timedelta(minutes=17))
+    completed = scheduler.tick()
+    path, query = fixture.calls[0]
+    assert path == '/gocpbmgpup1-2026.10.05/_search'
+    expected_filters = [
+        {'range': {'@timestamp': {'gte': '2026-10-05T21:37:00+00:00', 'lt': '2026-10-05T21:54:00+00:00'}}},
+        {'term': {'kubernetes.namespace_name.keyword': 'ai-voice'}},
+        {'term': {'kubernetes.labels.app.keyword': 'aihub-foya-stt-apis-http'}},
+        {'term': {'kubernetes.container_name.keyword': 'aihub-foya-stt-apis-http'}},
+    ]
+    if explicit_uuid:
+        expected_filters.append({'term': {'openshift.cluster_id.keyword': fixture.document_id}})
+    assert query['query']['bool']['filter'] == expected_filters
+    run = repo.history(monitor.id)[0]
+    assert completed == 1 and run.status.value == 'SUCCESS'
+    assert run.counts.events_retrieved == 2 and run.counts.parsed_events == 2
+    assert len(pipeline.rows) == 2
+    assert repo.get(monitor.id).last_successful_end == fixture.definition.initial_start + timedelta(minutes=15)
+    summary = repo.result(run.id)['source_summary']
+    expected_scope = dict(source_scope='gocpbmgpup1', index_expression='gocpbmgpup1*',
+                          resolved_index='gocpbmgpup1-2026.10.05',
+                          retrieval_start='2026-10-05T21:37:00+00:00', retrieval_end='2026-10-05T21:54:00+00:00',
+                          namespace='ai-voice', workload='aihub-foya-stt-apis-http', container='aihub-foya-stt-apis-http',
+                          document_cluster_id=fixture.document_id if explicit_uuid else None)
+    assert {key: summary[key] for key in expected_scope} == expected_scope
+    assert summary['cluster_alias'] == 'gocpbmgpup1' and summary['source_profile'] == 'gocpbmgpup1'
+    assert 'cluster_id' not in summary  # no ambiguous identity in new diagnostics
+    captured = capsys.readouterr()
+    logs = [json.loads(line.removeprefix('[MONITOR] ')) for line in captured.out.splitlines()]
+    acquired = next(row for row in logs if row['event'] == 'ACQUIRED')
+    assert {key: acquired[key] for key in expected_scope} == expected_scope
+    stored_and_logged = str(summary) + captured.out + captured.err
+    for secret in ('synthetic-reader', 'synthetic-password', 'synthetic.invalid', 'Authorization'):
+        assert secret not in stored_and_logged
+    assert 'headers' not in summary and all('headers' not in row for row in logs)
+
+
+def test_returned_document_uuid_is_not_validated_against_logical_alias(repo, pipeline):
+    records = [record(str(i), i, 'ERROR: synthetic failure') for i in (1, 2)]
+    records = [replace(row, stream_identity=replace(row.stream_identity, source_scope='document-uuid')) for row in records]
+    repo.create(definition(), enabled=True, now=BASE)
+    executor, _ = executor_for(pipeline, records)
+    result = executor.execute(repo.claim(BASE + timedelta(minutes=17)), set())
+    assert result.counts.logical_events == 2
+
+
+def test_source_profile_mismatch_fails_before_acquisition(repo, source_scope_executor):
+    from monitoring.worker import MonitorWorker
+    fixture = source_scope_executor
+    monitor = repo.create(replace(fixture.definition, source_profile='other-profile'), enabled=True, now=BASE)
+    assert MonitorWorker(repo, fixture.executor, clock=lambda: BASE + timedelta(days=1), log=lambda *a, **k: None).tick() == 0
+    assert fixture.calls == []
+    assert repo.history(monitor.id)[0].error_category == 'OPENSEARCH_CONFIG'
+    assert repo.get(monitor.id).last_successful_end is None
+
+
+@pytest.mark.parametrize('mismatch', ['source_profile', 'document_cluster_id', 'namespace', 'workload', 'container'])
+def test_out_of_scope_returned_records_fail_without_watermark(repo, mismatch):
+    from monitoring.worker import MonitorWorker
+    row = record('a', 1, 'ERROR: failure')
+    row = replace(row, stream_identity=replace(row.stream_identity, source_scope=DOCUMENT_UUID))
+    if mismatch == 'source_profile':
+        row = replace(row, source_reference=replace(row.source_reference, source_scope='wrong-profile'))
+    else:
+        field = 'source_scope' if mismatch == 'document_cluster_id' else mismatch
+        row = replace(row, stream_identity=replace(row.stream_identity, **{field: 'wrong-value'}))
+    def no_pipeline(*args, **kwargs):
+        pytest.fail('Out-of-scope acquisition must fail before the pipeline')
+    executor, _ = executor_for(SimpleNamespace(process_ingested_pages=no_pipeline), [row])
+    monitor = repo.create(definition(container='main', document_cluster_id=DOCUMENT_UUID), enabled=True, now=BASE)
+    assert MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17), log=lambda *a, **k: None).tick() == 0
+    run = repo.history(monitor.id)[0]
+    assert run.status.value == 'FAILED' and run.error_category == 'OPENSEARCH_QUERY'
+    assert repo.result(run.id) is None and repo.get(monitor.id).last_successful_end is None
+
+
+def test_correctly_scoped_quiet_window_succeeds_and_advances_watermark(repo, pipeline, source_scope_executor):
+    from monitoring.worker import MonitorWorker
+    fixture = source_scope_executor
+    fixture.hits.clear()
+    fixture.executor.policy_loader = lambda: pytest.fail('Quiet windows need no policy')
+    monitor = repo.create(fixture.definition, enabled=True, now=BASE)
+    assert MonitorWorker(repo, fixture.executor, clock=lambda: BASE + timedelta(days=1), log=lambda *a, **k: None).tick() == 1
+    run = repo.history(monitor.id)[0]
+    assert run.status.value == 'SUCCESS' and run.counts.events_retrieved == 0
+    assert repo.result(run.id)['source_summary']['document_cluster_id'] is None
+    assert repo.get(monitor.id).last_successful_end == run.window.end
+    assert pipeline.rows == []
+
+
+def test_legacy_monitor_json_keeps_alias_and_history_without_migration(repo, source_scope_executor):
+    from monitoring.repository import SQLiteMonitorRepository
+    from monitoring.worker import MonitorWorker
+    fixture = source_scope_executor
+    monitor = repo.create(fixture.definition, enabled=True, now=BASE)
+    historical = worker(repo, [BASE + timedelta(days=1)])[0]
+    assert historical.tick() == 1
+    run = repo.history(monitor.id)[0]
+    with sqlite3.connect(repo.path) as db:
+        legacy = json.loads(db.execute('SELECT definition FROM monitors WHERE id=?', (monitor.id,)).fetchone()[0])
+        legacy.pop('document_cluster_id')
+        payload = json.dumps(legacy)
+        db.execute('UPDATE monitors SET definition=? WHERE id=?', (payload, monitor.id))
+        db.execute('UPDATE monitor_runs SET definition=? WHERE id=?', (payload, run.id))
+        history_before = db.execute('SELECT * FROM monitor_runs WHERE id=?', (run.id,)).fetchone()
+        result_before = db.execute('SELECT * FROM monitor_results WHERE run_id=?', (run.id,)).fetchone()
+    reopened = SQLiteMonitorRepository(repo.path)
+    loaded = reopened.get(monitor.id)
+    assert loaded.definition.cluster_id == loaded.definition.cluster_alias == 'gocpbmgpup1'
+    assert loaded.definition.source_profile == 'gocpbmgpup1' and loaded.definition.document_cluster_id is None
+    assert reopened.history(monitor.id)[0].definition == loaded.definition
+    reopened.update(monitor.id, replace(loaded.definition, name='renamed'), revision=loaded.revision, now=BASE)
+    with sqlite3.connect(repo.path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('SELECT * FROM monitor_runs WHERE id=?', (run.id,)).fetchone() == history_before
+        assert db.execute('SELECT * FROM monitor_results WHERE run_id=?', (run.id,)).fetchone() == result_before
+    # A separate legacy definition that has never run uses the corrected scope.
+    new = repo.create(fixture.definition, enabled=True, now=BASE)
+    repo.set_enabled(monitor.id, False, now=BASE)
+    with sqlite3.connect(repo.path) as db:
+        db.execute('UPDATE monitors SET definition=? WHERE id=?', (payload, new.id))
+    assert MonitorWorker(reopened, fixture.executor, clock=lambda: BASE + timedelta(days=1), log=lambda *a, **k: None).tick() == 1
+    assert reopened.history(new.id)[0].counts.events_retrieved == 2

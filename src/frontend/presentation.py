@@ -310,9 +310,18 @@ class InvestigationPresenter:
 
         technical = [('Kaynak', source)]
         for key, label in (('start', 'Aralık başlangıcı'), ('end', 'Aralık sonu (hariç)'), ('source_scope', 'Kaynak kapsamı'),
-                           ('index_expression', 'İndeks'), ('pages_read', 'Alınan sayfa'), ('record_budget', 'Kayıt sınırı')):
+                           ('retrieval_start', 'Sorgu başlangıcı'), ('retrieval_end', 'Sorgu sonu (hariç)'),
+                           ('namespace', 'Namespace'), ('workload', 'Deployment / workload'), ('container', 'Container'),
+                           ('pages_read', 'Alınan sayfa'), ('record_budget', 'Kayıt sınırı')):
             if key in acquisition:
                 technical.append((label, acquisition[key]))
+        if acquisition.get('resolved_index'):
+            technical.append(('İndeks', acquisition['resolved_index']))
+            technical.append(('Kaynak indeks deseni', acquisition.get('index_expression')))
+        elif 'index_expression' in acquisition:
+            technical.append(('İndeks', acquisition['index_expression']))
+        if 'document_cluster_id' in acquisition:
+            technical.append(('Document OpenShift cluster UUID', acquisition['document_cluster_id'] or 'Absent (no filter)'))
         if 'verify_certs' in acquisition:
             technical.append(('TLS doğrulaması', 'Açık' if acquisition['verify_certs'] else 'Kapalı'))
         selection = acquisition.get('policy_selection') or {}

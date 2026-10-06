@@ -51,7 +51,11 @@ def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
     from monitoring.domain import RunCounts
     repo.set_enabled(monitor.id, True, now=BASE)
     run = repo.claim(BASE + timedelta(minutes=17))
-    safe = ui.boundary.presentation_result(ui.payload, {'records_read': 7}, ui.boundary.load_connection())
+    summary = dict(records_read=7, source_scope='gocpbmgpup1', index_expression='gocpbmgpup1*',
+                   resolved_index='gocpbmgpup1-2026.10.05', retrieval_start='2026-10-05T11:59:00+00:00',
+                   retrieval_end='2026-10-05T12:16:00+00:00', namespace='ns', workload='app', container='main',
+                   document_cluster_id=None)
+    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
     repo.succeed(run, safe, RunCounts(events_retrieved=7, logical_events=7), {}, now=BASE + timedelta(minutes=17))
     app = ui.app()
     app.button(key='start_monitors').click().run()
@@ -59,10 +63,20 @@ def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
     assert app.selectbox(key='monitor_run').value == run.id
     assert any(item.value == 'Investigation sonucu' for item in app.title)
     assert any('Last successful end: 2026-10-05T12:15:00+00:00' == item.value for item in app.text)
+    technical = next(item.value for item in app.dataframe
+                     if 'Gösterge' in item.value and 'İndeks' in item.value['Gösterge'].values)
+    details = dict(zip(technical['Gösterge'], technical['Değer']))
+    assert details['İndeks'] == summary['resolved_index']
+    assert details['Kaynak indeks deseni'] == summary['index_expression']
+    assert details['Kaynak kapsamı'] == 'gocpbmgpup1'
+    assert details['Sorgu başlangıcı'] == summary['retrieval_start']
+    assert details['Sorgu sonu (hariç)'] == summary['retrieval_end']
+    assert details['Document OpenShift cluster UUID'] == 'Absent (no filter)'
     assert_safe(app)
 
 
-def test_create_disabled_and_edit_monitor_from_form(monitoring_ui):
+@pytest.mark.parametrize('document_cluster_id', [None, '11111111-2222-4333-8444-555555555555'])
+def test_create_disabled_and_edit_monitor_from_form(monitoring_ui, document_cluster_id):
     ui, repo, _ = monitoring_ui
     app = ui.app()
     app.button(key='start_monitors').click().run()
@@ -70,7 +84,11 @@ def test_create_disabled_and_edit_monitor_from_form(monitoring_ui):
     # Form widgets are identified by labels; two forms exist on this screen.
     def first(label):
         return next(item for item in app.text_input if item.label == label)
-    first('Cluster').set_value('cluster')
+    assert first('Source profile / scope').value == 'profile'
+    assert first('Document OpenShift cluster UUID (optional)').value == ''
+    first('Logical cluster alias').set_value('logical-alias')
+    if document_cluster_id:
+        first('Document OpenShift cluster UUID (optional)').set_value(document_cluster_id)
     first('Namespace').set_value('ns')
     first('Deployment / workload').set_value('app')
     app.button(key='save_monitor_new').click().run()
@@ -79,11 +97,14 @@ def test_create_disabled_and_edit_monitor_from_form(monitoring_ui):
     assert len(monitors) == 2
     created = next(m for m in monitors if m.definition.name == 'created-in-ui')
     assert not created.enabled and created.definition.source_timezone is None
+    assert created.definition.cluster_id == created.definition.cluster_alias == 'logical-alias'
+    assert created.definition.document_cluster_id == document_cluster_id
     app.selectbox(key='inspect_monitor').select(created.id).run()
     app.text_input(key='monitor_name_' + created.id).set_value('edited-in-ui')
     app.button(key='save_monitor_' + created.id).click().run()
     assert not app.exception
     assert repo.get(created.id).definition.name == 'edited-in-ui'
+    assert repo.get(created.id).definition.document_cluster_id == document_cluster_id
     assert not repo.history(created.id) and not ui.sources
 
 

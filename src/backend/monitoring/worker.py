@@ -39,7 +39,14 @@ class MonitorWorker:
                 consumed = self.repository.consumed(run.monitor_id, since)
                 category = 'PIPELINE'
                 result = self.executor.execute(run, consumed)
-                self.log('ACQUIRED', records=result.counts.events_retrieved, unique_records=result.counts.unique_records)
+                # Copy only effective scope fields from the executor's redacted
+                # presentation, never a connection object or raw query payload.
+                summary = result.presentation.get('source_summary', {})
+                scope = {key: summary[key] for key in (
+                    'source_scope', 'index_expression', 'resolved_index', 'retrieval_start', 'retrieval_end',
+                    'namespace', 'workload', 'container', 'document_cluster_id',
+                ) if key in summary}
+                self.log('ACQUIRED', records=result.counts.events_retrieved, unique_records=result.counts.unique_records, **scope)
                 self.log('PIPELINE', candidates=result.counts.signal_candidates, qualified=result.counts.qualified_signals,
                          correlations=result.counts.correlations, incidents=result.counts.incidents)
                 category = 'PERSISTENCE'

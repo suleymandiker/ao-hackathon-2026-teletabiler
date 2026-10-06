@@ -317,6 +317,7 @@ def test_timestamp_ties_remain_distinct_and_next_page_starts_after_last_sequence
 
 @pytest.mark.parametrize("changes", [
     {"namespace": "other"}, {"workload": "other"}, {"container": "other"},
+    {"cluster_id": "other-document-uuid"},
     {"start": START + timedelta(seconds=1)}, {"end": END + timedelta(seconds=1)},
 ])
 def test_cursor_rejects_incompatible_selection_before_http(api, config, changes):

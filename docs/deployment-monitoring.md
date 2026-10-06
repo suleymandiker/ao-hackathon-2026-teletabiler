@@ -99,8 +99,8 @@ override was added: a missing/broken relevant daily index still fails acquisitio
 and leaves the watermark unchanged.
 
 Monitors/runs continue persisting their source profile, not today's date. Neither
-SQLite schema nor existing monitor definitions change. Each successful result's
-`source_summary` now includes `index_expression`, `index_strategy`, `resolved_index`,
+SQLite schema nor existing monitor definitions changed for daily-index resolution.
+Each successful result's `source_summary` includes `index_expression`, `index_strategy`, `resolved_index`,
 `namespace`, `workload`, `container`, and the existing exact retrieval bounds.
 The profile wildcard stays configured; tomorrow's target resolves automatically.
 
@@ -151,13 +151,85 @@ suite passed **930 tests** (896 baseline + 34 new). `git diff --check` and white
 checks for new files passed. No live OpenSearch calls were made during this
 correction; the commands above are the Citrix validation procedure.
 
+## Source identity and document cluster filtering
+
+The real logical window `[2026-10-05T21:38:00Z,2026-10-05T21:53:00Z)` exposed a
+separate acquisition bug after daily-index resolution was correct. The monitor's
+logical alias `gocpbmgpup1` was passed from `MonitorDefinition.cluster_id` through
+`OpenSearchMonitorExecutor.execute()` into `OpenSearchSource.read_page(cluster_id=...)`.
+That argument emits a term on `openshift.cluster_id.keyword`, whose documents
+contain a UUID, not the alias. The executor also compared returned stream UUIDs
+to that same alias, so removing only the query filter would still reject records.
+
+The supplied live diagnostic found 66 records with time, namespace, workload and
+container filters, and zero after adding the alias as a document cluster filter.
+Those counts describe that diagnostic only; no count is assumed by application
+logic. A correctly scoped, complete empty query remains a valid SUCCESS.
+
+Identity now has explicit meanings:
+
+| Value | Meaning and behavior |
+| --- | --- |
+| `source_profile` / configured `source_scope` | Must match `OPENSEARCH_SOURCE_SCOPE`; identifies the configured connection/index family. Returned `SourceReference.source_scope` is checked against it. |
+| `cluster_alias` | Logical cluster name. The legacy constructor/JSON field `cluster_id` is retained, exposed as this property and labeled **Logical cluster alias** in the form. It never creates a document filter. |
+| Optional `document_cluster_id` | Explicit actual `openshift.cluster_id` value. Defaults to `None`; never inferred from the profile, alias, index or environment name. Only this field supplies `read_page(cluster_id=...)` and optional returned-UUID validation. |
+
+The low-level source's existing `cluster_id` keyword remains compatible and has
+document-level semantics. `StreamIdentity.source_scope` continues carrying the
+document UUID, preserving pod/container/channel segmentation identity. No parser,
+canonical event, template identity, timestamp, downstream or RCA contract changes.
+The manual OpenSearch application and smoke tool do not pass the logical alias
+as a document filter; their source-reference handling remains unchanged.
+
+For the reported example with the default 60-second overlap, the exact selection is:
+
+```text
+source_scope: gocpbmgpup1
+index_expression: gocpbmgpup1*
+index_strategy: daily_utc
+resolved_index: gocpbmgpup1-2026.10.05
+@timestamp: gte 2026-10-05T21:37:00+00:00, lt 2026-10-05T21:54:00+00:00
+kubernetes.namespace_name.keyword: ai-voice
+kubernetes.labels.app.keyword: aihub-foya-stt-apis-http
+kubernetes.container_name.keyword: aihub-foya-stt-apis-http
+document_cluster_id: null (no openshift.cluster_id term)
+```
+
+With zero overlap, the same query uses the exact logical bounds 21:38–21:53Z.
+The time range remains half-open. An explicitly configured document UUID adds
+only `term openshift.cluster_id.keyword = <configured UUID>`; namespace, workload,
+container, sorting, cursor binding, daily UTC dates and shard validation are unchanged.
+
+Successful results persist `source_scope`, `cluster_alias`, `source_profile`,
+`index_expression`, `resolved_index`, retrieval bounds, namespace, workload,
+container and `document_cluster_id` (null when absent). The worker's ACQUIRED log
+includes the effective scope from the redacted result through an explicit field
+allowlist. It never logs connection objects, headers or raw queries. The workbench
+shows **İndeks** as the resolved index when available, **Kaynak indeks deseni** as
+the configured pattern, and separate retrieval bounds and document UUID status.
+Older results lacking a resolved index continue showing their recorded pattern;
+the UI does not invent a historical query target.
+
+`MonitorDefinition` gains only the optional `document_cluster_id` JSON field.
+Old definitions without that field read as `None`; their stored `cluster_id`
+remains a logical alias. SQLite schema version stays 1; no database migration,
+automatic history rewrite, watermark reset or learning-state reset occurs.
+The new filter is part of the immutable scope after the first run, just like
+namespace/workload. Changing it then requires a new monitor. Result persistence
+still atomically commits receipts, SUCCESS and `last_successful_end=window.end`;
+query, pipeline or persistence failure does not advance the watermark.
+
+**The prior smoke SUCCESS for 21:38–21:53Z used an invalid filter and is not proof
+of acquisition correctness.** Preserve it as history and use a **new disabled
+smoke monitor** after this patch. Do not reuse its watermark or delete history.
+
 ## Domain and persistence
 
 `monitoring/domain.py` defines immutable typed objects:
 
 | Object | Fields |
 | --- | --- |
-| `MonitorDefinition` | name, source_profile, cluster_id, namespace, workload, optional container, initial_start, interval_seconds, window_seconds, ingestion_delay_seconds, overlap_seconds, source_timezone, page_size, max_pages |
+| `MonitorDefinition` | name, source_profile, legacy cluster_id (logical cluster_alias), namespace, workload, optional container, initial_start, interval_seconds, window_seconds, ingestion_delay_seconds, overlap_seconds, source_timezone, page_size, max_pages, optional document_cluster_id |
 | `DeploymentMonitor` | id, definition, enabled, status, last_successful_end, next_run_at, safe last error category/summary, created_at, updated_at, revision |
 | `MonitorRun` | id, monitor_id, exact window, immutable definition snapshot, actual start/finish, created_at, status, claim token, attempt count, counts, result reference, safe error category/summary |
 | `RunCounts` | retrieved/unique records, logical/parsed events, templated-event count, candidate/qualified signals, correlations, incidents, RCA count |
@@ -259,9 +331,10 @@ No session or raw assembly buffer survives a run.
 Within retrieval, `(source scope, concrete _index, _id)` is hashed to deduplicate
 physical records before assembly; document version changes do not create a new
 line. Record order remains the original `@timestamp ASC`,
-`openshift.sequence ASC` order. The same exact mapping gains only an optional
-cluster filter (`openshift.cluster_id.keyword`); namespace/workload/container
-filters keep their existing mappings. Pod names never define a monitor.
+`openshift.sequence ASC` order. Only an explicitly configured document cluster ID
+adds a filter on `openshift.cluster_id.keyword`; a logical source alias never
+does. Namespace/workload/container filters keep their existing mappings.
+Pod names never define a monitor.
 
 The optional source-neutral `assembled_event_filter` in the authoritative pipeline
 applies **after assembly and before parsing/template learning/downstream**. Without
@@ -341,9 +414,10 @@ for execution. The existing upload and ad-hoc OpenShift flows remain under
 **Manual Investigation / Test / Smoke** for compatibility.
 
 Worker output is allowlisted structured `[MONITOR]` JSON: START, ACQUIRED, PIPELINE,
-SUCCESS, FAILED, with opaque IDs, exact windows, integer counts, duration and safe
-categories. Error summaries are fixed text, never exception strings. Categories
-include configuration, auth, timeout, query, acquisition limit, policy, pipeline,
+SUCCESS, FAILED, with opaque IDs, exact windows, redacted effective acquisition
+scope, integer counts, duration and safe categories. Error summaries are fixed
+text, never exception strings. Categories include configuration, auth, timeout,
+query, acquisition limit, policy, pipeline,
 persistence and interrupted/unknown failures.
 
 Legacy pipeline stdout/stderr/logging (including opt-in RCA prompt debug output)
@@ -377,11 +451,16 @@ Terminal 1, UI:
 
 1. Open **Deployment Monitors**. Verify "Source configuration loaded". This only
    checks configuration; a later worker run checks live access.
-2. Create **one disabled monitor**. Use the configured source profile, validated
-   cluster, exact namespace and workload (e.g. the validated gateway workload),
-   and optional container. Use interval/window **900 seconds**, delay **60 seconds**,
-   overlap **60 seconds**, page size **100**, maximum pages **20**. Set **UTC** only
-   if this source's naive message timestamps were validated as UTC.
+2. Pause other smoke monitors and create **one NEW disabled monitor**. For the
+   reported source, set **Source profile / scope** and **Logical cluster alias**
+   to `gocpbmgpup1`, namespace `ai-voice`, and both workload and container to
+   `aihub-foya-stt-apis-http`. Leave **Document OpenShift cluster UUID** blank unless
+   the actual document UUID is independently configured. Use interval/window
+   **900 seconds**, delay **60 seconds**, overlap **60 seconds**, page size **100**,
+   maximum pages **20**. Leave source timezone blank (**Unknown**) unless this
+   workload's message timezone is independently verified. Configure
+   `OPENSEARCH_SOURCE_SCOPE=gocpbmgpup1`, `OPENSEARCH_INDEX=gocpbmgpup1*` and
+   `OPENSEARCH_INDEX_STRATEGY=daily_utc` in both processes.
 3. Choose an explicit initial start covering one known safe 15-minute test period.
    Its end plus overlap must be at least the delay behind current time. The form
    proposes a recent timestamp, but verify it against actual data availability.
@@ -402,7 +481,12 @@ Terminal 2, one bounded worker tick:
 6. Refresh. Inspect MonitorRun logical `[start,end)`, actual times, counts, attempt,
    status, and persisted investigation. Open **Window, source policy and boundary
    diagnostics**: confirm retrieval overlap, explicit timezone (including None if
-   intended), verified policy selection, and any boundary diagnostics. Confirm
+   intended), verified policy selection, and any boundary diagnostics. For the
+   known active interval, require **ACQUIRED records > 0**, pipeline execution and
+   MonitorRun SUCCESS. Check `source_scope=gocpbmgpup1`, the correct resolved daily
+   index, namespace/workload/container above, and `document_cluster_id=null`.
+   There must be no alias-based `openshift.cluster_id=gocpbmgpup1` filter. Technical
+   details must show the resolved index alongside the base pattern. Confirm
    `last_successful_end` equals exactly the successful logical end.
 7. Restart by invoking the one-tick command in a fresh worker process. If the next
    window is not safe/due, expect no new run. Once it is safe/due, another one-tick
@@ -426,6 +510,14 @@ do not scale SQLite/advisory-lock workers across pods and call it HA. PostgreSQL
 repository/leases are the intended migration path.
 
 ## Validation and next phase
+
+Source-identity correction validation: the alias filter, returned-UUID rejection
+and incorrect technical index display were first reproduced as three failing
+regressions. After the correction, **393 focused acquisition/monitoring/UI tests**,
+**273 timestamp/determinism/RCA tests**, and **951 full regression tests** passed
+(930 baseline + 21 added cases). Automated tests use no real OpenSearch/LLM calls.
+`git diff --check` passed. The real Citrix smoke remains an operator validation
+step using the new-monitor procedure above; no live result is claimed here.
 
 Offline tests use temporary SQLite, injected clocks, fake OpenSearch transport and
 pipeline dependencies. Tests block network/LLM and production learning state.

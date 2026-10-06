@@ -138,7 +138,9 @@ class OpenSearchMonitorExecutor:
                        resolved_index=resolved_index, namespace=definition.namespace,
                        workload=definition.workload, container=definition.container,
                        source_timezone=definition.source_timezone, source_profile=definition.source_profile,
-                       cluster_id=definition.cluster_id, pages_read=0, records_read=0, unique_records=0,
+                       source_scope=config.source_scope, cluster_alias=definition.cluster_alias,
+                       document_cluster_id=definition.document_cluster_id,
+                       pages_read=0, records_read=0, unique_records=0,
                        duplicate_records=0, budget_reached=False, stop_reason='interval_exhausted',
                        page_size=definition.page_size, max_pages=definition.max_pages,
                        record_budget=definition.page_size * definition.max_pages)
@@ -152,7 +154,7 @@ class OpenSearchMonitorExecutor:
                 for _ in range(definition.max_pages):
                     page = source.read_page(start=start, end=end, namespace=definition.namespace,
                                             workload=definition.workload, container=definition.container,
-                                            cluster_id=definition.cluster_id, page_size=definition.page_size, cursor=cursor)
+                                            cluster_id=definition.document_cluster_id, page_size=definition.page_size, cursor=cursor)
                     summary['pages_read'] += 1
                     summary['records_read'] += len(page.records)
                     if len(page.records) > definition.page_size:
@@ -163,7 +165,11 @@ class OpenSearchMonitorExecutor:
                         if timestamp is None or not start <= timestamp < end:
                             raise MonitoringError('OPENSEARCH_QUERY')
                         identity = record.stream_identity
-                        if (identity is None or identity.source_scope != definition.cluster_id
+                        # SourceReference identifies the acquisition profile;
+                        # StreamIdentity carries the document's cluster UUID.
+                        if (record.source_reference.source_scope != config.source_scope or identity is None
+                                or (definition.document_cluster_id is not None
+                                    and identity.source_scope != definition.document_cluster_id)
                                 or identity.namespace != definition.namespace or identity.workload != definition.workload
                                 or (definition.container and identity.container != definition.container)):
                             raise MonitoringError('OPENSEARCH_QUERY')

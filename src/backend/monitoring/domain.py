@@ -28,6 +28,11 @@ class RunStatus(str, Enum):
 
 @dataclass(frozen=True)
 class MonitorDefinition:
+    """Source profile and logical cluster alias are not document UUIDs.
+
+    ``cluster_id`` retains its legacy constructor/JSON name for stored monitors.
+    Only an explicit ``document_cluster_id`` may constrain openshift.cluster_id.
+    """
     name: str
     source_profile: str
     cluster_id: str
@@ -42,6 +47,11 @@ class MonitorDefinition:
     source_timezone: str | None = None
     page_size: int = 100
     max_pages: int = 20
+    document_cluster_id: str | None = None
+
+    @property
+    def cluster_alias(self) -> str:
+        return self.cluster_id
 
     def __post_init__(self):
         for name in ('name', 'source_profile', 'cluster_id', 'namespace', 'workload'):
@@ -50,6 +60,10 @@ class MonitorDefinition:
                 raise ValueError('Monitor names and scope must be nonempty single-line text (max 200 characters)')
         if self.container is not None and (type(self.container) is not str or not self.container.strip()):
             raise ValueError('Container must be nonempty or omitted')
+        if self.document_cluster_id is not None:
+            value = self.document_cluster_id
+            if type(value) is not str or not value.strip() or len(value) > 200 or any(ord(c) < 32 for c in value):
+                raise ValueError('Document cluster ID must be single-line text (max 200 characters) or omitted')
         for name, low, high in (
             ('interval_seconds', 1, 86400), ('window_seconds', 1, 86400),
             ('ingestion_delay_seconds', 0, 86400), ('overlap_seconds', 0, 3600),
