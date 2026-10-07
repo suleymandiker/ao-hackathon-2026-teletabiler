@@ -21,9 +21,10 @@ from monitoring.errors import MESSAGES
 class MonitorRepository(Protocol):
     def create(self, definition: MonitorDefinition, *, enabled: bool, now: datetime) -> DeploymentMonitor: ...
     def get(self, monitor_id: str) -> DeploymentMonitor: ...
-    def list(self) -> list[DeploymentMonitor]: ...
+    def list(self, *, include_archived: bool = False) -> list[DeploymentMonitor]: ...
     def update(self, monitor_id: str, definition: MonitorDefinition, *, revision: int, now: datetime) -> DeploymentMonitor: ...
     def set_enabled(self, monitor_id: str, enabled: bool, *, now: datetime) -> DeploymentMonitor: ...
+    def archive(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def claim(self, now: datetime) -> MonitorRun | None: ...
     def recover_running(self, now: datetime) -> None: ...
     def succeed(self, run: MonitorRun, result: dict, counts: RunCounts, receipts: dict[str, str], *, now: datetime) -> None: ...
@@ -59,7 +60,7 @@ class SQLiteMonitorRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1):
+            if version not in (0, 1, 2):
                 raise ValueError('Unsupported monitoring schema version')
             # Refuse accidental use of an existing policy/template database.
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -85,10 +86,15 @@ class SQLiteMonitorRepository:
                     source_time TEXT NOT NULL, PRIMARY KEY(monitor_id, reference_hash))''',
                 'CREATE INDEX IF NOT EXISTS monitor_due ON monitors(enabled, next_run_at)',
                 'CREATE INDEX IF NOT EXISTS receipt_time ON monitor_receipts(monitor_id, source_time)',
-                'PRAGMA user_version=1',
             )
             for statement in statements:
                 db.execute(statement)
+            # Additive v2 migration: existing definitions, runs, results and
+            # receipts are untouched. Learning stores are separate databases.
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(monitors)')}
+            if 'archived' not in columns:
+                db.execute('ALTER TABLE monitors ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
+            db.execute('PRAGMA user_version=2')
 
     @contextmanager
     def _transaction(self):
@@ -110,7 +116,7 @@ class SQLiteMonitorRepository:
         return DeploymentMonitor(
             row['id'], read_definition(row['definition']), bool(row['enabled']), MonitorStatus(row['status']),
             instant(row['last_successful_end']), instant(row['next_run_at']), instant(row['created_at']),
-            instant(row['updated_at']), row['revision'], row['error_category'], row['error_summary'])
+            instant(row['updated_at']), row['revision'], row['error_category'], row['error_summary'], bool(row['archived']))
 
     @staticmethod
     def _run(row):
@@ -124,7 +130,9 @@ class SQLiteMonitorRepository:
         now = utc(now).isoformat()
         monitor_id = new_id()
         with self._transaction() as db:
-            db.execute('INSERT INTO monitors VALUES (?,?,?,?,?,?,?,?,?,?,?)', (
+            db.execute('''INSERT INTO monitors
+                (id,definition,enabled,status,last_successful_end,next_run_at,created_at,updated_at,revision,error_category,error_summary)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (
                 monitor_id, definition_json(definition), int(enabled), 'ACTIVE' if enabled else 'PAUSED',
                 None, now, now, now, 0, None, None))
         return self.get(monitor_id)
@@ -136,13 +144,16 @@ class SQLiteMonitorRepository:
                 raise KeyError('Monitor not found')
             return self._monitor(row)
 
-    def list(self):
+    def list(self, *, include_archived=False):
         with self._transaction() as db:
-            return [self._monitor(row) for row in db.execute('SELECT * FROM monitors ORDER BY created_at,id')]
+            return [self._monitor(row) for row in db.execute(
+                'SELECT * FROM monitors WHERE (? OR archived=0) ORDER BY created_at,id', (include_archived,))]
 
     def update(self, monitor_id, definition, *, revision, now):
         with self._transaction() as db:
             old = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone())
+            if old.archived:
+                raise ValueError('Cannot edit an archived monitor')
             if old.revision != revision or old.status == MonitorStatus.RUNNING:
                 raise ValueError('Monitor changed or is running; refresh before editing')
             has_history = db.execute('SELECT 1 FROM monitor_runs WHERE monitor_id=? LIMIT 1', (monitor_id,)).fetchone()
@@ -155,6 +166,11 @@ class SQLiteMonitorRepository:
     def set_enabled(self, monitor_id, enabled, *, now):
         now = utc(now).isoformat()
         with self._transaction() as db:
+            old = db.execute('SELECT archived FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+            if old is None:
+                raise KeyError('Monitor not found')
+            if old['archived']:
+                raise ValueError('Cannot enable or pause an archived monitor')
             db.execute('''UPDATE monitors SET enabled=?, status=CASE
                 WHEN ?=0 THEN 'PAUSED'
                 WHEN EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=? AND status='RUNNING') THEN 'RUNNING'
@@ -162,10 +178,22 @@ class SQLiteMonitorRepository:
                 (int(enabled), int(enabled), monitor_id, now, now, monitor_id))
         return self.get(monitor_id)
 
+    def archive(self, monitor_id, *, now):
+        """Stop future claims, retaining audit evidence and any in-flight run.
+
+        Like pause, an owned run may finish persisting its result. It cannot
+        reactivate the monitor. Repeated archive requests are harmless.
+        """
+        with self._transaction() as db:
+            db.execute("""UPDATE monitors SET archived=1,enabled=0,status='ARCHIVED',
+                updated_at=?,revision=revision+1 WHERE id=? AND archived=0""",
+                (utc(now).isoformat(), monitor_id))
+        return self.get(monitor_id)
+
     def claim(self, now):
         now = utc(now)
         with self._transaction() as db:
-            rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND next_run_at<=?
+            rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0 AND next_run_at<=?
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
                 ORDER BY next_run_at,id''', (now.isoformat(),)).fetchall()
             for row in rows:
@@ -217,7 +245,8 @@ class SQLiteMonitorRepository:
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
             db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
                 error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1 WHERE id=?''',
-                (run.window.end.isoformat(), due.isoformat(), 'ACTIVE' if monitor.enabled else 'PAUSED', now.isoformat(), run.monitor_id))
+                (run.window.end.isoformat(), due.isoformat(),
+                 'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED', now.isoformat(), run.monitor_id))
             # Only overlap receipts can be needed again; history/results are durable.
             cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
             db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?', (run.monitor_id, cutoff.isoformat()))
@@ -232,7 +261,7 @@ class SQLiteMonitorRepository:
             db.execute("UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=? WHERE id=?",
                        (now.isoformat(), category, MESSAGES[category], run.id))
             db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
-                revision=revision+1 WHERE id=?''', ('ERROR' if monitor.enabled else 'PAUSED',
+                revision=revision+1 WHERE id=?''', ('ARCHIVED' if monitor.archived else 'ERROR' if monitor.enabled else 'PAUSED',
                 (now + timedelta(seconds=monitor.definition.interval_seconds)).isoformat(), category, MESSAGES[category], now.isoformat(), run.monitor_id))
 
     def recover_running(self, now):
@@ -242,7 +271,7 @@ class SQLiteMonitorRepository:
         for run in runs:
             self.fail(run, 'INTERRUPTED', now=now)
         with self._transaction() as db:
-            db.execute("UPDATE monitors SET next_run_at=? WHERE error_category='INTERRUPTED'", (utc(now).isoformat(),))
+            db.execute("UPDATE monitors SET next_run_at=? WHERE error_category='INTERRUPTED' AND archived=0", (utc(now).isoformat(),))
 
     def history(self, monitor_id, limit=100):
         if not 1 <= limit <= 1000:

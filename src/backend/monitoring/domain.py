@@ -18,6 +18,7 @@ class MonitorStatus(str, Enum):
     PAUSED = 'PAUSED'
     RUNNING = 'RUNNING'
     ERROR = 'ERROR'
+    ARCHIVED = 'ARCHIVED'
 
 
 class RunStatus(str, Enum):
@@ -91,6 +92,7 @@ class DeploymentMonitor:
     revision: int = 0
     last_error_category: str | None = None
     last_error_summary: str | None = None
+    archived: bool = False
 
 
 @dataclass(frozen=True)

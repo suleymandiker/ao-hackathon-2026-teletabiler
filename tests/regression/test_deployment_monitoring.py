@@ -80,7 +80,7 @@ def test_create_read_edit_and_schema_is_separate(repo):
                          revision=monitor.revision, now=BASE)
     assert repo.list() == [edited]
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
         assert {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {
             'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts'}
     with pytest.raises(ValueError, match='changed'):
@@ -134,6 +134,102 @@ def test_success_pause_resume_history_and_watermark(repo):
     assert scheduler.tick() == 1
     assert calls[-1].window.start == successful.last_successful_end
     assert repo.result(calls[0].id) is not None
+
+
+def test_archive_preserves_history_evidence_watermark_and_duplicate_name(repo):
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    from monitoring.domain import RunCounts
+    result = {'investigation': 'persisted', 'detailed_pipeline_trace': {'persisted': True}}
+    repo.succeed(run, result, RunCounts(logical_events=3), {'receipt': BASE.isoformat()}, now=BASE)
+    duplicate = repo.create(definition(), enabled=True, now=BASE)
+    before, history = repo.get(monitor.id), repo.history(monitor.id)
+    receipts = repo.consumed(monitor.id, BASE)
+    archived = repo.archive(monitor.id, now=BASE)
+    assert archived.archived and not archived.enabled and archived.status.value == 'ARCHIVED'
+    assert archived.definition == before.definition
+    assert archived.last_successful_end == before.last_successful_end
+    assert archived.next_run_at == before.next_run_at
+    assert repo.history(monitor.id) == history and repo.result(run.id) == result
+    assert repo.consumed(monitor.id, BASE) == receipts
+    assert repo.list() == [duplicate]
+    assert {m.id for m in repo.list(include_archived=True)} == {monitor.id, duplicate.id}
+    assert repo.get(duplicate.id) == duplicate
+    claimed = repo.claim(BASE + timedelta(hours=1))
+    assert claimed.monitor_id == duplicate.id
+    assert repo.claim(BASE + timedelta(hours=2)) is None
+    with pytest.raises(ValueError, match='archived'):
+        repo.set_enabled(monitor.id, True, now=BASE)
+    with pytest.raises(ValueError, match='archived'):
+        repo.update(monitor.id, definition(name='changed'), revision=archived.revision, now=BASE)
+
+
+@pytest.mark.parametrize('completion', ['success', 'failure', 'recovery'])
+def test_archive_during_execution_cannot_reactivate_or_retry(repo, completion):
+    from monitoring.domain import RunCounts
+    from monitoring.repository import SQLiteMonitorRepository
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    repo.archive(monitor.id, now=BASE)
+    if completion == 'success':
+        repo.succeed(run, {'recorded': True}, RunCounts(), {}, now=BASE)
+        assert repo.result(run.id) == {'recorded': True}
+        assert repo.get(monitor.id).last_successful_end == run.window.end
+    elif completion == 'failure':
+        repo.fail(run, 'OPENSEARCH_TIMEOUT', now=BASE)
+    else:
+        repo.recover_running(BASE)
+    reopened = SQLiteMonitorRepository(repo.path)
+    archived = reopened.get(monitor.id)
+    assert archived.archived and not archived.enabled and archived.status.value == 'ARCHIVED'
+    assert len(reopened.history(monitor.id)) == 1
+    assert reopened.claim(BASE + timedelta(days=1)) is None
+    assert worker(reopened, [BASE + timedelta(days=1)])[0].tick(max_runs=5) == 0
+
+
+def test_archive_is_idempotent_and_claim_guard_is_independent_of_enabled(repo):
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    archived = repo.archive(monitor.id, now=BASE)
+    assert repo.archive(monitor.id, now=BASE + timedelta(hours=1)) == archived
+    # Even an inconsistent enabled flag cannot bypass the archive lifecycle.
+    with sqlite3.connect(repo.path) as db:
+        db.execute('UPDATE monitors SET enabled=1 WHERE id=?', (monitor.id,))
+    assert repo.claim(BASE + timedelta(days=1)) is None
+
+
+def test_v1_migration_defaults_existing_monitors_and_preserves_all_audit_rows(repo, tmp_path):
+    from monitoring.repository import SQLiteMonitorRepository
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    scheduler, calls, _ = worker(repo, [BASE + timedelta(minutes=17)])
+    scheduler.tick()
+    # Build a populated v1 database, rather than migrating an empty fixture.
+    legacy_path = tmp_path / 'legacy-v1.sqlite3'
+    with sqlite3.connect(repo.path) as source, sqlite3.connect(legacy_path) as legacy:
+        for table in ('monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts'):
+            schema = source.execute("SELECT sql FROM sqlite_master WHERE name=?", (table,)).fetchone()[0]
+            if table == 'monitors':
+                schema = schema.replace(', archived INTEGER NOT NULL DEFAULT 0', '')
+            legacy.execute(schema)
+            columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})') if row[1] != 'archived']
+            records = source.execute(f'SELECT {",".join(columns)} FROM {table}').fetchall()
+            legacy.executemany(f'INSERT INTO {table} VALUES ({",".join("?" for _ in columns)})', records)
+        legacy.execute('PRAGMA user_version=1')
+    with sqlite3.connect(legacy_path) as db:
+        before = {table: db.execute(f'SELECT * FROM {table}').fetchall()
+                  for table in ('monitor_runs', 'monitor_results', 'monitor_receipts')}
+        assert 'archived' not in {row[1] for row in db.execute('PRAGMA table_info(monitors)')}
+    migrated = SQLiteMonitorRepository(legacy_path)
+    loaded = migrated.get(monitor.id)
+    assert not loaded.archived and loaded == repo.get(monitor.id)
+    assert migrated.result(calls[0].id) == repo.result(calls[0].id)
+    assert migrated.history(monitor.id) == repo.history(monitor.id)
+    with sqlite3.connect(legacy_path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        for table, records in before.items():
+            assert db.execute(f'SELECT * FROM {table}').fetchall() == records
+    migrated.archive(monitor.id, now=BASE)
+    assert migrated.result(calls[0].id) == repo.result(calls[0].id)
+    assert SQLiteMonitorRepository(legacy_path).get(monitor.id).archived
 
 
 def test_failed_window_retry_and_restart_do_not_duplicate(repo):
@@ -838,7 +934,7 @@ def test_legacy_monitor_json_keeps_alias_and_history_without_migration(repo, sou
     assert reopened.history(monitor.id)[0].definition == loaded.definition
     reopened.update(monitor.id, replace(loaded.definition, name='renamed'), revision=loaded.revision, now=BASE)
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
         assert db.execute('SELECT * FROM monitor_runs WHERE id=?', (run.id,)).fetchone() == history_before
         assert db.execute('SELECT * FROM monitor_results WHERE run_id=?', (run.id,)).fetchone() == result_before
     # A separate legacy definition that has never run uses the corrected scope.
