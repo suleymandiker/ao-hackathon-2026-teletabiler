@@ -4,7 +4,7 @@ The protocol is the migration boundary for a future PostgreSQL implementation.
 One success transaction owns the result, reference receipts and watermark.
 """
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
@@ -26,6 +26,7 @@ class MonitorRepository(Protocol):
     def set_enabled(self, monitor_id: str, enabled: bool, *, now: datetime) -> DeploymentMonitor: ...
     def archive(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def claim(self, now: datetime) -> MonitorRun | None: ...
+    def schedule_summary(self, now: datetime) -> 'ScheduleSummary': ...
     def recover_running(self, now: datetime) -> None: ...
     def succeed(self, run: MonitorRun, result: dict, counts: RunCounts, receipts: dict[str, str], *, now: datetime) -> None: ...
     def fail(self, run: MonitorRun, category: str, *, now: datetime, diagnostics: dict | None = None) -> None: ...
@@ -33,6 +34,13 @@ class MonitorRepository(Protocol):
     def result(self, run_id: str) -> dict | None: ...
     def acquisition_diagnostics(self, run_id: str) -> dict | None: ...
     def consumed(self, monitor_id: str, since: datetime) -> set[str]: ...
+
+
+@dataclass(frozen=True)
+class ScheduleSummary:
+    enabled_monitors: int
+    due_monitors: int
+    next_due_at: datetime | None
 
 
 def encode(value):
@@ -228,6 +236,34 @@ class SQLiteMonitorRepository:
                 db.execute("UPDATE monitors SET status='RUNNING',updated_at=?,revision=revision+1 WHERE id=?", (now.isoformat(), monitor.id))
                 return self._run(db.execute('SELECT * FROM monitor_runs WHERE id=?', (run_id,)).fetchone())
         return None
+
+    def schedule_summary(self, now):
+        """Read scheduling state without claiming runs or changing persisted state."""
+        now = utc(now)
+        db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            enabled = db.execute('SELECT COUNT(*) FROM monitors WHERE enabled=1 AND archived=0').fetchone()[0]
+            rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0
+                AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
+                ORDER BY next_run_at,id''')
+            due = 0
+            next_due_at = None
+            for row in rows:
+                monitor = self._monitor(row)
+                window = next_window(monitor)
+                existing = db.execute('SELECT status FROM monitor_runs WHERE monitor_id=? AND window_start=? AND window_end=?',
+                                      (monitor.id, window.start.isoformat(), window.end.isoformat())).fetchone()
+                if existing and existing['status'] == 'SUCCESS':
+                    continue
+                ready_at = max(monitor.next_run_at, safe_at(window, monitor.definition))
+                if ready_at <= now:
+                    due += 1
+                if next_due_at is None or ready_at < next_due_at:
+                    next_due_at = ready_at
+            return ScheduleSummary(enabled, due, next_due_at)
+        finally:
+            db.close()
 
     @staticmethod
     def _owned(db, run):

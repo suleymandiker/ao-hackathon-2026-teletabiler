@@ -1,8 +1,13 @@
 """Shared storage location and process ownership; no scheduler at import time."""
 from contextlib import contextmanager
+import errno
 import os
 from pathlib import Path
 from data_paths import monitoring_data_dir
+
+
+class WorkerLockBusy(OSError):
+    """Another local process owns the advisory scheduler lock."""
 
 
 def database_path():
@@ -25,12 +30,17 @@ def exclusive_worker(path):
             lock.write(b'0')
             lock.flush()
         lock.seek(0)
-        if os.name == 'nt':
-            import msvcrt
-            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in (errno.EACCES, errno.EAGAIN) or getattr(error, 'winerror', None) in (32, 33):
+                raise WorkerLockBusy('Another monitor worker already owns the scheduler lock.') from None
+            raise
         try:
             yield
         finally:
