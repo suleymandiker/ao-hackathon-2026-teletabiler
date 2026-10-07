@@ -116,6 +116,31 @@ def api():
     )
 
 
+def test_client_passes_query_params_separately(api, config):
+    session = FakeSession(FakeResponse(page()))
+    client = api.client.OpenSearchClient(config, session=session)
+    assert client.post_json('/synthetic/_field_caps', {}, params={'fields': 'field-a,field-b'}) == page()
+    url, request = session.calls[0]
+    assert url.endswith('/synthetic/_field_caps') and '?' not in url
+    assert request['params'] == {'fields': 'field-a,field-b'}
+    assert request['json'] == {}
+
+
+def test_client_rejects_question_mark_in_path(api, config):
+    session = FakeSession(FakeResponse(page()))
+    client = api.client.OpenSearchClient(config, session=session)
+    with pytest.raises(api.client.OpenSearchClientError, match='Invalid request path'):
+        client.post_json('/synthetic/_field_caps?fields=field-a', {})
+    assert session.calls == []
+
+
+def test_existing_post_json_callers_need_no_params_argument(api, config):
+    session = FakeSession(FakeResponse(page()))
+    client = api.client.OpenSearchClient(config, session=session)
+    assert client.post_json('/synthetic/_search', {}) == page()
+    assert session.calls[0][1]['params'] is None
+
+
 @pytest.fixture
 def config(api):
     return api.config.OpenSearchConfig(
@@ -213,7 +238,7 @@ def test_exact_query_and_transport_configuration(api, config):
             "track_total_hits": False, "timeout": "9000ms", "_source": SOURCE_PATHS,
             "sort": [{"@timestamp": "asc"}, {"openshift.sequence": "asc"}],
         },
-        "auth": ("synthetic-reader", PASSWORD), "verify": True,
+        "params": None, "auth": ("synthetic-reader", PASSWORD), "verify": True,
         "timeout": (2.5, 9), "allow_redirects": False,
     }
     assert session.trust_env is False

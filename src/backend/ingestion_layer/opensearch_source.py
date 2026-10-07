@@ -97,7 +97,8 @@ def resolve_exact_mapping(client, start, end, *, names=('namespace', 'workload',
     mapping = config.field_mapping
     index = resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy)
     fields = sorted({getattr(mapping, name + suffix) for name in names for suffix in ('', '_exact')})
-    response = client.post_json('/' + quote(index, safe='*,.-_') + '/_field_caps', {'fields': fields})
+    response = client.post_json('/' + quote(index, safe='*,.-_') + '/_field_caps', {},
+                                params={'fields': ','.join(fields)})
     capabilities = response.get('fields')
     if not isinstance(capabilities, dict) or response.get('failures'):
         raise OpenSearchSourceError('Exact field mapping unavailable')

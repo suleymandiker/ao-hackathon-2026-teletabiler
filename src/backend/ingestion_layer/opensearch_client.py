@@ -36,7 +36,7 @@ class OpenSearchClient:
     def __exit__(self, *exc_info):
         self.close()
 
-    def post_json(self, path: str, body: dict) -> dict:
+    def post_json(self, path: str, body: dict, *, params=None) -> dict:
         """POST an idempotent read; do not use this retry policy for writes.
 
         Redirects, TLS failures, invalid requests and malformed JSON fail without
@@ -56,6 +56,7 @@ class OpenSearchClient:
                 response = self._session.post(
                     self._hosts[attempt % len(self._hosts)] + path,
                     json=body,
+                    params=params,
                     auth=(self.config.username, self.config.password),
                     verify=self.config.ca_bundle or self.config.verify_certs,
                     timeout=(self.config.connect_timeout, self.config.request_timeout),

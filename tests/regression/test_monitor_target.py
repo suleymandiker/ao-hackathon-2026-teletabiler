@@ -22,14 +22,19 @@ class KeywordClient:
     def __init__(self):
         self.config = config()
         self.calls = []
+        self.params_calls = []
 
-    def post_json(self, path, query):
+    def post_json(self, path, query, *, params=None):
         self.calls.append((path, query))
+        self.params_calls.append(params)
         if path.endswith('_field_caps'):
+            assert query == {}
+            assert params is not None and 'fields' in params
+            fields = params['fields'].split(',')
             return {'fields': {name: {'keyword': {'type': 'keyword', 'searchable': True,
                                                   'aggregatable': True}} for name in (
                 'kubernetes.namespace_name', 'kubernetes.labels.app', 'kubernetes.container_name',
-                'openshift.cluster_id')}}
+                'openshift.cluster_id') if name in fields}}
         terms = {key: value for clause in query['query']['bool']['filter']
                  for key, value in clause.get('term', {}).items()}
         matches = terms == {'kubernetes.namespace_name': 'ai-document-assistant',
@@ -57,6 +62,8 @@ def test_known_aida_document_matches_exact_keyword_base_fields():
     client.config = resolve(client, kwargs['start'], kwargs['end'])
     page = OpenSearchSource(client).read_page(**kwargs)
     assert len(page.records) == 1
+    assert client.calls[-2] == ('/gocpbmgpup1-2026.10.07/_field_caps', {})
+    assert client.params_calls[-2] == {'fields': 'kubernetes.container_name,kubernetes.container_name.keyword,kubernetes.labels.app,kubernetes.labels.app.keyword,kubernetes.namespace_name,kubernetes.namespace_name.keyword'}
     assert client.calls[-1][0] == '/gocpbmgpup1-2026.10.07/_search'
     filters = client.calls[-1][1]['query']['bool']['filter']
     assert filters[1:] == [
@@ -73,7 +80,7 @@ def test_mapping_failure_is_explicit_instead_of_quiet(kind):
         'text' if kind == 'text' else 'keyword': {'searchable': kind != 'nonsearchable', 'aggregatable': True}}}
     if kind == 'conflict':
         capabilities['kubernetes.namespace_name']['text'] = {'searchable': True}
-    client.post_json = lambda *a: {'fields': capabilities}
+    client.post_json = lambda *a, **kw: {'fields': capabilities}
     with pytest.raises(OpenSearchSourceError):
         resolve_exact_mapping(client, datetime(2026, 10, 7, tzinfo=timezone.utc),
                               datetime(2026, 10, 8, tzinfo=timezone.utc), names=('namespace',))
@@ -82,8 +89,8 @@ def test_mapping_failure_is_explicit_instead_of_quiet(kind):
 def test_configured_keyword_subfields_are_preserved():
     from ingestion_layer.opensearch_source import resolve_exact_mapping
     client = KeywordClient()
-    client.post_json = lambda path, query: {'fields': {field: {'keyword': {'searchable': True, 'aggregatable': True}}
-                                                     for field in query['fields']}}
+    client.post_json = lambda path, query, *, params=None: {'fields': {field: {'keyword': {'searchable': True, 'aggregatable': True}}
+                                                                      for field in params['fields'].split(',')}}
     actual = resolve_exact_mapping(client, datetime(2026, 10, 7, tzinfo=timezone.utc), datetime(2026, 10, 8, tzinfo=timezone.utc))
     assert actual == config()
 
@@ -95,9 +102,9 @@ class DiscoveryClient(KeywordClient):
     def close(self):
         pass
 
-    def post_json(self, path, query):
+    def post_json(self, path, query, *, params=None):
         if path.endswith('_field_caps'):
-            return super().post_json(path, query)
+            return super().post_json(path, query, params=params)
         self.calls.append((path, query))
         if self.failed:
             return {'timed_out': False, '_shards': {'failed': 1}}
