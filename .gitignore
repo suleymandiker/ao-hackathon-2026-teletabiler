@@ -57,6 +57,7 @@ cover/
 
 # Django stuff:
 *.log
+!tests/fixtures/sre_segmentation_test_same_format_changed_content.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -217,5 +218,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Durable operational monitoring state (separate from learning state)
-src/data/monitoring/
+# Mutable runtime state under the repository data directory
+data/**/*.sqlite
+data/**/*.sqlite3
+data/**/*.db
+data/**/*-wal
+data/**/*-shm
+data/templates/template_drain_v4f.bin
+data/templates/template_state_v4f.json
+data/monitoring/learning/templates.json
+data/monitoring/learning/drain.bin

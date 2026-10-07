@@ -364,7 +364,7 @@ ile kaçışlanır
 
 ## 5. Kalıcılık
 
-Tek kalıcı durum `data/policy_registry.sqlite3`'tür (ortam değişkeni
+Politika durumu `data/policy/policy_registry.sqlite3`'tür (ortam değişkeni
 `AIOPS_POLICY_REGISTRY_PATH` ile taşınabilir). İçinde yalnız doğrulanmış
 segmentasyon ve parser politikaları bulunur.
 
@@ -375,7 +375,7 @@ segmentasyon ve parser politikaları bulunur.
 | Doğrulama metrikleri | Ham LLM yanıtları |
 | Şema sürümü | Müşteri / PII verisi |
 
-Şablon durumu ayrıca `data/template_state_v4f.json` + `template_drain_v4f.bin`
+Şablon durumu ayrıca `data/templates/template_state_v4f.json` + `data/templates/template_drain_v4f.bin`
 olarak yazılır (yalnız ham log yolunda).
 
 ---

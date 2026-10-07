@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from data_paths import policy_data_dir
 
 
 class ParserPolicyRegistry:
@@ -14,8 +15,7 @@ class ParserPolicyRegistry:
     """
 
     def __init__(self, db_path=None):
-        root = Path(__file__).resolve().parents[3]
-        default_db_path = root / "data" / "policy_registry.sqlite3"
+        default_db_path = policy_data_dir() / "policy_registry.sqlite3"
         self.db_path = Path(
             db_path
             or os.getenv("AIOPS_POLICY_REGISTRY_PATH")

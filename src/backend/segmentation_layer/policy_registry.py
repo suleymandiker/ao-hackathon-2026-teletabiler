@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
+from data_paths import policy_data_dir
 
 
 class SegmentationPolicyRegistry:
@@ -22,10 +23,9 @@ class SegmentationPolicyRegistry:
     _lock = threading.RLock()
 
     def __init__(self, db_path: Optional[str] = None, max_entries: int = 5000):
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.db_path = db_path or os.getenv(
             "AIOPS_POLICY_REGISTRY_PATH",
-            os.path.join(root, "data", "policy_registry.sqlite3"),
+            str(policy_data_dir() / "policy_registry.sqlite3"),
         )
         self.max_entries = max(100, int(max_entries))
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)

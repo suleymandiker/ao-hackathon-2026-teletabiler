@@ -9,6 +9,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'backend'))
 
 from application_environment import load_environment
+from data_paths import monitoring_data_dir
 from monitoring.execution import OpenSearchMonitorExecutor
 from monitoring.repository import SQLiteMonitorRepository
 from monitoring.runtime import database_path, exclusive_worker
@@ -20,7 +21,7 @@ def pipeline():
     from full_pipeline_v2 import FullAIOpsPipelineV2
     # A worker owns its persistent learning files. A separately cached manual
     # pipeline must not overwrite these files with stale in-memory state.
-    learning = Path(os.environ.get('AIOPS_MONITOR_LEARNING_DIR') or database_path().parent / 'learning')
+    learning = Path(os.environ.get('AIOPS_MONITOR_LEARNING_DIR') or monitoring_data_dir() / 'learning')
     learning.mkdir(parents=True, exist_ok=True)
     return FullAIOpsPipelineV2(template_state=str(learning / 'templates.json'),
                               drain_state=str(learning / 'drain.bin'), use_ai_rca=True)

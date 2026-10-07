@@ -32,7 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "backend"))
 
-RAW_LOG = ROOT / "data" / "sre_segmentation_test_same_format_changed_content.log"
+RAW_LOG = ROOT / "tests" / "fixtures" / "sre_segmentation_test_same_format_changed_content.log"
 
 # Sentetik senaryo: billing-db diski dolar -> billing-api yazamaz ->
 # payment-api zaman aşımına uğrar -> order-gw 502 döner.

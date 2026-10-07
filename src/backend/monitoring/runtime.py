@@ -2,11 +2,12 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
+from data_paths import monitoring_data_dir
 
 
 def database_path():
     return Path(os.environ.get('AIOPS_MONITOR_DB') or
-                Path(__file__).resolve().parents[2] / 'data' / 'monitoring' / 'monitors.sqlite3').resolve()
+                monitoring_data_dir() / 'monitors.sqlite3').resolve()
 
 
 @contextmanager

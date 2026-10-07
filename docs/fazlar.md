@@ -38,7 +38,7 @@ tasarımları listeliyor:
 - drift/revalidation durum makinesi
 
 Bu silmeler bilinçli bir sadeleştirme kararıdır: iki doğruluk kaynağı = bug
-kaynağı. Tek kalıcı durum `data/policy_registry.sqlite3` oldu.
+kaynağı. Politika durumu `data/policy/policy_registry.sqlite3` altında tutulur.
 
 **Ölçüm:** 246 fiziksel satır → **44 mantıksal olay**, coverage %100,
 parser başarısı %100.
@@ -264,7 +264,7 @@ Mimarinin varlık nedeni tam olarak budur: LLM değişken, ürün değil.
 - Commit geçmişi seyrek; geliştirme süreci commit'lerle değil kod izleriyle
   belgeleniyor.
 - Resmî hackathon veri paketiyle ölçüm yapılmadı; ölçümler
-  `data/sre_segmentation_test_same_format_changed_content.log` ve
+  `tests/fixtures/sre_segmentation_test_same_format_changed_content.log` ve
   `tools/benchmark.py`'nin ürettiği sentetik pakete dayanıyor.
 - Otomatik test paketi (pytest) yok; doğrulama `tools/benchmark.py` içindeki
   7 kontrolle yapılıyor.

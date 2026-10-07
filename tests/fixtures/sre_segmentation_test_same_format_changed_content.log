@@ -1,0 +1,246 @@
+2026-12-25 22:47:00.120 INFO [edge-gateway] request_id=7ac9 route=/orders method=GET status=200 latency_ms=87
+2026-12-25 22:47:00.211 INFO [fulfillment-service] request_id=7ac9 order_id=ORD-8801 status=created user_id=U-441
+2026-12-25 22:47:01.004 ERROR [billing-service] request_id=d42e order_id=ORD-8802 charge_failed provider=adyen error=timeout
+Traceback (most recent call last):
+  File "/app/payment/client.py", line 284, in charge
+    response = self._post_with_retry(payload)
+  File "/app/payment/client.py", line 221, in _post_with_retry
+    raise TimeoutError("provider request timed out")
+TimeoutError: provider request timed out
+2026-12-25 22:47:01.287 WARN [billing-service] request_id=d42e order_id=ORD-8802 retry=1 backoff_ms=425
+2026-12-25 22:47:01.911 ERROR [billing-service] request_id=d42e order_id=ORD-8802 charge_failed provider=adyen error=timeout
+Traceback (most recent call last):
+  File "/app/payment/client.py", line 284, in charge
+    response = self._post_with_retry(payload)
+  File "/app/payment/client.py", line 224, in _post_with_retry
+    raise TimeoutError("provider request timed out")
+TimeoutError: provider request timed out
+2026-12-25 22:47:02.104 INFO [fulfillment-service] request_id=d42e order_id=ORD-8802 payment_status=pending
+2026-12-25T22:47:02.300Z ERROR stock-service request_id=f731 event=reserve_stock status=failed
+{
+  "service": "stock-service",
+  "request_id": "f731",
+  "event": "reserve_stock",
+  "sku": "SKU-91",
+  "error": {"type": "ConnectionError", "message": "No route to host"},
+  "retryable": true
+}
+2026-12-25T22:47:02.501Z INFO stock-service request_id=f731 retry=1 delay_ms=750
+2026-12-25 22:47:03.012 ERROR [cart-service] checkout_id=CHK-7711 dependency=stock-service phase=reserve
+java.net.NoRouteToHostException: Host unreachable: stock-service:8080
+    at okhttp3.internal.connection.RealConnection.connectSocket(RealConnection.kt:397)
+    at okhttp3.internal.connection.ExchangeFinder.findConnection(ExchangeFinder.kt:185)
+    at okhttp3.internal.http.RetryAndFollowUpInterceptor.intercept(RetryAndFollowUpInterceptor.kt:211)
+Caused by: java.net.ConnectException: Connection refused
+    at sun.nio.ch.Net.pollConnect(Native Method)
+    at sun.nio.ch.Net.pollConnectNow(Net.java:731)
+2026-12-25 22:47:03.422 WARN [cart-service] checkout_id=CHK-7711 action=retry attempt=2
+2026-12-25 22:47:04.008 ERROR [fulfillment-service] order_id=ORD-8803 state=payment_timeout severity=critical
+  dependency chain:
+    fulfillment-service -> billing-service -> adyen
+  symptom: customer checkout exceeded 10s SLA
+  recommendation: circuit-break payment provider
+2026-12-25 22:47:04.321 INFO [edge-gateway] request_id=88cd route=/health method=GET status=200 latency_ms=6
+2026-12-25T22:47:05.005Z ERROR worker-9 task=receipt-generation exception=RuntimeError
+RuntimeError: downstream ledger-db is unavailable
+  caused_by: psycopg2.OperationalError
+  detail: could not connect to server: Connection refused
+  Is the server running on host "ledger-db" and accepting
+  TCP/IP connections on port 5432?
+2026-12-25T22:47:05.201Z INFO worker-9 task=receipt-generation retry=1 delay_ms=1500
+2026-12-25 22:47:06,004 INFO nginx access remote_addr=172.20.8.31 request="GET /api/orders/ORD-8801 HTTP/1.1" status=200 body_bytes=936 request_time=0.083
+2026-12-25 22:47:06,114 INFO nginx access remote_addr=172.20.8.32 request="POST /api/orders HTTP/1.1" status=504 body_bytes=244 request_time=12.417 upstream="http://fulfillment-service:8080"
+2026-12-25 22:47:06,115 ERROR nginx upstream prematurely closed connection while reading response header from upstream
+    client: 172.20.8.32
+    server: cart.example.internal
+    request: "POST /api/orders HTTP/1.1"
+    upstream: "http://fulfillment-service:8080"
+    host: "cart.example.internal"
+2026-12-25 22:47:07.002 INFO [kubelet] pod=billing-service-7b7d7c6d9f-x82k4 container=payment readiness probe failed
+    HTTP probe failed with statuscode: 503
+    endpoint: /readyz
+    consecutive_failures: 3
+2026-12-25 22:47:07.119 WARN [kubelet] pod=billing-service-7b7d7c6d9f-x82k4 container=payment restarting
+    restart_count=7
+    reason=CrashLoopBackOff
+2026-12-25 22:47:08.003 INFO [controller] deployment=billing-service rollout=progressing replicas_available=3 replicas_desired=6
+2026-12-25 22:47:08.751 ERROR [billing-service] request_id=f901 order_id=ORD-8804 msg="circuit breaker open"
+2026-12-25 22:47:08.752 ERROR [billing-service] request_id=f902 order_id=ORD-8805 msg="circuit breaker open"
+2026-12-25 22:47:09.001 INFO [billing-service] request_id=f903 order_id=ORD-8806 msg="request rejected by circuit breaker"
+2026-12-25 22:47:10.450 ERROR [scheduler] job=daily-settlement state=failed
+Caused by: java.sql.SQLException: timeout waiting for connection from pool
+    pool_size=32
+    active=32
+    idle=0
+    wait_ms=41700
+2026-12-25 22:47:11.101 INFO [scheduler] job=daily-settlement retry=1
+2026-12-25 22:47:11.450 ERROR [redis-client] command=GET key=cache:ORD-8804 error=READONLY You can't write against a read only replica.
+    redis_endpoint=redis-replica-7:6379
+    shard=5
+2026-12-25 22:47:12.019 INFO [redis-client] command=GET key=cache:ORD-8804 retry=1
+2026-12-25 22:47:12.731 DEBUG [metrics] metric=payment.latency_ms value=18473 tags={"provider":"adyen","region":"tr1"}
+2026-12-25 22:47:13.004 ERROR [alertmanager] alert=BillingProviderTimeout state=firing severity=critical
+    labels:
+      service: billing-service
+      provider: adyen
+    annotations:
+      summary: payment provider timeout rate above threshold
+      runbook: https://runbooks.example.internal/payment-timeout
+2026-12-25 22:47:13.204 ERROR [alertmanager] alert=StockNoRoute state=firing severity=critical
+    labels:
+      service: stock-service
+      dependency: stock-service
+    annotations:
+      summary: inventory connection failures detected
+2026-12-25 22:47:14.000 INFO [edge-gateway] request_id=xy72 route=/orders method=GET status=200 latency_ms=68
+2026-12-25 22:47:14.600 ERROR [fulfillment-service] request_id=xy72 order_id=ORD-8807 status=failed
+Caused by: PaymentTimeout: payment provider did not respond before deadline
+  upstream_request_id: a81c
+  elapsed_ms: 10488
+  customer_visible: true
+2026-12-25 22:47:15.100 INFO [fulfillment-service] request_id=xy72 remediation=queued action="retry-payment"
+2026-12-25 22:47:16.001 INFO [billing-service] request_id=d42e recovery=successful provider=adyen
+2026-12-25 22:47:16.220 INFO [stock-service] request_id=f731 recovery=successful
+2026-12-25 22:47:17.000 INFO [cart-service] checkout_id=CHK-7711 status=recovered
+nova-compute.log.1.2018-11-23_12:02:35 2018-11-22 09:38:23.788 2931 INFO nova.compute.manager [req-3ea4052c-895d-4b64-9e2d-04d64c4d94ab - - - - -] [instance: 719832a5-1b99-41ab-81a2-4c9bc9c84e39] VM Resumed (Lifecycle Event)
+nova-compute.log.1.2018-11-23_12:02:35 2018-11-22 09:38:23.788 2931 INFO nova.compute.manager [req-3ea4052c-895d-4b64-9e2d-04d64c4d94ab - - - - -] [instance: 719832a5-1b99-41ab-81a2-4c9bc9c84e39] VM Resumed (Lifecycle Event)
+2019-07-04 03:51:28,170 WARN [main] org.apache.hadoop.mapred.YarnChild: Exception running child : java.net.NoRouteToHostException: No Route to Host from  EDGEHOST-Q7/127.0.0.1 to data-nn-72:9000 failed on socket timeout exception: java.net.NoRouteToHostException: No route to host: no further information; For more details see:  http://wiki.apache.org/hadoop/NoRouteToHost
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+	at org.apache.hadoop.net.NetUtils.wrapWithMessage(NetUtils.java:791)
+	at org.apache.hadoop.net.NetUtils.wrapException(NetUtils.java:757)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1472)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1399)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:232)
+	at com.sun.proxy.$Proxy15.getBlockLocations(Unknown Source)
+	at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.getBlockLocations(ClientNamenodeProtocolTranslatorPB.java:254)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:187)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:102)
+	at com.sun.proxy.$Proxy16.getBlockLocations(Unknown Source)
+	at org.apache.hadoop.hdfs.DFSClient.callGetBlockLocations(DFSClient.java:1220)
+	at org.apache.hadoop.hdfs.DFSClient.getLocatedBlocks(DFSClient.java:1210)
+	at org.apache.hadoop.hdfs.DFSClient.getLocatedBlocks(DFSClient.java:1200)
+	at org.apache.hadoop.hdfs.DFSInputStream.fetchLocatedBlocksAndGetLastBlockLength(DFSInputStream.java:271)
+	at org.apache.hadoop.hdfs.DFSInputStream.openInfo(DFSInputStream.java:238)
+	at org.apache.hadoop.hdfs.DFSInputStream.chooseDataNode(DFSInputStream.java:917)
+	at org.apache.hadoop.hdfs.DFSInputStream.blockSeekTo(DFSInputStream.java:568)
+	at org.apache.hadoop.hdfs.DFSInputStream.readWithStrategy(DFSInputStream.java:800)
+	at org.apache.hadoop.hdfs.DFSInputStream.read(DFSInputStream.java:847)
+	at java.io.DataInputStream.read(DataInputStream.java:100)
+	at org.apache.hadoop.util.LineReader.fillBuffer(LineReader.java:180)
+	at org.apache.hadoop.util.LineReader.readDefaultLine(LineReader.java:216)
+	at org.apache.hadoop.util.LineReader.readLine(LineReader.java:174)
+	at org.apache.hadoop.mapreduce.lib.input.LineRecordReader.nextKeyValue(LineRecordReader.java:185)
+	at org.apache.hadoop.mapred.MapTask$NewTrackingRecordReader.nextKeyValue(MapTask.java:553)
+	at org.apache.hadoop.mapreduce.task.MapContextImpl.nextKeyValue(MapContextImpl.java:80)
+	at org.apache.hadoop.mapreduce.lib.map.WrappedMapper$Context.nextKeyValue(WrappedMapper.java:91)
+	at org.apache.hadoop.mapreduce.Mapper.run(Mapper.java:144)
+	at org.apache.hadoop.mapred.MapTask.runNewMapper(MapTask.java:784)
+	at org.apache.hadoop.mapred.MapTask.run(MapTask.java:341)
+	at org.apache.hadoop.mapred.YarnChild$2.run(YarnChild.java:163)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:415)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1628)
+	at org.apache.hadoop.mapred.YarnChild.main(YarnChild.java:158)
+Caused by: java.net.NoRouteToHostException: No route to host: no further information
+	at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+	at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:735)
+	at org.apache.hadoop.net.SocketIOWithTimeout.connect(SocketIOWithTimeout.java:206)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:530)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:494)
+	at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:607)
+	at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:705)
+	at org.apache.hadoop.ipc.Client$Connection.access$2800(Client.java:368)
+	at org.apache.hadoop.ipc.Client.getConnection(Client.java:1521)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1438)
+	... 36 more
+
+2019-07-04 03:51:28,170 INFO [main] org.apache.hadoop.mapred.Task: Runnning cleanup for the task
+2019-07-04 03:51:28,217 WARN [main] org.apache.hadoop.ipc.Client: Address change detected. Old: data-nn-72/10.190.173.170:9000 New: data-nn-72:9000
+2019-07-04 03:51:28,217 INFO [main] org.apache.hadoop.mapred.YarnChild: Exception cleaning up: java.net.NoRouteToHostException: No Route to Host from  EDGEHOST-Q7/127.0.0.1 to data-nn-72:9000 failed on socket timeout exception: java.net.NoRouteToHostException: No route to host: no further information; For more details see:  http://wiki.apache.org/hadoop/NoRouteToHost
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance0(Native Method)
+	at sun.reflect.NativeConstructorAccessorImpl.newInstance(NativeConstructorAccessorImpl.java:57)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+	at org.apache.hadoop.net.NetUtils.wrapWithMessage(NetUtils.java:791)
+	at org.apache.hadoop.net.NetUtils.wrapException(NetUtils.java:757)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1472)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1399)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:232)
+	at com.sun.proxy.$Proxy15.delete(Unknown Source)
+	at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.delete(ClientNamenodeProtocolTranslatorPB.java:521)
+	at sun.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at sun.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:57)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:187)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:102)
+	at com.sun.proxy.$Proxy16.delete(Unknown Source)
+	at org.apache.hadoop.hdfs.DFSClient.delete(DFSClient.java:1929)
+	at org.apache.hadoop.hdfs.DistributedFileSystem$12.doCall(DistributedFileSystem.java:638)
+	at org.apache.hadoop.hdfs.DistributedFileSystem$12.doCall(DistributedFileSystem.java:634)
+	at org.apache.hadoop.fs.FileSystemLinkResolver.resolve(FileSystemLinkResolver.java:81)
+	at org.apache.hadoop.hdfs.DistributedFileSystem.delete(DistributedFileSystem.java:634)
+	at org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter.abortTask(FileOutputCommitter.java:466)
+	at org.apache.hadoop.mapreduce.lib.output.FileOutputCommitter.abortTask(FileOutputCommitter.java:455)
+	at org.apache.hadoop.mapred.Task.taskCleanup(Task.java:1199)
+	at org.apache.hadoop.mapred.YarnChild$3.run(YarnChild.java:185)
+	at java.security.AccessController.doPrivileged(Native Method)
+	at javax.security.auth.Subject.doAs(Subject.java:415)
+	at org.apache.hadoop.security.UserGroupInformation.doAs(UserGroupInformation.java:1628)
+	at org.apache.hadoop.mapred.YarnChild.main(YarnChild.java:182)
+Caused by: java.net.NoRouteToHostException: No route to host: no further information
+	at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+	at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:735)
+	at org.apache.hadoop.net.SocketIOWithTimeout.connect(SocketIOWithTimeout.java:206)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:530)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:494)
+	at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:607)
+	at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:705)
+	at org.apache.hadoop.ipc.Client$Connection.access$2800(Client.java:368)
+	at org.apache.hadoop.ipc.Client.getConnection(Client.java:1521)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1438)
+	... 24 more
+2019-07-04 04:12:42,514 WARN [LeaseRenewer:batchusr@data-nn-72:9000] org.apache.hadoop.ipc.Client: Address change detected. Old: data-nn-72/10.190.173.170:9000 New: data-nn-72:9000
+2019-07-04 04:19:39,751 WARN [LeaseRenewer:batchusr@data-nn-72:9000] org.apache.hadoop.hdfs.LeaseRenewer: Failed to renew lease for [DFSClient_NONMAPREDUCE_1537864556_1] for 1422 seconds.  Will retry shortly ...
+java.net.NoRouteToHostException: No Route to Host from  EDGEHOST-Q7/127.0.0.1 to data-nn-72:9000 failed on socket timeout exception: java.net.NoRouteToHostException: No route to host: no further information; For more details see:  http://wiki.apache.org/hadoop/NoRouteToHost
+	at sun.reflect.GeneratedConstructorAccessor29.newInstance(Unknown Source)
+	at sun.reflect.DelegatingConstructorAccessorImpl.newInstance(DelegatingConstructorAccessorImpl.java:45)
+	at java.lang.reflect.Constructor.newInstance(Constructor.java:526)
+	at org.apache.hadoop.net.NetUtils.wrapWithMessage(NetUtils.java:791)
+	at org.apache.hadoop.net.NetUtils.wrapException(NetUtils.java:757)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1472)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1399)
+	at org.apache.hadoop.ipc.ProtobufRpcEngine$Invoker.invoke(ProtobufRpcEngine.java:232)
+	at com.sun.proxy.$Proxy14.renewLease(Unknown Source)
+	at org.apache.hadoop.hdfs.protocolPB.ClientNamenodeProtocolTranslatorPB.renewLease(ClientNamenodeProtocolTranslatorPB.java:571)
+	at sun.reflect.GeneratedMethodAccessor6.invoke(Unknown Source)
+	at sun.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.lang.reflect.Method.invoke(Method.java:606)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invokeMethod(RetryInvocationHandler.java:187)
+	at org.apache.hadoop.io.retry.RetryInvocationHandler.invoke(RetryInvocationHandler.java:102)
+	at com.sun.proxy.$Proxy15.renewLease(Unknown Source)
+	at org.apache.hadoop.hdfs.DFSClient.renewLease(DFSClient.java:879)
+	at org.apache.hadoop.hdfs.LeaseRenewer.renew(LeaseRenewer.java:417)
+	at org.apache.hadoop.hdfs.LeaseRenewer.run(LeaseRenewer.java:442)
+	at org.apache.hadoop.hdfs.LeaseRenewer.access$700(LeaseRenewer.java:71)
+	at org.apache.hadoop.hdfs.LeaseRenewer$1.run(LeaseRenewer.java:298)
+	at java.lang.Thread.run(Thread.java:724)
+Caused by: java.net.NoRouteToHostException: No route to host: no further information
+	at sun.nio.ch.SocketChannelImpl.checkConnect(Native Method)
+	at sun.nio.ch.SocketChannelImpl.finishConnect(SocketChannelImpl.java:735)
+	at org.apache.hadoop.net.SocketIOWithTimeout.connect(SocketIOWithTimeout.java:206)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:530)
+	at org.apache.hadoop.net.NetUtils.connect(NetUtils.java:494)
+	at org.apache.hadoop.ipc.Client$Connection.setupConnection(Client.java:607)
+	at org.apache.hadoop.ipc.Client$Connection.setupIOstreams(Client.java:705)
+	at org.apache.hadoop.ipc.Client$Connection.access$2800(Client.java:368)
+	at org.apache.hadoop.ipc.Client.getConnection(Client.java:1521)
+	at org.apache.hadoop.ipc.Client.call(Client.java:1438)
+	... 16 more

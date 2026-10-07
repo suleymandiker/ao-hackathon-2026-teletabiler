@@ -79,8 +79,9 @@ def list_verified_policies(db_path=None):
     Existing hexadecimal signatures are safe display identifiers. Nonstandard
     signatures get opaque display IDs; the snapshot retains the original value.
     """
+    from data_paths import policy_data_dir
     path = Path(db_path or os.environ.get('AIOPS_POLICY_REGISTRY_PATH') or
-                Path(__file__).resolve().parents[1] / 'data' / 'policy_registry.sqlite3')
+                policy_data_dir() / 'policy_registry.sqlite3')
     try:
         if not path.exists():
             return ()

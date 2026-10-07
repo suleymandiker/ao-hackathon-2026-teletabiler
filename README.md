@@ -236,7 +236,7 @@ Zaman aşımı: bağlantı 15 s / okuma 180 s. Gateway `response_format` kabul
 etmezse istek bir kez sade olarak tekrarlanır.
 
 **Başka hiçbir dış API kullanılmamaktadır.** Veritabanı olarak yalnız yerel
-SQLite (`data/policy_registry.sqlite3`) kullanılır.
+SQLite (`data/policy/policy_registry.sqlite3`) kullanılır.
 
 ---
 
@@ -275,7 +275,7 @@ Gerekçe: Turkcell inference gateway kurumsal ağ içindedir; public bir deploy
 
 **Doğrulama ve veri**
 - Resmî hackathon veri paketiyle ölçüm yapılmadı. Sayılar
-  `data/sre_segmentation_test_same_format_changed_content.log` dosyasına ve
+  `tests/fixtures/sre_segmentation_test_same_format_changed_content.log` dosyasına ve
   `tools/benchmark.py`'nin ürettiği **sentetik** alarm paketine dayanır.
 - Otomatik test paketi (pytest) yok. Doğrulama `tools/benchmark.py` içindeki
   7 kontrolle yapılır.
@@ -311,13 +311,15 @@ Gerekçe: Turkcell inference gateway kurumsal ağ içindedir; public bir deploy
 ├── docs/
 │   ├── plan.md                problem, hedef, kapsam, risk kaydı
 │   ├── mimari.md              katman katman tasarım kararları
-│   └── fazlar.md              geliştirme fazları + ölçüm tablosu
+│   ├── fazlar.md              geliştirme fazları + ölçüm tablosu
+│   └── README_SMOKE_TEST.md   SRE smoke test açıklaması
 ├── prompts/
 │   ├── README.md              prompt envanteri ve savunma katmanları
 │   └── gelistirme/            AI asistanı yönlendirme kalıpları
 ├── demo/                      ekran görüntüleri
 ├── tools/benchmark.py         tekrarlanabilir ölçüm koşusu
-├── data/                      smoke test log dosyası + politika registry'si
+├── tests/fixtures/            sentetik SRE log örneği
+├── data/                      politika, şablon ve monitoring çalışma durumu
 └── src/
     ├── backend/               9 katmanlı pipeline + ai_engine + prompts
     └── frontend/              Streamlit arayüzü + tasarım sistemi

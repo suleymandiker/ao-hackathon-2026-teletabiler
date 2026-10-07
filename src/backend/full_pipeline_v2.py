@@ -11,12 +11,19 @@ from downstream_pipeline import DownstreamAIOpsPipeline
 from input_package_layer.package_loader import InputPackageLoader
 from time_quality import TimeQuality
 from pipeline_observation import PipelineObserver
+from data_paths import template_data_dir
 from parser_layer.timestamp.source_policy import TimestampContext, TimestampSourcePolicy, resolve_event_time
 import os
 
+_DEFAULT_STATE = object()
+
 class FullAIOpsPipelineV2:
     """Final simple path: segmentation -> parser -> template -> signal -> qualify -> correlate -> incident -> RCA."""
-    def __init__(self, template_state='data/template_state_v4f.json', drain_state='data/template_drain_v4f.bin', window_seconds=60, use_ai_rca=True):
+    def __init__(self, template_state=_DEFAULT_STATE, drain_state=_DEFAULT_STATE, window_seconds=60, use_ai_rca=True):
+        if template_state is _DEFAULT_STATE:
+            template_state = template_data_dir() / 'template_state_v4f.json'
+        if drain_state is _DEFAULT_STATE:
+            drain_state = template_data_dir() / 'template_drain_v4f.bin'
         self.segmenter=SegmentationPipeline(); self.parser=ParserPipeline()
         self.templater=TemplatePipeline(state_path=template_state,candidate_state_path=drain_state)
         self.downstream=DownstreamAIOpsPipeline(window_seconds, use_ai_rca=use_ai_rca)

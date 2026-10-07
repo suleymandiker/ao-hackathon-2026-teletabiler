@@ -146,7 +146,7 @@ explicit; it never invokes the selector or gateway from the UI. Existing
    Confirm the new watermark equals the successful logical end without replay.
 
 The local implementation environment has no configured monitoring database at
-`src/data/monitoring/monitors.sqlite3`, no available browser session, and its native
+`data/monitoring/monitors.sqlite3`, no available browser session, and its native
 computer-use pipe is unavailable. The live procedure therefore remains pending
 access to the existing Citrix deployment; no successful live smoke is claimed and
 no empty replacement monitoring database is created.
@@ -406,12 +406,12 @@ SQLite implements the `MonitorRepository` protocol (including the run/result
 repository methods). Worker and UI do not issue SQL. Default storage:
 
 ```text
-src/data/monitoring/monitors.sqlite3
+data/monitoring/monitors.sqlite3
 ```
 
-Override with the same absolute `AIOPS_MONITOR_DB` in UI and worker. The directory
-is git-ignored. Tables are `monitors`, `monitor_runs`, `monitor_results`, and
-`monitor_receipts`. Definition/count/result payloads are versioned by schema
+Override with the same absolute `AIOPS_MONITOR_DB` in UI and worker. Mutable SQLite
+files under `data/` are git-ignored. Tables are `monitors`, `monitor_runs`,
+`monitor_results`, and `monitor_receipts`. Definition/count/result payloads are versioned by schema
 version 1; scheduling/claim/watermark fields are indexed relational columns.
 Initialization is transactional and additive. Unknown versions and databases
 containing unrelated tables are rejected. Existing policy/template databases
@@ -674,7 +674,7 @@ RCA rank, expert schema or Evidence Pack is changed.
 
 The UI keeps its existing cached manual pipeline and learning lifecycle. The worker
 has its own persistent template registry and Drain files under
-`<monitor-db-directory>/learning/` (override `AIOPS_MONITOR_LEARNING_DIR`). It keeps
+`<AIOPS_DATA_DIR>/monitoring/learning/` (override `AIOPS_MONITOR_LEARNING_DIR`). It keeps
 one pipeline instance across runs. This new execution plane starts a distinct
 learning history; it does not erase or silently overwrite the manual pipeline's
 learned state. Learned IDs/matches depend on the relevant persisted history, as
@@ -720,7 +720,7 @@ In **both terminals**, choose the same durable monitoring database:
 
 ```powershell
 Set-Location D:\Dev\hackathon\ao-hackathon-2026-teletabiler
-$env:AIOPS_MONITOR_DB = Join-Path $PWD 'src\data\monitoring\monitors.sqlite3'
+$env:AIOPS_MONITOR_DB = Join-Path $PWD 'data\monitoring\monitors.sqlite3'
 ```
 
 Terminal 1, UI:

@@ -765,10 +765,11 @@ def test_worker_daily_indices_use_both_overlaps_and_preserve_profile(repo, pipel
             return self
         def __exit__(self, *args):
             pass
-        def post_json(self, path, query):
+        def post_json(self, path, query, *, params=None):
             if path.endswith('/_field_caps'):
+                fields = params['fields'].split(',')
                 return {'fields': {name: {'keyword': {'searchable': True, 'aggregatable': True}}
-                                   for name in query['fields'] if name.endswith('.keyword')}}
+                                   for name in fields if name.endswith('.keyword')}}
             calls.append((path, query))
             return {'timed_out': False, '_shards': {'failed': int(shard_failure)}, 'hits': {'hits': []}}
     executor = OpenSearchMonitorExecutor(lambda: pipeline, connection_loader=lambda size: config, client_factory=Client,
@@ -836,10 +837,11 @@ def source_scope_executor(pipeline):
             return self
         def __exit__(self, *args):
             pass
-        def post_json(self, path, query):
+        def post_json(self, path, query, *, params=None):
             if path.endswith('/_field_caps'):
+                fields = params['fields'].split(',')
                 return {'fields': {name: {'keyword': {'searchable': True, 'aggregatable': True}}
-                                   for name in query['fields'] if name.endswith('.keyword')}}
+                                   for name in fields if name.endswith('.keyword')}}
             calls.append((path, query))
             matches = all(scope[key] == value for item in query['query']['bool']['filter']
                           for key, value in item.get('term', {}).items())
@@ -1002,9 +1004,9 @@ def test_aida_keyword_base_mapping_worker_acquires_known_document_and_persists_q
             return self
         def __exit__(self, *args):
             pass
-        def post_json(self, path, query):
+        def post_json(self, path, query, *, params=None):
             from copy import deepcopy
-            payload = super().post_json(path, query)
+            payload = super().post_json(path, query, params=params)
             if path.endswith('/_search') and payload['hits']['hits']:
                 second = deepcopy(payload['hits']['hits'][0])
                 second['_id'] = 'second-header-for-policy-validation'
