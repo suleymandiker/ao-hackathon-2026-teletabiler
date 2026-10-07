@@ -117,9 +117,9 @@ def harness(monkeypatch, tmp_path):
             return super().save_state()
 
     class RecordingDownstream(full.DownstreamAIOpsPipeline):
-        def process(self, events):
+        def process(self, events, **options):
             self.inputs = list(events)
-            return super().process(self.inputs)
+            return super().process(self.inputs, **options)
 
     sessions = []
 
@@ -593,3 +593,19 @@ def test_core_layers_have_no_opensearch_imports(harness):
             elif isinstance(node, ast.ImportFrom):
                 assert "opensearch" not in (node.module or "").lower(), path
                 assert all("opensearch" not in alias.name.lower() for alias in node.names), path
+
+
+def test_monitor_trace_keeps_real_parser_template_learning_and_all_outputs_identical(harness):
+    from monitoring.trace import TraceCollector
+    records = [record(1, HEADER), record(2, CONT), record(3, NEXT)]
+    original = harness.pipeline().process_ingested_pages([page(*records)], policy_provider=provider)
+    collector = TraceCollector('fixture-run')
+    for source in records:
+        collector.acquisition(source, timestamp=source.source_timestamp,
+                              inside_window=True, overlap=False, duplicate=False)
+    observed = harness.pipeline().process_ingested_pages([page(*records)], policy_provider=provider, observer=collector)
+    assert observed == original
+    trace = collector.finish(observed)
+    assert [row['data']['template_id'] for row in trace['stages']['patterns']] == [
+        row['template_id'] for row in observed['pipeline_trace']['template']['items']]
+    assert len(trace['stages']['patterns']) == observed['stats']['templated']

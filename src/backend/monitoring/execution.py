@@ -14,6 +14,7 @@ from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
 from monitoring.errors import MonitoringError
+from monitoring.trace import TraceCollector
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
 from verified_policy_resolver import VerifiedPolicyResolver, PolicyResolutionError
 
@@ -115,12 +116,13 @@ def redact_ai_secret(value):
 class OpenSearchMonitorExecutor:
     def __init__(self, pipeline_factory, *, connection_loader=application.load_connection,
                  client_factory=OpenSearchClient, source_factory=OpenSearchSource,
-                 policy_loader=application.list_verified_policies):
+                 policy_loader=application.list_verified_policies, trace_limits=None):
         self.pipeline_factory = pipeline_factory
         self.connection_loader = connection_loader
         self.client_factory = client_factory
         self.source_factory = source_factory
         self.policy_loader = policy_loader
+        self.trace_limits = trace_limits
 
     def execute(self, run: MonitorRun, consumed: set[str]) -> ExecutionResult:
         definition = run.definition
@@ -130,6 +132,8 @@ class OpenSearchMonitorExecutor:
             raise MonitoringError('OPENSEARCH_CONFIG') from None
         if config.source_scope != definition.source_profile:
             raise MonitoringError('OPENSEARCH_CONFIG')
+        trace = TraceCollector(run.id, limits=self.trace_limits,
+                               secrets=(config.password, config.username, *config.hosts, os.environ.get('SAKA_API_KEY')))
         overlap = timedelta(seconds=definition.overlap_seconds)
         start, end = run.window.start - overlap, run.window.end + overlap
         resolved_index = resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy)
@@ -175,6 +179,10 @@ class OpenSearchMonitorExecutor:
                                 or (definition.container and identity.container != definition.container)):
                             raise MonitoringError('OPENSEARCH_QUERY')
                         key = reference_key(record)
+                        trace.acquisition(record, timestamp=timestamp,
+                                          inside_window=run.window.start <= timestamp < run.window.end,
+                                          overlap=not run.window.start <= timestamp < run.window.end,
+                                          duplicate=key in seen)
                         if key in seen:
                             summary['duplicate_records'] += 1
                             continue
@@ -220,7 +228,7 @@ class OpenSearchMonitorExecutor:
             with quiet_pipeline():
                 result = self.pipeline_factory().process_ingested_pages(
                     pages, policy_provider=lambda key, record: snapshot,
-                    source_timezone=definition.source_timezone, assembled_event_filter=ownership)
+                    source_timezone=definition.source_timezone, assembled_event_filter=ownership, observer=trace)
             if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                 reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
                 if any(count for reason, count in reasons.items() if reason != 'blank_context'):
@@ -235,6 +243,7 @@ class OpenSearchMonitorExecutor:
             # Reuse the established safe presentation projection; never persist
             # canonical raw traces or arbitrary transport/pipeline exceptions.
             presentation = redact_ai_secret(application.presentation_result(result, summary, config))
+            presentation['detailed_pipeline_trace'] = trace.finish(result)
             return ExecutionResult(presentation, counts, ownership.receipts)
         except MonitoringError:
             raise

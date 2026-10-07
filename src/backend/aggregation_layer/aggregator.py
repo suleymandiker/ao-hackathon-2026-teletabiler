@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, Iterable, List, Tuple
 from analysis_time import source_time_ms, order_key, signal_order
 from parser_layer.timestamp.source_policy import BASES
+from pipeline_observation import PipelineObserver
 import re
 
 
@@ -91,7 +92,7 @@ class SignalAggregator:
         self.window_ms = max(1, int(window_seconds)) * 1000
         self.representative_limit = max(1, int(representative_limit))
 
-    def aggregate(self, events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def aggregate(self, events: Iterable[Dict[str, Any]], *, observer: PipelineObserver | None = None) -> List[Dict[str, Any]]:
         groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
         for e in events:
             tid = str(e.get('template_id') or '').strip()
@@ -151,5 +152,7 @@ class SignalAggregator:
                 timestamp_basis_counts={basis: total for basis in BASES
                     if (total := sum((r.get('timestamp_provenance') or {}).get('basis') == basis for r in rows))},
             ).to_dict())
+            if observer is not None:
+                observer('membership', (out[-1]['signal_id'], rows))
         return sorted(out, key=lambda row: (row['window_start_ms'] is None,
                       row['window_start_ms'] or 0, *signal_order(row)))

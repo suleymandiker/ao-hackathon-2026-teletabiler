@@ -7,6 +7,7 @@ from ai_engine import call_ai_agent, load_prompt, safe_usage, MODELS_CONFIG
 from rca_layer.evidence import RCAEvidenceSelector, EvidenceBudgetError, serialize
 from rca_layer.expert_output import RCAExpertOutputValidator, ExpertOutputError, response_format
 from analysis_time import time_key, order_key
+from pipeline_observation import PipelineObserver
 
 
 class DeterministicRCAEngine:
@@ -82,7 +83,7 @@ class ExpertRCAEngine:
         self.last_expert_diagnostics: Dict[str, Any] = {}
 
     def analyze(self, incidents: Iterable[Dict[str, Any]], correlations: Iterable[Dict[str, Any]],
-                signals: Iterable[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
+                signals: Iterable[Dict[str, Any]] = (), *, observer: PipelineObserver | None = None) -> List[Dict[str, Any]]:
         incidents, correlations, signals = list(incidents), list(correlations), list(signals)
         self.last_case_analysis = None
         self.last_ai_error = None
@@ -96,6 +97,8 @@ class ExpertRCAEngine:
             pack = RCAEvidenceSelector().build(incidents, correlations, signals, base_results,
                 max_incidents=self.max_incidents, overhead_chars=len(overhead), overhead_bytes=len(overhead.encode('utf-8')))
             self.last_expert_diagnostics = dict(pack.diagnostics)
+            if observer is not None:
+                observer('expert_input', pack)
             print('[RCA CONTEXT] ' + ' | '.join(f'{key}={value}' for key, value in pack.diagnostics))
             reply, duration, usage = call_ai_agent(
                 'Ajan_2_RCA_Expert', prompt, pack.serialized, temperature=0.0,

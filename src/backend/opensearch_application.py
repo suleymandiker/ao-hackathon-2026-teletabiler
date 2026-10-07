@@ -224,7 +224,8 @@ def run_analysis(pipeline_factory, request, policy=None, *, automatic=False):
 
 def safe_text(value, config=None):
     """Defense in depth for display strings, including derived analysis text."""
-    text = str(value)
+    from evidence_redaction import redact_text
+    text = redact_text(value)
     secrets = (config.password, config.username, *config.hosts) if config is not None else ()
     for secret in sorted(secrets, key=len, reverse=True):
         if secret:

@@ -279,7 +279,7 @@ def pipeline(monkeypatch):
             pass
     pipeline.templater = Templater()
     pipeline.downstream = SimpleNamespace(set_context=lambda context: None,
-                                         process=lambda events: {'stats': {}, 'signals': [], 'rca': [], 'incidents': []})
+                                         process=lambda events, **options: {'stats': {}, 'signals': [], 'rca': [], 'incidents': []})
     pipeline.rows = rows
     return pipeline
 

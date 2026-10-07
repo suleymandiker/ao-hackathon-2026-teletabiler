@@ -9,6 +9,7 @@ from monitoring.repository import SQLiteMonitorRepository
 from monitoring.runtime import database_path
 from presentation import InvestigationPresenter
 import investigation_views as views
+from trace_views import load_trace
 
 
 def repository():
@@ -183,4 +184,4 @@ def render(connection, redact):
             boundary_details(summary, run.counts.logical_events, redact)
             model = InvestigationPresenter(redact).build(result, source='Deployment Monitor',
                                                          target=redact(monitor.definition.namespace + ' / ' + monitor.definition.workload))
-            views.investigation(model)
+            views.investigation(model, trace=load_trace(result, run_id, redact), trace_key='trace_' + run_id)

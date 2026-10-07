@@ -137,7 +137,7 @@ def incidents(view):
     incident_detail(view.incidents[selected])
 
 
-def stage_details(view):
+def stage_details(view, *, trace=None, trace_key=None):
     selected = st.selectbox('Pipeline aşamasını incele', range(len(view.stages)),
                            format_func=lambda index: view.stages[index].name, key='pipeline_stage')
     stage = view.stages[selected]
@@ -158,9 +158,12 @@ def stage_details(view):
         elif stage.key in ('incident', 'rca') and view.incidents:
             for incident in view.incidents:
                 incident_detail(incident)
+        if trace_key is not None:
+            from trace_views import stage_evidence
+            stage_evidence(trace, stage.key, key=trace_key + '_' + stage.key)
 
 
-def investigation(view):
+def investigation(view, *, trace=None, trace_key=None):
     st.title('Investigation sonucu')
     st.caption(view.source + (' · ' + view.target if view.target else ''))
     html(theme.summary(view))
@@ -186,7 +189,10 @@ def investigation(view):
         details(signal_stage.details)
         for reason, count in view.reason_counts:
             st.text(f'{count} · {reason}')
-    stage_details(view)
+    stage_details(view, trace=trace, trace_key=trace_key)
+    if trace_key is not None:
+        from trace_views import event_lineage
+        event_lineage(trace, key=trace_key)
     if view.timeline:
         with st.expander('Zaman çizelgesi'):
             st.caption(f'Gerçek kaynak zamanlarından türetilen en fazla {TIMELINE_LIMIT} gözlem; işlem aşaması zamanları değildir.')

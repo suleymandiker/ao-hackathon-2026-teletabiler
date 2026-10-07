@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List
 
 _FAILURE = re.compile(r"\b(timeout|timed out|connection refused|no route to host|unreachable|failed|failure|exception|error|circuit breaker|5\d\d)\b", re.I)
@@ -7,6 +8,15 @@ _FAILURE = re.compile(r"\b(timeout|timed out|connection refused|no route to host
 ROOT_TYPES={'network_down','pkt_loss','disk_full','db_write_fail','db_conn_pool','gc_pressure','oom_risk','ext_unreach','ext_slow'}
 SYMPTOM_TYPES={'conn_refused','timeout','http_5xx','latency_high','txn_fail','thread_pool','queue_backlog'}
 BACKGROUND_TYPES={'cert_expiry','backup_warn','ntp_drift','log_rotate','disk_warn','cpu_high','mem_high','network_flap'}
+
+
+@dataclass(frozen=True)
+class QualificationEvidence:
+    rule: str
+    score_threshold: float | None
+    score_threshold_met: bool | None
+    eligibility_met: bool
+    eligibility_rule: str
 
 class SignalNoiseGate:
     """Explainable gate for structured alarms and generic logs."""
@@ -28,6 +38,9 @@ class SignalNoiseGate:
                 elif count>=2: score+=.05; evidence.append('birden_fazla_olay')
                 if reliable>=.90: score+=.05; evidence.append('güvenilir_şablon')
                 score=round(min(1.0,score),3); qualified=score>=self.min_score and (sev<=4 or (failure and count>=20))
+                s['qualification_details'] = asdict(QualificationEvidence(
+                    'score_and_operational_evidence', self.min_score, score >= self.min_score,
+                    sev <= 4 or (failure and count >= 20), 'severity <= 4 OR (failure semantics AND count >= 20)'))
                 s.update(qualification_score=score,qualified=qualified,qualification_evidence=evidence,qualification_reason='nitelikli_sinyal' if qualified else 'gürültü_olarak_bastırıldı'); out.append(s); continue
             if typ in ROOT_TYPES: score+=.48; evidence.append('kök_neden_adayı_alarm_tipi')
             elif typ in SYMPTOM_TYPES: score+=.32; evidence.append('operasyonel_semptom_alarm_tipi')
@@ -46,6 +59,12 @@ class SignalNoiseGate:
                 qualified = count>=10 and srcsev>=4
             else:
                 qualified = score>=self.min_score
+            s['qualification_details'] = asdict(QualificationEvidence(
+                'background_guard' if typ in BACKGROUND_TYPES else 'score_threshold',
+                None if typ in BACKGROUND_TYPES else self.min_score,
+                None if typ in BACKGROUND_TYPES else score >= self.min_score,
+                count >= 10 and srcsev >= 4 if typ in BACKGROUND_TYPES else True,
+                'count >= 10 AND source severity >= 4' if typ in BACKGROUND_TYPES else 'no additional eligibility guard'))
             s.update(qualification_score=score,qualified=qualified,qualification_evidence=evidence,
                      qualification_reason='nitelikli_sinyal' if qualified else 'gürültü_olarak_bastırıldı')
             out.append(s)

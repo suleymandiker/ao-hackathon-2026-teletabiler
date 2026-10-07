@@ -8,6 +8,7 @@ from context_enrichment_layer.enricher import ContextEnricher
 from rca_layer.rca_engine import ExpertRCAEngine
 from learning_planning_layer.planner import LearningPlanner
 from analysis_time import AnalysisTimeContext, source_time_ms
+from pipeline_observation import PipelineObserver
 
 class DownstreamAIOpsPipeline:
     """Basit final akış: Sinyal adayı -> Gürültü kapısı -> Korelasyon -> Olay -> RCA -> Plan."""
@@ -27,7 +28,7 @@ class DownstreamAIOpsPipeline:
         self.enricher = ContextEnricher(topology=topology)
         self.incidents = IncidentCandidateBuilder(topology=topology)
 
-    def process(self, templated_events: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    def process(self, templated_events: Iterable[Dict[str, Any]], *, observer: PipelineObserver | None = None) -> Dict[str, Any]:
         reference = None
 
         def observed_events():
@@ -38,14 +39,15 @@ class DownstreamAIOpsPipeline:
                     reference = timestamp if reference is None else max(reference, timestamp)
                 yield event
 
-        signals = self.noise_gate.qualify(self.aggregator.aggregate(observed_events()))
+        options = {'observer': observer} if observer is not None else {}
+        signals = self.noise_gate.qualify(self.aggregator.aggregate(observed_events(), **options))
         # No current downstream feature needs recency/decay. Retain the factual
         # reference as local diagnostics, never fill missing event coordinates.
         analysis_time = AnalysisTimeContext(reference)
         qualified = [s for s in signals if s.get('qualified')]
         correlations = self.correlator.correlate(qualified)
         incidents = self.enricher.enrich(self.incidents.build(signals, correlations), signals)
-        rca = self.rca.analyze(incidents, correlations, signals)
+        rca = self.rca.analyze(incidents, correlations, signals, **options)
         plans = self.planner.plan(incidents, rca)
         return {
             'analysis_time': analysis_time.to_dict(),

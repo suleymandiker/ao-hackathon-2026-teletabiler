@@ -1,5 +1,165 @@
 # Deployment monitoring
 
+## Pipeline Trace / Evidence Explorer
+
+**Pipeline Trace is observational. It does not alter pipeline decisions.**
+For newly executed Deployment Monitor runs, the existing stage selector keeps
+its summaries and adds persisted Records / Evidence, selected input/output
+details, related evidence, and Event Lineage. Search covers stored text, IDs,
+severity, service/component, pod/container, pattern and boundary status. Signal
+decisions and pattern identities also have dedicated filters. Tables page through
+100 items; a 240-character table preview explicitly indicates shortening. The
+selected item shows its stored content, including continuation indentation.
+Technical JSON is secondary to content and recorded field/value tables.
+
+The current evidence inventory and capture additions are:
+
+| Stage | Existing authoritative evidence | Observation added |
+| --- | --- | --- |
+| Acquisition | `IngestedLogRecord`, `SourceReference`, stream identity, raw source time/order | Sanitized record content, ordinal, duplicate flag, inside-window/overlap flags, and source-reference hash before deduplication |
+| Segmentation | `AssembledEvent` contributors, `LineEvidence`, pinned policy, emission reason, `BoundaryStatus`; `UnassembledRecord` disposition | Full bounded output list, assembled text, contributor links, classification/confidence, policy identity/validation reference, admitted flag, owned analysis ordinal |
+| Parsing | `ParseOutcome` and canonical event fields; old samples capped at 200 | Outcome from the same parser call, canonical fields and logical input link; no extraction heuristics or reparse |
+| Patterns | Authoritative template result and `last_decision` | Every bounded occurrence linked to its canonical event, template ID/text, reliability/source/reason; existing aggregate pattern counts stay intact |
+| Signal | All candidates, score, qualified flag, reason and qualification evidence; only eight representative event IDs | Exact aggregation membership callback before the representative cap; typed `QualificationEvidence` records the existing threshold/eligibility rule at the gate |
+| Correlation | Accepted edges with source/target signal IDs, scores, time gaps, relationship evidence | Persisted copies and member links; rejected proposals do not exist in the domain and are not invented |
+| Incident | IDs, times, severity, services, signals, templates, probable root and confidence | Persisted copies with actual signal membership and links to edges whose endpoints belong to the incident; these links do not claim every edge caused construction |
+| RCA | Deterministic ranked candidates/scores/evidence and optional validated case interpretation | Separate deterministic results, actual submitted expert Evidence Pack and alias/member maps, and optional interpretation/status |
+
+### Read model and lineage
+
+`monitoring/trace.py` defines `PipelineTrace`, `TraceItem` and `TraceLimits`.
+The version-1 envelope is stored under `detailed_pipeline_trace` alongside the
+existing result. It contains `run_id`, `schema_version`, `limits`, eight ordered
+`stages`, exact per-stage `totals`, `omitted_items`, and `trace_complete`.
+Each item contains `ref`, `ordinal`, `parents`, sanitized `data`,
+`preview_truncated`, `omitted_fields`, and `omitted_links`.
+
+`pipeline_observation.PipelineObserver` is an optional synchronous callback over
+borrowed outputs. Core processing imports only this source-neutral protocol;
+it does not depend on monitoring DTOs. The executor constructs one collector per
+run. No collector is cached on a pipeline, parser, template miner or user session.
+Parsing uses the existing `process_with_outcome` implementation (the same method
+called by `process`), exactly once. Aggregation observes its actual group members;
+the frontend does not reproduce grouping, scoring or membership logic.
+
+Source references use the same SHA-256 scope/partition/record-ID identity as
+monitor receipts and boundary diagnostics, with the existing intentional version
+exclusion. Canonical event IDs, template IDs, signal IDs and incident IDs remain
+unchanged in processing. Presentation references are deterministic within a run:
+`record:N`, `logical:N`, `canonical:N`, `occurrence:N`, `signal:<domain-id>`,
+`incident:<domain-id>` and `rca:<incident-id>`. Correlation objects have no domain
+ID, so `correlation:N` follows their authoritative output order. Expert evidence
+uses `expert:input`, `expert:result` or `expert:status`. Unsafe or excessively long
+display IDs become an explicit `redacted-id:<sha256>` consistently in links;
+this never replaces a domain identity. The run ID supplies the namespace.
+
+Logical ordinals include excluded context/dispositions; `analysis_event_ordinal`
+identifies an admitted event in the original analysis. Acquisition includes
+duplicate retrieval records, while only the retained record links to assembly.
+Consequently trace-stage totals need not equal the owned-event summary counts.
+Event Lineage traverses stored parent links and their reverse links. It can follow
+a physical record through assembly, canonical output, pattern occurrence, signal,
+correlation, incident and RCA. Suppression is a factual terminal state. Missing
+details under a budget are marked as limited coverage, never as a failed stage.
+Reference design leaves pattern occurrences addressable for a later baseline UI;
+no baseline facts or anomaly decisions are implemented here.
+
+### Persistence, limits and security
+
+Trace construction uses already acquired records and actual stage outputs; it
+does not query OpenSearch again. Opening any stage, RCA or lineage performs no
+segmentation, parsing, templating, scoring, correlation, incident construction,
+RCA, network or LLM call. The frontend reads only the selected result whose trace
+`run_id` matches that completed MonitorRun.
+
+The existing `SQLiteMonitorRepository.succeed` transaction publishes the whole
+result (including trace), successful status, receipts and watermark atomically.
+Acquisition/pipeline failures publish no result. Serialization or transaction
+failure cannot leave a completed partial trace. SQLite schema version remains 1;
+no table migration, historical rewrite, watermark reset, monitor recreation,
+template/Drain reset, or policy invalidation occurs. Historical results without
+the new field remain readable and show:
+
+> Detailed pipeline trace was not stored for this historical run.
+
+Default trace configuration preserves up to **2,000 items per stage**, **16 MiB
+for the entire serialized trace**, **8,192 characters per textual field**,
+**16,000 field nodes/links per item**, and nesting depth **12**. These are
+`TraceLimits` application configuration, injectable through
+`OpenSearchMonitorExecutor(trace_limits=...)`, not monitor scheduling settings.
+The standard acquisition bound is 100 records × 20 pages = 2,000; existing
+configuration permits at most 500 × 20 = 10,000. Trace limits do not change either
+acquisition bound. The shared byte budget reserves 4 KiB for its envelope.
+
+Each stage retains an ordered prefix until its item/byte allowance is exhausted;
+there is no random sampling. Counters continue for every omitted item. Text/field
+shortening and omitted links set item flags and `trace_complete=false`; the UI
+displays both global and item-level coverage notices. IDs and source hashes are
+preserved independently of text-preview limits where possible. Read-time paging
+does not discard stored records. The collector's temporary identity/membership
+maps are bounded by the existing finite acquisition, and it does not retain raw
+source objects. This adds bounded evidence per run, not an unbounded raw-log
+archive; existing history retention is unchanged.
+
+A compact representative fixture with three acquisition records, two logical
+events, two canonical outputs, two pattern occurrences and one suppressed signal
+serializes to approximately **6 KiB**. Full-contract regression fixtures also
+exercise larger content, the legacy 200-sample boundary, and item/byte/field/link
+limits. Retained-memory probes cover 2,000 and 10,000 input items after exhaustion.
+
+All trace text and nested canonical attributes cross `evidence_redaction` before
+retention/persistence. It covers configured OpenSearch credentials/endpoints and
+the configured AI key, Authorization/Basic/Bearer, JWTs, API keys, passwords,
+secrets, credentials, cookies and sensitive headers, private-key blocks, and
+credential-bearing URLs. `user_id`/`userId` values are conservatively redacted
+because this workload can embed credentials there. Arbitrary acquisition metadata
+and cursors are not captured. The UI redacts again, including technical JSON,
+and displays log content through text/code/dataframe controls, never raw HTML.
+No unredacted trace copy or trace content is written to worker logs. Redaction
+does not modify events used by learning/processing or the expert prompt.
+
+`BoundaryStatus` and `emission_reason` are copied from the actual assembly result.
+No completion/truncation inference is added, and
+`boundary_allows_baseline_evidence()` remains unchanged. Deterministic RCA ranking
+is preserved even when the optional expert is unavailable. The expert trace
+shows the actual submitted pack (sanitized), with any further trace shortening
+explicit; it never invokes the selector or gateway from the UI. Existing
+`qwen_destekli` annotation does not transfer authority to the expert.
+
+### Trace smoke on the existing Citrix deployment
+
+1. Keep the existing checkout, monitor definitions, `AIOPS_MONITOR_DB`, learning
+   directory and environment. Reload/restart its Streamlit process with this code
+   if required. Do not create a replacement monitor or edit SQLite to force a run.
+2. When the existing monitor is enabled and due, from that checkout run exactly
+   `.\.venv\Scripts\python.exe -B tools\monitor_worker.py --once --max-runs 1`.
+   Require START → ACQUIRED → PIPELINE → SUCCESS and record the exact run ID/window.
+3. In Deployment Monitors, open that same new successful window. Preserve the
+   summaries and inspect all eight stage selections. For a normal workload,
+   zero qualified signals/correlations/incidents/RCA are valid factual empty states.
+4. Select a logical event and compare contributing physical records, indentation,
+   assembled text, stream, source times, policy, emission reason and boundary
+   status. Follow its canonical event, authoritative pattern occurrence and actual
+   signal decision/evidence through Event Lineage. Check any coverage notices.
+5. Inspect content and technical expanders for credential redaction, including
+   `user_id`. Open an older run and verify its explicit historical-trace message.
+   Confirm the new watermark equals the successful logical end without replay.
+
+The local implementation environment has no configured monitoring database at
+`src/data/monitoring/monitors.sqlite3`, no available browser session, and its native
+computer-use pipe is unavailable. The live procedure therefore remains pending
+access to the existing Citrix deployment; no successful live smoke is claimed and
+no empty replacement monitoring database is created.
+
+Trace validation: **162 focused tests** passed across trace, real ingestion,
+monitoring persistence and Streamlit suites. The full offline regression suite
+passed **1,018 tests** (968 baseline + 50 additions). Tests use temporary databases
+and learning state, block external network/LLM calls, and cover identical pipeline
+outputs with/without observation, atomic rollback, full membership, redaction,
+historical reads, actual expert input capture, and explicit resource limits.
+Tracked and untracked whitespace checks passed. Nothing was staged, committed or
+pushed; live Citrix validation remains pending as described above.
+
 ## Architecture and configuration finding
 
 Streamlit is the **control plane**: monitor definitions, enable/pause, persisted

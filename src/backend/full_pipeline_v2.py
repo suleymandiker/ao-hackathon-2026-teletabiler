@@ -10,6 +10,7 @@ from template_layer.template_pipeline import TemplatePipeline
 from downstream_pipeline import DownstreamAIOpsPipeline
 from input_package_layer.package_loader import InputPackageLoader
 from time_quality import TimeQuality
+from pipeline_observation import PipelineObserver
 from parser_layer.timestamp.source_policy import TimestampContext, TimestampSourcePolicy, resolve_event_time
 import os
 
@@ -109,6 +110,7 @@ class FullAIOpsPipelineV2:
         topology=None,
         source_timezone=None,
         assembled_event_filter=None,
+        observer: PipelineObserver | None = None,
     ) -> Dict[str, Any]:
         """Analyze one caller-bounded, finite sequence of already acquired pages.
 
@@ -120,6 +122,9 @@ class FullAIOpsPipelineV2:
         An optional source-neutral assembled_event_filter selects emitted
         assembly outputs before parsing/learning. Monitoring uses this seam for
         window ownership; omitted filters preserve existing batch behavior.
+        An optional synchronous observer receives borrowed outputs at existing
+        stage boundaries. It must not mutate them; no observer is kept on the
+        pipeline or learning state. Monitoring owns its sanitized read model.
 
         One local session emits events in completion order, followed by close
         tails in first-seen stream order. Dispositions are counted with the first
@@ -147,6 +152,12 @@ class FullAIOpsPipelineV2:
         }
         event_provenance = []
 
+        def admitted(output):
+            selected = assembled_event_filter is None or assembled_event_filter(output)
+            if observer is not None:
+                observer('segmentation', (output, selected))
+            return selected
+
         def logical_events():
             for page in pages:
                 if not isinstance(page, SourcePage):
@@ -155,6 +166,8 @@ class FullAIOpsPipelineV2:
                 diagnostics['records_read'] += len(page.records)
                 for output in session.feed_page(page):
                     if isinstance(output, UnassembledRecord):
+                        if observer is not None:
+                            observer('segmentation', (output, False))
                         diagnostics['unassembled_count'] += 1
                         reasons = diagnostics['unassembled_by_reason']
                         reasons[output.reason] = reasons.get(output.reason, 0) + 1
@@ -166,17 +179,17 @@ class FullAIOpsPipelineV2:
                                 'framing': output.record.framing.value,
                                 'record': self._record_provenance(output.record),
                             })
-                    elif assembled_event_filter is None or assembled_event_filter(output):
+                    elif admitted(output):
                         yield output
             for output in session.close():
-                if assembled_event_filter is None or assembled_event_filter(output):
+                if admitted(output):
                     yield output
 
         events = logical_events()
         try:
             self.downstream.set_context(topology)
             result = self._process_logical_events(events, event_provenance=event_provenance,
-                                                  timestamp_policy=timestamp_policy)
+                                                  timestamp_policy=timestamp_policy, observer=observer)
         finally:
             events.close()
             if not session.closed:
@@ -212,6 +225,7 @@ class FullAIOpsPipelineV2:
 
     def _process_logical_events(
         self, logical_events: Iterable[str | AssembledEvent], *, event_provenance=None, timestamp_policy=None,
+        observer: PipelineObserver | None = None,
     ) -> Dict[str, Any]:
         """Shared existing parser/template/downstream flow; no policy preparation."""
         time_quality = TimeQuality.from_env()
@@ -235,17 +249,20 @@ class FullAIOpsPipelineV2:
             stats['segmented']+=1
             if len(trace['segmentation']) < trace_limit:
                 trace['segmentation'].append(raw)
-            if time_quality is not None:
+            outcome = None
+            if time_quality is not None or observer is not None:
                 # process() delegates to this outcome contract. Older injected
                 # parsers can still use their existing process() method.
                 parse_with_outcome = getattr(self.parser, 'process_with_outcome', None)
                 if callable(parse_with_outcome):
                     outcome = parse_with_outcome(raw, **parse_options)
                     event = outcome.event
-                    parsed_time = time_quality.parsed(event, outcome.parser_id)
+                    if time_quality is not None:
+                        parsed_time = time_quality.parsed(event, outcome.parser_id)
                 else:
                     event = self.parser.process(raw, **parse_options)
-                    parsed_time = time_quality.parsed(event)
+                    if time_quality is not None:
+                        parsed_time = time_quality.parsed(event)
             else:
                 event=self.parser.process(raw, **parse_options)
             if isinstance(logical, AssembledEvent):
@@ -264,6 +281,8 @@ class FullAIOpsPipelineV2:
                         attributes[backup] = attributes['source_provenance']
                     attributes['source_provenance'] = provenance
                     event = dict(event, attributes=attributes)
+            if observer is not None:
+                observer('parsing', (stats['segmented'] - 1, event, outcome))
             if not event: continue
             stats['parsed']+=1
             if len(trace['parser']) < trace_limit:
@@ -279,13 +298,15 @@ class FullAIOpsPipelineV2:
             # completion order instead of reinterpreting provider metadata.
             row['source_order'] = stats['segmented'] - 1
             decision=self.templater.last_decision or {}; row['template_source']=decision.get('source'); row['template_reason']=decision.get('validator_reason')
+            if observer is not None:
+                observer('patterns', row)
             templated.append(row); stats['templated']+=1; stats['template_unreliable']+=0 if result.reliable else 1
             if time_quality is not None:
                 time_quality.downstream(row, parsed_time)
             if len(trace['template']) < trace_limit:
                 trace['template'].append(dict(row))
         print(f"[PIPELINE] Segmentasyon={stats['segmented']} | Ayrıştırma={stats['parsed']} | Şablonlama={stats['templated']}")
-        downstream=self.downstream.process(templated)
+        downstream=self.downstream.process(templated, **({'observer': observer} if observer is not None else {}))
         if time_quality is not None:
             time_quality.report(downstream)
         downstream['stats']={**stats,**downstream['stats']}
