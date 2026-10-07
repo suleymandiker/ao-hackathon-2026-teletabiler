@@ -186,7 +186,7 @@ def test_completed_run_selection_loads_exact_persisted_investigation_and_trace(m
         collector = TraceCollector(run.id)
         collector.add('acquisition', marker, dict(text=marker))
         result = dict(stats=dict(segmented=index + 1, parsed=0, templated=0),
-                      signals=[], incidents=[], source_summary=dict(selected_run=marker))
+                      signals=[], incidents=[], source_summary=dict(resolved_index=marker))
         result['detailed_pipeline_trace'] = collector.finish(result)
         repo.succeed(run, result, RunCounts(logical_events=index + 1), {}, now=clock)
         saved.append((run, repo.result(run.id), marker))

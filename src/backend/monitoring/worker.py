@@ -57,7 +57,11 @@ class MonitorWorker:
                 if isinstance(error, MonitoringError):
                     category = error.category
                 try:
-                    self.repository.fail(run, category, now=self.clock())
+                    diagnostics = getattr(error, 'acquisition_diagnostics', None) if isinstance(error, MonitoringError) else None
+                    if diagnostics is None:
+                        self.repository.fail(run, category, now=self.clock())
+                    else:
+                        self.repository.fail(run, category, now=self.clock(), diagnostics=diagnostics)
                 except Exception:
                     category = 'PERSISTENCE'
                 self.log('FAILED', run_id=run.id, category=category)

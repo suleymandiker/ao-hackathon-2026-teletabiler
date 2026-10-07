@@ -80,11 +80,30 @@ def test_create_read_edit_and_schema_is_separate(repo):
                          revision=monitor.revision, now=BASE)
     assert repo.list() == [edited]
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
         assert {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {
             'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts'}
     with pytest.raises(ValueError, match='changed'):
         repo.update(monitor.id, definition(), revision=monitor.revision, now=BASE)
+
+
+def test_v2_migration_preserves_results_and_defaults_diagnostics(repo):
+    from monitoring.repository import SQLiteMonitorRepository
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    worker(repo, [BASE + timedelta(minutes=17)])[0].tick()
+    run = repo.history(monitor.id)[0]
+    before = repo.result(run.id)
+    with sqlite3.connect(repo.path) as db:
+        db.execute('ALTER TABLE monitor_runs DROP COLUMN acquisition_diagnostics')
+        db.execute('PRAGMA user_version=2')
+        stored = db.execute('SELECT * FROM monitor_runs').fetchone()
+    reopened = SQLiteMonitorRepository(repo.path)
+    assert reopened.result(run.id) == before and reopened.history(monitor.id) == [run]
+    assert reopened.get(monitor.id).last_successful_end == run.window.end
+    assert reopened.acquisition_diagnostics(run.id) is None
+    with sqlite3.connect(repo.path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
+        assert db.execute('SELECT * FROM monitor_runs').fetchone()[:-1] == stored
 
 
 @pytest.mark.parametrize('changes', [
@@ -209,8 +228,10 @@ def test_v1_migration_defaults_existing_monitors_and_preserves_all_audit_rows(re
             schema = source.execute("SELECT sql FROM sqlite_master WHERE name=?", (table,)).fetchone()[0]
             if table == 'monitors':
                 schema = schema.replace(', archived INTEGER NOT NULL DEFAULT 0', '')
+            if table == 'monitor_runs':
+                schema = schema.replace(', acquisition_diagnostics TEXT', '')
             legacy.execute(schema)
-            columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})') if row[1] != 'archived']
+            columns = [row[1] for row in source.execute(f'PRAGMA table_info({table})') if row[1] not in ('archived', 'acquisition_diagnostics')]
             records = source.execute(f'SELECT {",".join(columns)} FROM {table}').fetchall()
             legacy.executemany(f'INSERT INTO {table} VALUES ({",".join("?" for _ in columns)})', records)
         legacy.execute('PRAGMA user_version=1')
@@ -224,9 +245,11 @@ def test_v1_migration_defaults_existing_monitors_and_preserves_all_audit_rows(re
     assert migrated.result(calls[0].id) == repo.result(calls[0].id)
     assert migrated.history(monitor.id) == repo.history(monitor.id)
     with sqlite3.connect(legacy_path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
         for table, records in before.items():
-            assert db.execute(f'SELECT * FROM {table}').fetchall() == records
+            rows = db.execute(f'SELECT * FROM {table}').fetchall()
+            assert ([row[:-1] for row in rows] if table == 'monitor_runs' else rows) == records
+        assert db.execute('SELECT acquisition_diagnostics FROM monitor_runs').fetchone()[0] is None
     migrated.archive(monitor.id, now=BASE)
     assert migrated.result(calls[0].id) == repo.result(calls[0].id)
     assert SQLiteMonitorRepository(legacy_path).get(monitor.id).archived
@@ -256,7 +279,7 @@ def test_failed_window_retry_and_restart_do_not_duplicate(repo):
         duplicate = list(db.execute('SELECT * FROM monitor_runs').fetchone())
         duplicate[0] = 'different-run-id'
         with pytest.raises(sqlite3.IntegrityError, match='monitor_runs.monitor_id'):
-            db.execute('INSERT INTO monitor_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', duplicate)
+            db.execute('INSERT INTO monitor_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', duplicate)
     with pytest.raises(ValueError, match='claim'):
         repo.succeed(calls[0], {}, retried.counts, {}, now=clock[0])
 
@@ -557,6 +580,19 @@ def test_acquisition_failures_persist_without_watermark_or_pipeline(repo, failur
     assert repo.get(monitor.id).last_successful_end is None
     assert repo.history(monitor.id)[0].error_category == category
     assert len(queries) == 1
+    run = repo.history(monitor.id)[0]
+    diagnostics = repo.acquisition_diagnostics(run.id)
+    assert diagnostics['source_profile'] == 'test-profile'
+    assert diagnostics['namespace'] == 'ns' and diagnostics['workload'] == 'app'
+    assert diagnostics['document_cluster_filter_active'] is False
+    assert diagnostics['budget_reached'] is (failure == 'cap')
+    assert diagnostics['records_read'] == (1 if failure in ('cap', 'malformed') else 0)
+    assert not any(value in str(diagnostics) for value in ('test-password', 'test-user', 'opaque', 'ERROR: failure'))
+    assert repo.result(run.id) is None
+    # Retrying the same logical window starts a fresh attempt snapshot.
+    retry = repo.claim(BASE + timedelta(minutes=32))
+    assert retry.id == run.id and retry.attempts == 2
+    assert repo.acquisition_diagnostics(run.id) is None
 
 
 def test_empty_window_succeeds_without_policy_and_config_error_is_safe(repo, pipeline):
@@ -730,6 +766,9 @@ def test_worker_daily_indices_use_both_overlaps_and_preserve_profile(repo, pipel
         def __exit__(self, *args):
             pass
         def post_json(self, path, query):
+            if path.endswith('/_field_caps'):
+                return {'fields': {name: {'keyword': {'searchable': True, 'aggregatable': True}}
+                                   for name in query['fields'] if name.endswith('.keyword')}}
             calls.append((path, query))
             return {'timed_out': False, '_shards': {'failed': int(shard_failure)}, 'hits': {'hits': []}}
     executor = OpenSearchMonitorExecutor(lambda: pipeline, connection_loader=lambda size: config, client_factory=Client,
@@ -798,6 +837,9 @@ def source_scope_executor(pipeline):
         def __exit__(self, *args):
             pass
         def post_json(self, path, query):
+            if path.endswith('/_field_caps'):
+                return {'fields': {name: {'keyword': {'searchable': True, 'aggregatable': True}}
+                                   for name in query['fields'] if name.endswith('.keyword')}}
             calls.append((path, query))
             matches = all(scope[key] == value for item in query['query']['bool']['filter']
                           for key, value in item.get('term', {}).items())
@@ -934,7 +976,7 @@ def test_legacy_monitor_json_keeps_alias_and_history_without_migration(repo, sou
     assert reopened.history(monitor.id)[0].definition == loaded.definition
     reopened.update(monitor.id, replace(loaded.definition, name='renamed'), revision=loaded.revision, now=BASE)
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
         assert db.execute('SELECT * FROM monitor_runs WHERE id=?', (run.id,)).fetchone() == history_before
         assert db.execute('SELECT * FROM monitor_results WHERE run_id=?', (run.id,)).fetchone() == result_before
     # A separate legacy definition that has never run uses the corrected scope.
@@ -944,3 +986,54 @@ def test_legacy_monitor_json_keeps_alias_and_history_without_migration(repo, sou
         db.execute('UPDATE monitors SET definition=? WHERE id=?', (payload, new.id))
     assert MonitorWorker(reopened, fixture.executor, clock=lambda: BASE + timedelta(days=1), log=lambda *a, **k: None).tick() == 1
     assert reopened.history(new.id)[0].counts.events_retrieved == 2
+
+
+def test_aida_keyword_base_mapping_worker_acquires_known_document_and_persists_query(repo, pipeline):
+    from test_monitor_target import KeywordClient
+    from monitoring.execution import OpenSearchMonitorExecutor
+    from monitoring.worker import MonitorWorker
+    from opensearch_application import VerifiedPolicy
+    from segmentation_layer.contracts import SegmentationPolicy
+    class Client(KeywordClient):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def post_json(self, path, query):
+            from copy import deepcopy
+            payload = super().post_json(path, query)
+            if path.endswith('/_search') and payload['hits']['hits']:
+                second = deepcopy(payload['hits']['hits'][0])
+                second['_id'] = 'second-header-for-policy-validation'
+                second['_source']['@timestamp'] = '2026-10-07T06:15:52Z'
+                second['_source']['openshift']['sequence'] = 124
+                second['sort'] = [1791353752000, 124]
+                payload['hits']['hits'].append(second)
+            return payload
+    config = KeywordClient().config
+    start = datetime(2026, 10, 7, 6, 1, tzinfo=timezone.utc)
+    monitor = repo.create(definition(source_profile='gocpbmgpup1', cluster_id='gocpbmgpup1',
+                                    namespace='ai-document-assistant', workload='aida-agent-http',
+                                    initial_start=start), enabled=True, now=start)
+    executor = OpenSearchMonitorExecutor(lambda: pipeline, connection_loader=lambda size: config,
+                                        client_factory=Client, policy_loader=lambda: (
+                                            VerifiedPolicy('info', SegmentationPolicy('info', r'^INFO', 'fixture')),))
+    completed = MonitorWorker(repo, executor, clock=lambda: start + timedelta(minutes=17), log=lambda *a, **k: None).tick()
+    assert completed == 1, repo.history(monitor.id)[0].error_category
+    run = repo.history(monitor.id)[0]
+    assert run.status.value == 'SUCCESS' and run.counts.events_retrieved == 2
+    assert run.counts.logical_events == 2 and run.counts.parsed_events == 2
+    assert repo.get(monitor.id).last_successful_end == start + timedelta(minutes=15)
+    summary = repo.result(run.id)['source_summary']
+    assert summary['resolved_index'] == 'gocpbmgpup1-2026.10.07'
+    assert summary['document_cluster_filter_active'] is False
+    assert summary['sort_fields'] == ['@timestamp', 'openshift.sequence']
+    assert summary['effective_query']['bool']['filter'][1:] == [
+        {'term': {'kubernetes.namespace_name': 'ai-document-assistant'}},
+        {'term': {'kubernetes.labels.app': 'aida-agent-http'}}]
+    assert summary['pages_read'] == 1 and summary['records_read'] == 2
+    assert summary['budget_reached'] is False
+    assert 'fixture-password' not in str(summary) and 'fixture-reader' not in str(summary)

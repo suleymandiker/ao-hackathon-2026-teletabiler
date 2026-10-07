@@ -52,16 +52,16 @@ def test_console_row_hierarchy_escaping_and_native_tabs(monitoring_ui):
     app = ui.app()
     app.button(key='start_monitors').click().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert [tab.label for tab in app.tabs] == ['Overview', 'Runs', 'Investigation', 'Pipeline Trace', 'Configuration']
-    assert app.tabs[0].button(key='toggle_monitor_' + monitor.id)
-    assert app.tabs[1].subheader[0].value == 'Run History'
-    assert app.tabs[4].button(key='edit_configuration_' + monitor.id)
-    assert any('Administration' in item.label for item in app.tabs[0].expander)
+    assert [tab.label for tab in app.tabs] == ['Overview', 'Findings', 'Runs', 'Settings']
+    assert app.tabs[3].button(key='toggle_monitor_' + monitor.id)
+    assert app.tabs[2].subheader[0].value == 'Run History'
+    assert app.tabs[3].button(key='edit_monitor_' + monitor.id)
+    assert any('Administration' in item.label for item in app.tabs[3].expander)
     assert 'Archive' not in app.button(key='toggle_monitor_' + monitor.id).label
     # AppTest exposes tab contents but has no tab-click API. Browser validation
     # covers switching tabs and retaining the active tab across Refresh.
     assert app.session_state['monitor_tabs_' + monitor.id] == 'Overview'
-    app.tabs[4].button(key='edit_configuration_' + monitor.id).click().run()
+    app.tabs[3].button(key='edit_monitor_' + monitor.id).click().run()
     assert app.session_state['monitor_edit_mode'] == monitor.id
     assert not app.exception
     assert_safe(app)
@@ -78,6 +78,26 @@ def monitoring_ui(ui, monkeypatch, tmp_path):
     from monitoring.repository import SQLiteMonitorRepository
     from monitoring.domain import MonitorDefinition
     import monitoring_views
+    from monitoring.targets import TargetOptions, TargetValidation
+    ui.target_calls = []
+    class Explorer:
+        def __init__(self, config, end):
+            self.end = end
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def options(self, name, **scope):
+            ui.target_calls.append(('options', name, scope))
+            values = {'namespace': ('ns', 'other-namespace', 'changed-ns'),
+                      'workload': ('app', 'other-workload'), 'container': ('main', 'sidecar')}
+            if name == 'workload' and scope.get('namespace') == 'other-namespace':
+                return TargetOptions(('other-workload',))
+            return TargetOptions(values[name])
+        def validate(self, namespace, workload, container=None):
+            ui.target_calls.append(('validate', namespace, workload, container))
+            return TargetValidation(3800, self.end - timedelta(seconds=12), 'INFO Agent completed · [redacted]')
+    monkeypatch.setattr(monitoring_views, 'TargetExplorer', Explorer)
     monkeypatch.setattr(monitoring_views, 'now', lambda: BASE)
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3')
     monitor = repo.create(MonitorDefinition('saved-monitor', 'profile', 'cluster', 'ns', 'app', BASE), now=BASE)
@@ -120,7 +140,7 @@ def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
     app.button(key='monitor_row_' + monitor.id).click().run()
     assert app.selectbox(key='selected_run_id').value == run.id
     assert any(item.value == 'Investigation sonucu' for item in app.title)
-    assert any('Last Successful End' in item.value and '05 Oct 12:15 UTC' in item.value for item in app.markdown)
+    assert any('Logs analyzed' in item.value and '7' in item.value for item in app.markdown)
     technical = next(item.value for item in app.dataframe
                      if 'Gösterge' in item.value and 'İndeks' in item.value['Gösterge'].values)
     details = dict(zip(technical['Gösterge'], technical['Değer']))
@@ -133,31 +153,29 @@ def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
     assert_safe(app)
 
 
-@pytest.mark.parametrize('document_cluster_id', [None, '11111111-2222-4333-8444-555555555555'])
-def test_create_disabled_and_edit_monitor_from_form(monitoring_ui, document_cluster_id):
+def test_create_minimal_monitor_with_defaults_and_edit_name(monitoring_ui):
     ui, repo, _ = monitoring_ui
     app = ui.app()
     app.button(key='start_monitors').click().run()
     app.button(key='new_monitor').click().run()
-    app.text_input(key='monitor_name_new').set_value('created-in-ui')
-    # Only the explicitly opened create form is rendered.
-    def first(label):
-        return next(item for item in app.text_input if item.label == label)
-    assert first('Source profile / scope').value == 'profile'
-    assert first('Document OpenShift cluster UUID (optional)').value == ''
-    first('Logical cluster alias').set_value('logical-alias')
-    if document_cluster_id:
-        first('Document OpenShift cluster UUID (optional)').set_value(document_cluster_id)
-    first('Namespace').set_value('ns')
-    first('Deployment / workload').set_value('app')
+    assert not any(item.label in ('Monitor name', 'Source profile / scope', 'Logical cluster alias') for item in app.text_input)
+    assert not app.number_input
+    app.selectbox(key='monitor_field_new_namespace').set_value('ns').run()
+    app.selectbox(key='monitor_field_new_workload').set_value('app').run()
+    assert any('3,800' in item.value for item in app.success)
+    assert app.code[0].value == 'INFO Agent completed · [redacted]'
+    assert app.selectbox(key='monitor_field_new_interval').value == '15 minutes'
+    assert app.selectbox(key='monitor_field_new_container').value is None
     app.button(key='save_monitor_new').click().run()
     assert not app.exception
     monitors = repo.list()
     assert len(monitors) == 2
-    created = next(m for m in monitors if m.definition.name == 'created-in-ui')
-    assert not created.enabled and created.definition.source_timezone is None
-    assert created.definition.cluster_id == created.definition.cluster_alias == 'logical-alias'
-    assert created.definition.document_cluster_id == document_cluster_id
+    created = next(m for m in monitors if m.definition.name == 'app')
+    assert created.enabled and created.definition.source_timezone is None
+    assert created.definition.cluster_id == created.definition.cluster_alias == 'profile'
+    assert created.definition.document_cluster_id is None
+    assert created.definition.initial_start == BASE and created.definition.container is None
+    assert created.definition.interval_seconds == created.definition.window_seconds == 900
     assert app.session_state['expanded_monitor_id'] == created.id
     assert not app.session_state['create_form_open']
     assert not any(item.key == 'monitor_name_new' for item in app.text_input)
@@ -166,7 +184,7 @@ def test_create_disabled_and_edit_monitor_from_form(monitoring_ui, document_clus
     app.button(key='save_monitor_' + created.id).click().run()
     assert not app.exception
     assert repo.get(created.id).definition.name == 'edited-in-ui'
-    assert repo.get(created.id).definition.document_cluster_id == document_cluster_id
+    assert repo.get(created.id).definition.document_cluster_id is None
     assert app.session_state['monitor_edit_mode'] is None
     assert not repo.history(created.id) and not ui.sources
 
@@ -212,12 +230,12 @@ def test_create_form_toggle_cancel_and_reopen_reset_without_mutation(monitoring_
     assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
     app.button(key='new_monitor').click().run()
     assert app.session_state['create_form_open']
-    app.text_input(key='monitor_name_new').set_value('abandoned')
+    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
     app.button(key='cancel_monitor_new').click().run()
     assert not app.session_state['create_form_open']
     assert repo.list() == [monitor]
     app.button(key='new_monitor').click().run()
-    assert app.text_input(key='monitor_name_new').value == ''
+    assert app.selectbox(key='monitor_field_new_namespace').value is None
     app.button(key='new_monitor').click().run()
     assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
     assert repo.list() == [monitor]
@@ -229,19 +247,17 @@ def test_creation_resets_fields_and_refreshes_clickable_list(monitoring_ui):
     app = ui.app()
     app.button(key='start_monitors').click().run()
     app.button(key='new_monitor').click().run()
-    app.text_input(key='monitor_name_new').set_value('new monitor')
-    app.text_input(key='monitor_field_new_namespace').set_value('other-namespace')
-    app.text_input(key='monitor_field_new_workload').set_value('other-workload')
+    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
+    app.selectbox(key='monitor_field_new_workload').set_value('other-workload').run()
     app.button(key='save_monitor_new').click().run()
     assert not app.exception
-    created = next(item for item in repo.list() if item.definition.name == 'new monitor')
+    created = next(item for item in repo.list() if item.definition.name == 'other-workload')
     assert app.session_state['expanded_monitor_id'] == created.id
     assert not app.session_state['create_form_open']
     assert app.button(key='monitor_row_' + created.id)
     app.button(key='new_monitor').click().run()
-    assert app.text_input(key='monitor_name_new').value == ''
-    assert app.text_input(key='monitor_field_new_namespace').value == ''
-    assert app.text_input(key='monitor_field_new_workload').value == ''
+    assert app.selectbox(key='monitor_field_new_namespace').value is None
+    assert not any(item.key == 'monitor_field_new_workload' for item in app.selectbox)
     assert not ui.sources and not ui.files and not ui.packages
     assert_safe(app)
 
@@ -258,13 +274,13 @@ def test_duplicate_name_actions_use_expanded_monitor_id(monitoring_ui, action):
         app.button(key='edit_monitor_' + second.id).click().run()
         assert app.session_state['monitor_edit_mode'] == second.id
         app.text_input(key='monitor_name_' + second.id).set_value('changed second')
-        app.text_input(key='monitor_field_' + second.id + '_namespace').set_value('changed-ns')
+        app.selectbox(key='monitor_field_' + second.id + '_namespace').set_value('changed-ns').run()
         if action == 'cancel_edit':
             app.button(key='cancel_monitor_' + second.id).click().run()
             assert repo.get(second.id) == second
             app.button(key='edit_monitor_' + second.id).click().run()
             assert app.text_input(key='monitor_name_' + second.id).value == second.definition.name
-            assert app.text_input(key='monitor_field_' + second.id + '_namespace').value == 'ns'
+            assert app.selectbox(key='monitor_field_' + second.id + '_namespace').value == 'ns'
         else:
             app.button(key='save_monitor_' + second.id).click().run()
             assert repo.get(second.id).definition.name == 'changed second'
@@ -337,7 +353,7 @@ def test_empty_list_and_archived_only_list_are_clear(monitoring_ui):
     app.button(key='start_monitors').click().run()
     assert any('No monitors to show' in item.value for item in app.info)
     app.button(key='new_monitor').click().run()
-    assert app.session_state['create_form_open'] and app.text_input(key='monitor_name_new')
+    assert app.session_state['create_form_open'] and app.selectbox(key='monitor_field_new_namespace')
     app.button(key='cancel_monitor_new').click().run()
     app.checkbox(key='show_archived').check().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
@@ -354,13 +370,13 @@ def test_failed_run_and_no_successful_investigation_empty_state(monitoring_ui):
     app.button(key='start_monitors').click().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
     assert any('Last run:' in item.value and 'FAILED' in item.value for item in app.markdown)
-    history = next(item.value for item in app.tabs[1].dataframe if 'Window' in item.value)
-    assert list(history.columns) == ['Window', 'Status', 'Duration', 'Records', 'Logical Events', 'Signals', 'Incidents']
-    diagnostics = next(item.value for item in app.tabs[1].dataframe if 'Error' in item.value)
+    history = next(item.value for item in app.tabs[2].dataframe if 'Window' in item.value)
+    assert list(history.columns) == ['Window', 'Status', 'Logs', 'Logical Events', 'Signals', 'Incidents']
+    diagnostics = next(item.value for item in app.tabs[2].dataframe if 'Error' in item.value)
     assert diagnostics.iloc[0]['Run'] == run.id and diagnostics.iloc[0]['Error'] == 'OPENSEARCH_TIMEOUT'
     assert any('OPENSEARCH_TIMEOUT' in item.value for item in app.error)
     assert any('No successful runs' in item.value for item in app.info)
-    assert not any(item.key == 'selected_run_id' for item in app.selectbox)
+    assert app.selectbox(key='selected_run_id').value == run.id
     assert repo.result(run.id) is None
     assert_safe(app)
 
@@ -382,6 +398,94 @@ def test_status_refresh_never_constructs_pipeline_or_queries_source(monitoring_u
     assert repo.get(monitor.id) == monitor
     assert not ui.sources and not ui.files and not ui.packages
     assert_safe(app)
+
+
+def test_selectors_reset_dependent_workload_and_container_refreshes_validation(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='new_monitor').click().run()
+    assert app.button(key='save_monitor_new').disabled
+    app.selectbox(key='monitor_field_new_namespace').set_value('ns').run()
+    app.selectbox(key='monitor_field_new_workload').set_value('app').run()
+    app.selectbox(key='monitor_field_new_container').set_value('sidecar').run()
+    assert ui.target_calls[-1] == ('validate', 'ns', 'app', 'sidecar')
+    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
+    assert app.selectbox(key='monitor_field_new_workload').value is None
+    assert app.button(key='save_monitor_new').disabled
+    assert repo.list() == [monitor]
+
+
+def test_history_locks_target_preserves_watermark_and_clones_new_identity(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.domain import RunCounts
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    repo.succeed(run, {'stats': {}, 'signals': [], 'source_summary': {}}, RunCounts(), {}, now=BASE)
+    before = repo.get(monitor.id)
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    app.button(key='edit_monitor_' + monitor.id).click().run()
+    assert app.text_input(key='monitor_field_' + monitor.id + '_namespace').disabled
+    assert app.text_input(key='monitor_field_' + monitor.id + '_workload').disabled
+    assert not ui.target_calls
+    assert any('Target cannot be changed' in item.value for item in app.caption)
+    app.selectbox(key='monitor_field_' + monitor.id + '_interval').set_value('30 minutes').run()
+    app.button(key='save_monitor_' + monitor.id).click().run()
+    changed = repo.get(monitor.id)
+    assert changed.definition.interval_seconds == 1800
+    assert changed.definition.window_seconds == 900
+    assert changed.last_successful_end == before.last_successful_end
+    assert repo.result(run.id) == {'stats': {}, 'signals': [], 'source_summary': {}}
+    app.button(key='clone_monitor_' + monitor.id).click().run()
+    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
+    app.selectbox(key='monitor_field_new_workload').set_value('other-workload').run()
+    app.button(key='save_monitor_new').click().run()
+    created = next(m for m in repo.list() if m.id != monitor.id)
+    assert created.definition.workload == 'other-workload' and created.enabled
+    assert created.last_successful_end is None and not repo.history(created.id)
+    assert repo.get(monitor.id) == changed
+    assert not app.exception
+
+
+def test_run_selection_opens_exact_persisted_evidence_without_queries(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.domain import RunCounts
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run1 = repo.claim(BASE + timedelta(minutes=17))
+    repo.succeed(run1, {'stats': {}, 'signals': [], 'source_summary': {'resolved_index': 'first-index'}},
+                 RunCounts(events_retrieved=3), {}, now=BASE + timedelta(minutes=17))
+    run2 = repo.claim(BASE + timedelta(minutes=32))
+    repo.succeed(run2, {'stats': {}, 'signals': [], 'source_summary': {'resolved_index': 'second-index'}},
+                 RunCounts(events_retrieved=5), {}, now=BASE + timedelta(minutes=32))
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    app.selectbox(key='selected_run_id').set_value(run1.id).run()
+    assert any('first-index' in item.value for item in app.json)
+    assert not any('second-index' in item.value for item in app.json)
+    assert not ui.target_calls and not ui.sources
+    assert not app.exception
+
+
+def test_failed_run_displays_persisted_safe_acquisition_diagnostics(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    repo.set_enabled(monitor.id, True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    repo.fail(run, 'ACQUISITION_LIMIT', now=BASE, diagnostics={
+        'source_profile': 'profile', 'resolved_index': 'persisted-failed-index',
+        'records_read': 2000, 'pages_read': 20, 'budget_reached': True,
+        'effective_query': {'bool': {'filter': [{'term': {'namespace': 'ns'}}]}},
+        'password': 'must-not-render'})
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert any('persisted-failed-index' in item.value and '2000' in item.value for item in app.json)
+    assert not any('must-not-render' in item.value for item in app.json)
+    assert repo.get(monitor.id).last_successful_end is None and repo.result(run.id) is None
+    assert 'must-not-render' not in str(repo.acquisition_diagnostics(run.id))
+    assert not ui.target_calls and not ui.sources and not app.exception
 
 
 @pytest.mark.parametrize('possible,confirmed', [(2, 0), (0, 0), (1, 2)])

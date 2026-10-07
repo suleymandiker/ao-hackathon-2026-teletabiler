@@ -10,7 +10,7 @@ module does not establish global key uniqueness across arbitrary index sets.
 
 import base64
 import binascii
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -83,6 +83,41 @@ def _unique_object(pairs):
             raise ValueError("Duplicate JSON key")
         result[key] = value
     return result
+
+
+def resolve_exact_mapping(client, start, end, *, names=('namespace', 'workload', 'container')):
+    """Resolve exact fields from the acquired indices, never from value guesses.
+
+    OpenShift can map the base field as keyword, without a .keyword subfield.
+    Preserve configured exact fields when valid; otherwise admit only a verified
+    keyword base field. An unmapped/text/conflicting field is a query failure,
+    not an empty workload. No analyzed match or broader filter is substituted.
+    """
+    config = client.config
+    mapping = config.field_mapping
+    index = resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy)
+    fields = sorted({getattr(mapping, name + suffix) for name in names for suffix in ('', '_exact')})
+    response = client.post_json('/' + quote(index, safe='*,.-_') + '/_field_caps', {'fields': fields})
+    capabilities = response.get('fields')
+    if not isinstance(capabilities, dict) or response.get('failures'):
+        raise OpenSearchSourceError('Exact field mapping unavailable')
+
+    def exact(field):
+        types = capabilities.get(field, {})
+        if set(types) != {'keyword'}:
+            return False
+        info = types['keyword']
+        return (info.get('searchable') is True and info.get('aggregatable') is True
+                and not info.get('non_searchable_indices') and not info.get('non_aggregatable_indices'))
+
+    changes = {}
+    for name in names:
+        configured, base = getattr(mapping, name + '_exact'), getattr(mapping, name)
+        selected = configured if exact(configured) else base if exact(base) else None
+        if selected is None:
+            raise OpenSearchSourceError('Required exact field is unmapped or incompatible')
+        changes[name + '_exact'] = selected
+    return replace(config, field_mapping=replace(mapping, **changes))
 
 
 class OpenSearchSource:

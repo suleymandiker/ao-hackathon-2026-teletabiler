@@ -1,5 +1,6 @@
 """Compact monitor console primitives; dynamic values are escaped at this boundary."""
 from theme import e
+from datetime import datetime, timezone
 
 
 # Key-scoped selectors leave other application buttons and the sidebar untouched.
@@ -56,7 +57,7 @@ CSS = """
 
 
 def pill(label):
-    tone = label.lower() if label in {'ACTIVE', 'PAUSED', 'ARCHIVED', 'SUCCESS', 'FAILED', 'ERROR', 'RUNNING'} else 'neutral'
+    tone = label.lower() if label in {'ACTIVE', 'PAUSED', 'ARCHIVED', 'SUCCESS', 'FAILED', 'ERROR', 'RUNNING'} else 'active' if label == 'HEALTHY' else 'paused' if label == 'ATTENTION' else 'neutral'
     return f'<span class="monitor-pill monitor-pill--{tone}">{e(label)}</span>'
 
 
@@ -64,16 +65,35 @@ def interval(seconds):
     return f'{seconds // 60} min' if seconds % 60 == 0 else f'{seconds} s'
 
 
+def relative(value, *, future=False):
+    if value is None:
+        return 'Never'
+    seconds = max(0, int(((value - datetime.now(timezone.utc)) if future else (datetime.now(timezone.utc) - value)).total_seconds()))
+    text = f'{seconds}s' if seconds < 60 else f'{seconds // 60} min' if seconds < 3600 else f'{seconds // 3600} h'
+    return 'in ' + text if future else text + ' ago'
+
+
+def operational(run):
+    if run is None or run.status.value != 'SUCCESS':
+        return None
+    return 'ATTENTION' if run.counts.incidents or run.counts.qualified_signals else 'HEALTHY'
+
+
 def monitor_row(monitor, run, expanded, redact):
     d = monitor.definition
     state = 'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED'
-    next_run = monitor.next_run_at.strftime('%d %b %H:%M UTC') if monitor.enabled and not monitor.archived else 'Not scheduled'
+    next_run = relative(monitor.next_run_at, future=True) if monitor.enabled and not monitor.archived else 'Not scheduled'
     classes = 'monitor-row' + (' monitor-row--expanded' if expanded else '') + (' monitor-row--archived' if monitor.archived else '')
     name, scope = e(redact(d.name)), e(redact(d.namespace + ' / ' + d.workload))
-    return (f'<div class="{classes}">{pill(state)}'
+    result = operational(run)
+    badge = result if state == 'ACTIVE' and result else state
+    logs = (f'{run.counts.events_retrieved:,} · ' + ('flowing' if run.counts.events_retrieved else 'no logs')) if run and run.status.value == 'SUCCESS' else 'Unknown'
+    findings = f'{run.counts.qualified_signals} signals · {run.counts.incidents} incidents' if run and run.status.value == 'SUCCESS' else 'Awaiting analysis'
+    return (f'<div class="{classes}">{pill(badge)}'
             f'<div class="monitor-identity"><strong title="{name}">{name}</strong><small title="{scope}">{scope}</small></div>'
-            f'<div class="monitor-runtime">Last run: {pill(run.status.value) if run else "No runs"}'
-            f'<small>{e(interval(d.interval_seconds))} · Next: {e(next_run)}</small></div>'
+            f'<div class="monitor-runtime">{pill(state)} · Last run: {pill(run.status.value) if run else "No runs"}'
+            f'<small>Last check {e(relative(run.actual_finished_at or run.actual_started_at) if run else "Never")} · Logs {e(logs)}</small>'
+            f'<small>Findings {e(findings)} · Next run {e(next_run)}</small></div>'
             f'<span class="monitor-caret" aria-hidden="true">{"⌄" if expanded else "›"}</span></div>')
 
 
@@ -83,12 +103,15 @@ def fields(rows, redact):
 
 
 def kpis(monitor, latest):
-    def stamp(value):
-        return value.strftime('%d %b %H:%M UTC') if value else 'None'
-    rows = [('Last Run', latest.status.value if latest else 'No runs'),
-            ('Last Successful End', stamp(monitor.last_successful_end)),
-            ('Next Run', stamp(monitor.next_run_at) if monitor.enabled and not monitor.archived else 'Not scheduled'),
-            ('Interval', interval(monitor.definition.interval_seconds)),
-            ('Records / Events', f'{latest.counts.events_retrieved} / {latest.counts.logical_events}' if latest else '—')]
+    successful = latest is not None and latest.status.value == 'SUCCESS'
+    rows = [('Monitoring', 'Archived' if monitor.archived else 'Active' if monitor.enabled else 'Paused'),
+            ('Log flow', ('Flowing' if latest.counts.events_retrieved else 'No logs in last window') if successful else 'Unknown'),
+            ('Last analysis', latest.status.value if latest else 'No runs'),
+            ('Analysis age', relative(latest.actual_finished_at or latest.actual_started_at) if latest else 'Never'),
+            ('Logs analyzed', f'{latest.counts.events_retrieved:,}' if successful else '—'),
+            ('Logical events', str(latest.counts.logical_events) if successful else '—'),
+            ('Signals', str(latest.counts.qualified_signals) if successful else '—'),
+            ('Incidents', str(latest.counts.incidents) if successful else '—'),
+            ('Next run', relative(monitor.next_run_at, future=True) if monitor.enabled and not monitor.archived else 'Not scheduled')]
     return '<div class="monitor-kpis">' + ''.join(
         f'<div><small>{e(label)}</small><strong>{e(value)}</strong></div>' for label, value in rows) + '</div>'

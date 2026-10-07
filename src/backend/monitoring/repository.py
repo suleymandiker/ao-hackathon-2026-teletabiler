@@ -28,9 +28,10 @@ class MonitorRepository(Protocol):
     def claim(self, now: datetime) -> MonitorRun | None: ...
     def recover_running(self, now: datetime) -> None: ...
     def succeed(self, run: MonitorRun, result: dict, counts: RunCounts, receipts: dict[str, str], *, now: datetime) -> None: ...
-    def fail(self, run: MonitorRun, category: str, *, now: datetime) -> None: ...
+    def fail(self, run: MonitorRun, category: str, *, now: datetime, diagnostics: dict | None = None) -> None: ...
     def history(self, monitor_id: str, limit: int = 100) -> list[MonitorRun]: ...
     def result(self, run_id: str) -> dict | None: ...
+    def acquisition_diagnostics(self, run_id: str) -> dict | None: ...
     def consumed(self, monitor_id: str, since: datetime) -> set[str]: ...
 
 
@@ -60,7 +61,7 @@ class SQLiteMonitorRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2):
+            if version not in (0, 1, 2, 3):
                 raise ValueError('Unsupported monitoring schema version')
             # Refuse accidental use of an existing policy/template database.
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -94,7 +95,12 @@ class SQLiteMonitorRepository:
             columns = {row['name'] for row in db.execute('PRAGMA table_info(monitors)')}
             if 'archived' not in columns:
                 db.execute('ALTER TABLE monitors ADD COLUMN archived INTEGER NOT NULL DEFAULT 0')
-            db.execute('PRAGMA user_version=2')
+            # Additive v3: latest failed-attempt acquisition snapshot. Existing
+            # runs default to NULL; historical results/evidence are untouched.
+            run_columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
+            if 'acquisition_diagnostics' not in run_columns:
+                db.execute('ALTER TABLE monitor_runs ADD COLUMN acquisition_diagnostics TEXT')
+            db.execute('PRAGMA user_version=3')
 
     @contextmanager
     def _transaction(self):
@@ -209,11 +215,14 @@ class SQLiteMonitorRepository:
                 if existing:
                     run_id = existing['id']
                     db.execute("""UPDATE monitor_runs SET status='RUNNING', claim_token=?, started_at=?,
-                        finished_at=NULL, attempts=attempts+1, error_category=NULL,error_summary=NULL WHERE id=?""",
+                         finished_at=NULL, attempts=attempts+1, error_category=NULL,error_summary=NULL,
+                         acquisition_diagnostics=NULL WHERE id=?""",
                         (token, now.isoformat(), run_id))
                 else:
                     run_id = new_id()
-                    db.execute('INSERT INTO monitor_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
+                    db.execute('''INSERT INTO monitor_runs (id,monitor_id,window_start,window_end,definition,
+                        started_at,finished_at,created_at,status,claim_token,attempts,counts,result_reference,error_category,error_summary)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
                         run_id, monitor.id, window.start.isoformat(), window.end.isoformat(), definition_json(monitor.definition),
                         now.isoformat(), None, now.isoformat(), 'RUNNING', token, 1, encode(asdict(RunCounts())), None, None, None))
                 db.execute("UPDATE monitors SET status='RUNNING',updated_at=?,revision=revision+1 WHERE id=?", (now.isoformat(), monitor.id))
@@ -251,15 +260,22 @@ class SQLiteMonitorRepository:
             cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
             db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?', (run.monitor_id, cutoff.isoformat()))
 
-    def fail(self, run, category, *, now):
+    def fail(self, run, category, *, now, diagnostics=None):
         category = category if category in MESSAGES else 'UNKNOWN'
+        payload = None
+        if diagnostics is not None:
+            # Executor already removes runtime credentials. Reapply the existing
+            # safe projection at the storage boundary for alternate callers.
+            from opensearch_application import presentation_result
+            payload = encode(presentation_result({}, diagnostics, None)['source_summary'])
         now = utc(now)
         with self._transaction() as db:
             if not self._owned(db, run):
                 return
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
-            db.execute("UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=? WHERE id=?",
-                       (now.isoformat(), category, MESSAGES[category], run.id))
+            db.execute("""UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=?,
+                       acquisition_diagnostics=? WHERE id=?""",
+                       (now.isoformat(), category, MESSAGES[category], payload, run.id))
             db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
                 revision=revision+1 WHERE id=?''', ('ARCHIVED' if monitor.archived else 'ERROR' if monitor.enabled else 'PAUSED',
                 (now + timedelta(seconds=monitor.definition.interval_seconds)).isoformat(), category, MESSAGES[category], now.isoformat(), run.monitor_id))
@@ -283,6 +299,11 @@ class SQLiteMonitorRepository:
         with self._transaction() as db:
             row = db.execute('SELECT payload FROM monitor_results WHERE run_id=?', (run_id,)).fetchone()
             return json.loads(row[0]) if row else None
+
+    def acquisition_diagnostics(self, run_id):
+        with self._transaction() as db:
+            row = db.execute('SELECT acquisition_diagnostics FROM monitor_runs WHERE id=?', (run_id,)).fetchone()
+            return json.loads(row[0]) if row and row[0] else None
 
     def consumed(self, monitor_id, since):
         with self._transaction() as db:

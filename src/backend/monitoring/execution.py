@@ -9,7 +9,7 @@ import os
 
 import opensearch_application as application
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
-from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError
+from ingestion_layer.opensearch_source import OpenSearchSource, OpenSearchSourceError, resolve_exact_mapping
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
@@ -150,13 +150,45 @@ class OpenSearchMonitorExecutor:
                        page_size=definition.page_size, max_pages=definition.max_pages,
                        record_budget=definition.page_size * definition.max_pages)
         ownership = WindowOwnership(run, consumed)
+        def query_diagnostics(mapping):
+            filters = [{'range': {mapping.timestamp: {'gte': start.isoformat(), 'lt': end.isoformat()}}},
+                       {'term': {mapping.namespace_exact: definition.namespace}},
+                       {'term': {mapping.workload_exact: definition.workload}}]
+            if definition.container:
+                filters.append({'term': {mapping.container_exact: definition.container}})
+            if definition.document_cluster_id:
+                filters.append({'term': {mapping.cluster_id_exact: definition.document_cluster_id}})
+            summary.update(effective_query={'bool': {'filter': filters}},
+                           document_cluster_filter_active=definition.document_cluster_id is not None,
+                           sort_fields=[mapping.timestamp, mapping.sequence])
+        query_diagnostics(config.field_mapping)
+        summary['mapping_verified'] = False
+        summary['query_executed'] = False
+        def failure(category):
+            summary['unique_records'] = len(seen)
+            if category == 'ACQUISITION_LIMIT':
+                summary.update(budget_reached=True, stop_reason='acquisition_limit')
+            elif category.startswith('OPENSEARCH'):
+                summary['stop_reason'] = 'acquisition_failed'
+            error = MonitoringError(category)
+            error.acquisition_diagnostics = redact_ai_secret(application.presentation_result({}, summary, config)['source_summary'])
+            return error
         try:
             # Acquire all bounded pages before any learning. A page cap is a
             # failed run, never a successful partial window/watermark advance.
             pages, seen, cursor = [], set(), None
             with self.client_factory(config) as client:
+                if self.source_factory is OpenSearchSource:
+                    names = ('namespace', 'workload') + (('container',) if definition.container else ())
+                    if definition.document_cluster_id:
+                        names += ('cluster_id',)
+                    config = resolve_exact_mapping(client, start, end, names=names)
+                    client.config = config
+                    query_diagnostics(config.field_mapping)
+                    summary['mapping_verified'] = True
                 source = self.source_factory(client)
                 for _ in range(definition.max_pages):
+                    summary['query_executed'] = True
                     page = source.read_page(start=start, end=end, namespace=definition.namespace,
                                             workload=definition.workload, container=definition.container,
                                             cluster_id=definition.document_cluster_id, page_size=definition.page_size, cursor=cursor)
@@ -199,19 +231,19 @@ class OpenSearchMonitorExecutor:
                 else:
                     raise MonitoringError('ACQUISITION_LIMIT')
             summary['unique_records'] = len(seen)
-        except MonitoringError:
-            raise
+        except MonitoringError as error:
+            raise failure(error.category) from None
         except OpenSearchClientError as error:
             text = str(error)
             category = ('OPENSEARCH_AUTH' if text in ('OpenSearch HTTP failure (401)', 'OpenSearch HTTP failure (403)')
                         else 'OPENSEARCH_TIMEOUT' if text == 'OpenSearch connection or timeout failure'
                         else 'OPENSEARCH_QUERY')
-            raise MonitoringError(category) from None
+            raise failure(category) from None
         except OpenSearchSourceError as error:
             category = 'OPENSEARCH_TIMEOUT' if str(error) == 'Search timed out or lacks completion evidence' else 'OPENSEARCH_QUERY'
-            raise MonitoringError(category) from None
+            raise failure(category) from None
         except Exception:
-            raise MonitoringError('OPENSEARCH_QUERY') from None
+            raise failure('OPENSEARCH_QUERY') from None
 
         if seen:
             try:
@@ -220,7 +252,7 @@ class OpenSearchMonitorExecutor:
                 resolution = VerifiedPolicyResolver().resolve(sample, self.policy_loader())
                 summary['policy_selection'] = resolution.diagnostics()
             except (PolicyResolutionError, application.ApplicationError):
-                raise MonitoringError('POLICY') from None
+                raise failure('POLICY') from None
             snapshot = resolution.snapshot
         else:
             snapshot = None
@@ -234,6 +266,8 @@ class OpenSearchMonitorExecutor:
                 if any(count for reason, count in reasons.items() if reason != 'blank_context'):
                     raise MonitoringError('POLICY')
             summary['window_assembly'] = ownership.diagnostics
+            summary['pattern_count'] = len({row['template_id'] for row in result.get('signals', [])
+                                            if row.get('template_id') is not None})
             if 'event_provenance' in result:
                 summary['boundary_quality'] = build_boundary_quality(result['event_provenance'])
             stats = result['stats']
@@ -245,7 +279,7 @@ class OpenSearchMonitorExecutor:
             presentation = redact_ai_secret(application.presentation_result(result, summary, config))
             presentation['detailed_pipeline_trace'] = trace.finish(result)
             return ExecutionResult(presentation, counts, ownership.receipts)
-        except MonitoringError:
-            raise
+        except MonitoringError as error:
+            raise failure(error.category) from None
         except Exception:
-            raise MonitoringError('PIPELINE') from None
+            raise failure('PIPELINE') from None

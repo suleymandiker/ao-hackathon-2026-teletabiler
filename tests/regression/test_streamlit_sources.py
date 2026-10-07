@@ -44,6 +44,9 @@ def ui(monkeypatch, tmp_path):
     import ai_engine
     import full_pipeline_v2
     import opensearch_application as boundary
+    import application_environment
+    # Entrypoint reruns must not refill missing fixture keys from real .env.
+    monkeypatch.setattr(application_environment, 'load_environment', lambda: None)
     from segmentation_layer.contracts import SegmentationPolicy
     from template_layer.engine import DrainCandidateMiner, ValidatedTemplateRegistry
 
