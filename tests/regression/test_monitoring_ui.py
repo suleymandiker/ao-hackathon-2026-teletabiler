@@ -11,6 +11,62 @@ REAL_CONNECT = sqlite3.connect
 BASE = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
 
 
+def test_console_filters_loaded_definitions_and_preserves_expansion(monitoring_ui):
+    from dataclasses import replace
+    ui, repo, first = monitoring_ui
+    active = repo.create(replace(first.definition, name='API health', namespace='payments', workload='checkout'), enabled=True, now=BASE)
+    archived = repo.create(replace(first.definition, name='retired'), now=BASE)
+    repo.archive(archived.id, now=BASE)
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='monitor_row_' + active.id).click().run()
+    for query in ('API', 'PAYMENTS', 'checkout', 'payments checkout'):
+        app.text_input(key='monitor_search').set_value(query).run()
+        rows = [b.key for b in app.button if b.key.startswith('monitor_row_')]
+        assert rows == ['monitor_row_' + active.id]
+    app.text_input(key='monitor_search').set_value('no match').run()
+    assert any('No monitors match' in item.value for item in app.info)
+    assert app.session_state['expanded_monitor_id'] == active.id
+    app.text_input(key='monitor_search').set_value('').run()
+    for status, expected in [('Paused', first.id), ('Active', active.id), ('Archived', archived.id)]:
+        app.selectbox(key='monitor_status_filter').set_value(status).run()
+        assert [b.key for b in app.button if b.key.startswith('monitor_row_')] == ['monitor_row_' + expected]
+        app.button(key='refresh_monitors').click().run()
+        assert app.selectbox(key='monitor_status_filter').value == status
+    assert not app.exception
+    assert not ui.sources and not ui.files and not ui.packages
+    assert_safe(app)
+
+
+def test_console_row_hierarchy_escaping_and_native_tabs(monitoring_ui):
+    from dataclasses import replace
+    import monitoring_style as style
+    ui, repo, monitor = monitoring_ui
+    unsafe = replace(monitor, definition=replace(monitor.definition, name='<img src=x onerror=alert(1)>'))
+    markup = style.monitor_row(unsafe, None, False, lambda value: value)
+    assert '<img' not in markup and '&lt;img' in markup
+    assert 'monitor-identity' in markup and '<strong' in markup and '<small' in markup
+    assert 'monitor-pill--paused' in markup and 'PAUSED' in markup
+    assert 'Not scheduled' in markup and 'No runs' in markup
+    assert 'text-align:left' in style.CSS and ':focus-visible' in style.CSS
+    app = ui.app()
+    app.button(key='start_monitors').click().run()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert [tab.label for tab in app.tabs] == ['Overview', 'Runs', 'Investigation', 'Pipeline Trace', 'Configuration']
+    assert app.tabs[0].button(key='toggle_monitor_' + monitor.id)
+    assert app.tabs[1].subheader[0].value == 'Run History'
+    assert app.tabs[4].button(key='edit_configuration_' + monitor.id)
+    assert any('Administration' in item.label for item in app.tabs[0].expander)
+    assert 'Archive' not in app.button(key='toggle_monitor_' + monitor.id).label
+    # AppTest exposes tab contents but has no tab-click API. Browser validation
+    # covers switching tabs and retaining the active tab across Refresh.
+    assert app.session_state['monitor_tabs_' + monitor.id] == 'Overview'
+    app.tabs[4].button(key='edit_configuration_' + monitor.id).click().run()
+    assert app.session_state['monitor_edit_mode'] == monitor.id
+    assert not app.exception
+    assert_safe(app)
+
+
 @pytest.fixture
 def monitoring_ui(ui, monkeypatch, tmp_path):
     def connect(path, *args, **kwargs):
@@ -37,7 +93,7 @@ def test_persisted_monitors_render_without_source_config_and_toggle(monitoring_u
     assert not app.exception
     assert app.title[0].value == 'Deployment Monitors'
     assert any('Source unavailable' in item.value for item in app.warning)
-    assert any('PAUSED' in item.value for item in app.text)
+    assert any('PAUSED' in item.value for item in app.markdown)
     assert len(repo.history(monitor.id)) == 0
     app.button(key='toggle_monitor_' + monitor.id).click().run()
     assert repo.get(monitor.id).enabled
@@ -64,7 +120,7 @@ def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
     app.button(key='monitor_row_' + monitor.id).click().run()
     assert app.selectbox(key='selected_run_id').value == run.id
     assert any(item.value == 'Investigation sonucu' for item in app.title)
-    assert any('Last successful end: 2026-10-05T12:15:00+00:00' == item.value for item in app.text)
+    assert any('Last Successful End' in item.value and '05 Oct 12:15 UTC' in item.value for item in app.markdown)
     technical = next(item.value for item in app.dataframe
                      if 'Gösterge' in item.value and 'İndeks' in item.value['Gösterge'].values)
     details = dict(zip(technical['Gösterge'], technical['Değer']))
@@ -153,7 +209,7 @@ def test_create_form_toggle_cancel_and_reopen_reset_without_mutation(monitoring_
     ui, repo, monitor = monitoring_ui
     app = ui.app()
     app.button(key='start_monitors').click().run()
-    assert not app.session_state['create_form_open'] and not app.text_input
+    assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
     app.button(key='new_monitor').click().run()
     assert app.session_state['create_form_open']
     app.text_input(key='monitor_name_new').set_value('abandoned')
@@ -163,7 +219,7 @@ def test_create_form_toggle_cancel_and_reopen_reset_without_mutation(monitoring_
     app.button(key='new_monitor').click().run()
     assert app.text_input(key='monitor_name_new').value == ''
     app.button(key='new_monitor').click().run()
-    assert not app.session_state['create_form_open'] and not app.text_input
+    assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
     assert repo.list() == [monitor]
     assert_safe(app)
 
@@ -229,7 +285,7 @@ def test_archive_confirmation_cancel_and_show_archived_keep_duplicate_independen
     app = ui.app()
     app.button(key='start_monitors').click().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert not any(button.label == 'Confirm delete' for button in app.button)
+    assert not any(button.label == 'Confirm archive' for button in app.button)
     app.button(key='delete_monitor_' + monitor.id).click().run()
     assert repo.get(monitor.id) == monitor
     assert app.session_state['delete_confirmation_monitor_id'] == monitor.id
@@ -248,7 +304,7 @@ def test_archive_confirmation_cancel_and_show_archived_keep_duplicate_independen
     assert repo.get(duplicate.id) == duplicate
     app.checkbox(key='show_archived').check().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('ARCHIVED' in item.value for item in app.text)
+    assert any('ARCHIVED' in item.value for item in app.markdown)
     assert not any(button.key in {'toggle_monitor_' + monitor.id, 'edit_monitor_' + monitor.id,
                                  'delete_monitor_' + monitor.id} for button in app.button)
     app.checkbox(key='show_archived').uncheck().run()
@@ -266,11 +322,11 @@ def test_changing_monitors_clears_edit_delete_and_run_context(monitoring_ui):
     app.button(key='edit_monitor_' + first.id).click().run()
     app.button(key='monitor_row_' + second.id).click().run()
     assert app.session_state['monitor_edit_mode'] is None
-    assert not app.text_input
+    assert not [item for item in app.text_input if item.key != 'monitor_search']
     app.button(key='delete_monitor_' + second.id).click().run()
     app.button(key='monitor_row_' + first.id).click().run()
     assert app.session_state['delete_confirmation_monitor_id'] is None
-    assert not any(button.label == 'Confirm delete' for button in app.button)
+    assert not any(button.label == 'Confirm archive' for button in app.button)
     assert repo.list(include_archived=True) == sorted([first, second], key=lambda item: (item.created_at, item.id))
 
 
@@ -297,7 +353,11 @@ def test_failed_run_and_no_successful_investigation_empty_state(monitoring_ui):
     app = ui.app()
     app.button(key='start_monitors').click().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('Last run: FAILED' in item.value for item in app.text)
+    assert any('Last run:' in item.value and 'FAILED' in item.value for item in app.markdown)
+    history = next(item.value for item in app.tabs[1].dataframe if 'Window' in item.value)
+    assert list(history.columns) == ['Window', 'Status', 'Duration', 'Records', 'Logical Events', 'Signals', 'Incidents']
+    diagnostics = next(item.value for item in app.tabs[1].dataframe if 'Error' in item.value)
+    assert diagnostics.iloc[0]['Run'] == run.id and diagnostics.iloc[0]['Error'] == 'OPENSEARCH_TIMEOUT'
     assert any('OPENSEARCH_TIMEOUT' in item.value for item in app.error)
     assert any('No successful runs' in item.value for item in app.info)
     assert not any(item.key == 'selected_run_id' for item in app.selectbox)

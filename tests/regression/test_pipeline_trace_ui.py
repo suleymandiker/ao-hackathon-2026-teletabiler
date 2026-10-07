@@ -194,10 +194,13 @@ def test_completed_run_selection_loads_exact_persisted_investigation_and_trace(m
     app.button(key='start_monitors').click().run()
     assert not any(item.value == 'Run History' for item in app.subheader)
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert app.selectbox(key='selected_run_id').options == [saved[1][0].window.start.isoformat(), saved[0][0].window.start.isoformat()]
+    labels = app.selectbox(key='selected_run_id').options
+    assert len(labels) == 2
+    for label, (run, _, _) in zip(labels, reversed(saved)):
+        assert label.startswith(run.window.start.isoformat()) and label.endswith(run.id[:8]) and 'SUCCESS' in label
     assert app.selectbox(key='selected_run_id').value == saved[1][0].id
     table = next(item.value for item in app.dataframe if 'Window' in item.value)
-    assert list(table['logical_events']) == [2, 1]
+    assert list(table['Logical Events']) == [2, 1]
     for run, result, marker in saved:
         app.selectbox(key='selected_run_id').select(run.id).run()
         assert any(marker in item.value for item in app.json)
@@ -209,6 +212,11 @@ def test_completed_run_selection_loads_exact_persisted_investigation_and_trace(m
         assert app.session_state['expanded_monitor_id'] == monitor.id
         assert app.session_state['selected_run_id'] == run.id
         assert repo.result(run.id) == result
+        app.text_input(key='monitor_search').set_value('temporarily hidden').run()
+        assert app.session_state['selected_run_id'] == run.id
+        app.text_input(key='monitor_search').set_value('').run()
+        assert app.selectbox(key='selected_run_id').value == run.id
+        assert any(marker in item.value for item in app.json)
         assert_safe(app)
     # A worker can persist a newer window while the user inspects an older one.
     selected_id = app.session_state['selected_run_id']

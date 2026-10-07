@@ -163,7 +163,7 @@ def stage_details(view, *, trace=None, trace_key=None):
             stage_evidence(trace, stage.key, key=trace_key + '_' + stage.key)
 
 
-def investigation(view, *, trace=None, trace_key=None):
+def investigation(view, *, trace=None, trace_key=None, include_pipeline=True):
     st.title('Investigation sonucu')
     st.caption(view.source + (' · ' + view.target if view.target else ''))
     html(theme.summary(view))
@@ -189,8 +189,9 @@ def investigation(view, *, trace=None, trace_key=None):
         details(signal_stage.details)
         for reason, count in view.reason_counts:
             st.text(f'{count} · {reason}')
-    stage_details(view, trace=trace, trace_key=trace_key)
-    if trace_key is not None:
+    if include_pipeline:
+        stage_details(view, trace=trace, trace_key=trace_key)
+    if include_pipeline and trace_key is not None:
         from trace_views import event_lineage
         event_lineage(trace, key=trace_key)
     if view.timeline:

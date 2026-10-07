@@ -162,93 +162,96 @@ def monitor_form(repo, connection, redact, monitor=None):
             st.error('Monitoring storage is unavailable. Check database permissions and configuration.')
 
 
+def filter_monitors(monitors, query='', status='All'):
+    """Filter already loaded definitions only; enabled ERROR/RUNNING are active."""
+    words = query.casefold().split()
+    return [m for m in monitors
+            if all(word in ' '.join((m.definition.name, m.definition.namespace,
+                                      m.definition.workload)).casefold() for word in words)
+            and (status == 'All' or status == 'Archived' and m.archived
+                 or status == 'Active' and m.enabled and not m.archived
+                 or status == 'Paused' and not m.enabled and not m.archived)]
+
+
 def render(connection, redact):
-    st.title('Deployment Monitors')
-    st.caption('Define monitoring here. Start the independent worker to execute bounded windows; Refresh reads persisted status.')
+    import monitoring_style as style
+    st.markdown(style.CSS, unsafe_allow_html=True)
     for key, default in dict(expanded_monitor_id=None, selected_run_id=None, monitor_edit_mode=None,
                              create_form_open=False, show_archived=False,
                              delete_confirmation_monitor_id=None).items():
         st.session_state.setdefault(key, default)
+    # Preserve the ID even when a search temporarily hides its widget.
+    st.session_state['selected_run_id'] = st.session_state['selected_run_id']
+    title, refresh, create = st.columns([5, 1.3, 1.8], vertical_alignment='center')
+    with title:
+        st.title('Deployment Monitors')
+    with refresh:
+        st.button('Refresh', key='refresh_monitors', width='stretch')
+    with create:
+        st.button('+ New Monitor', key='new_monitor', type='primary', on_click=toggle_create, width='stretch')
+    search, status, archived = st.columns([3, 1.2, 1.6], vertical_alignment='bottom')
+    with search:
+        query = st.text_input('Search monitors', key='monitor_search', placeholder='Search name, namespace or workload…')
+    with status:
+        selected_status = st.selectbox('Status', ['All', 'Active', 'Paused', 'Archived'], key='monitor_status_filter')
+    with archived:
+        st.checkbox('Show archived', key='show_archived',
+                    help='Archived status also includes archived monitors automatically.')
     if connection is None:
         st.warning('Source unavailable: OpenSearch configuration is missing or invalid. Persisted monitors and history remain available. Configure OPENSEARCH_* in the application environment or repository .env, then restart the UI and worker.')
-    else:
-        st.info('Source configuration loaded. Connectivity is checked by the worker during acquisition.')
-    st.button('Refresh status', key='refresh_monitors')
-    st.checkbox('Show archived monitors', key='show_archived')
     try:
         repo = repository()
-        monitors = repo.list(include_archived=st.session_state['show_archived'])
+        monitors = repo.list(include_archived=st.session_state['show_archived'] or selected_status == 'Archived')
     except Exception:
         st.error('Monitoring storage is unavailable. Check AIOPS_MONITOR_DB and directory permissions.')
         return
     if st.session_state['expanded_monitor_id'] not in {monitor.id for monitor in monitors}:
         clear_monitor_selection()
-    st.button(('▾' if st.session_state['create_form_open'] else '▸') + ' New Monitor',
-              key='new_monitor', on_click=toggle_create)
     if st.session_state['create_form_open']:
         with st.container(border=True):
+            st.subheader('New monitor')
+            st.caption('Choose a workload and schedule. Execution is handled by the independent worker.')
             monitor_form(repo, connection, redact)
     if not monitors:
         st.info('No monitors to show. Create a monitor with New Monitor, or show archived monitors.')
         return
-    for monitor in monitors:
+    visible = filter_monitors(monitors, query, selected_status)
+    st.caption(f'{len(visible)} of {len(monitors)} monitors · Persisted status · Schedule times in UTC')
+    if not visible:
+        st.info('No monitors match these filters. Clear search or change Status.')
+    for monitor in visible:
         latest = repo.history(monitor.id, limit=1)
         run = latest[0] if latest else None
         expanded = st.session_state['expanded_monitor_id'] == monitor.id
-        with st.container(border=True):
-            st.button(('▾ ' if expanded else '▸ ') + redact(monitor.definition.name),
-                      key='monitor_row_' + monitor.id, on_click=toggle_details, args=(monitor.id,), width='stretch')
-            last_run = f'{run.status.value} · {run.actual_started_at.isoformat()}' if run else 'None'
-            st.caption(f'{monitor.status.value} · {redact(monitor.definition.namespace)} / '
-                       f'{redact(monitor.definition.workload)} · Last run: {last_run} · '
-                       f'Every {monitor.definition.interval_seconds}s')
+        with st.container(border=True, key='monitor_card_' + monitor.id):
+            with st.container(key='monitor_header_' + monitor.id):
+                st.markdown(style.monitor_row(monitor, run, expanded, redact), unsafe_allow_html=True)
+                st.button(('Collapse ' if expanded else 'Expand ') + redact(monitor.definition.name),
+                          key='monitor_row_' + monitor.id, on_click=toggle_details,
+                          args=(monitor.id,), width='stretch')
             if expanded:
                 monitor_details(repo, connection, redact, monitor, run)
 
 
-def monitor_details(repo, connection, redact, monitor, latest):
-    st.subheader('Status')
-    st.caption('Monitor ID: ' + monitor.id)
-    st.text(f'{monitor.status.value} | enabled={monitor.enabled}')
-    st.text('Last run: ' + (f'{latest.status.value} · {latest.actual_started_at.isoformat()}' if latest else 'None'))
-    st.text('Last successful end: ' + (monitor.last_successful_end.isoformat() if monitor.last_successful_end else 'None'))
-    st.text('Next run: ' + (monitor.next_run_at.isoformat() if monitor.enabled and not monitor.archived else 'Not scheduled'))
-    st.text(f'Interval / window: {monitor.definition.interval_seconds}s / {monitor.definition.window_seconds}s')
-    st.text('Source timezone: ' + (monitor.definition.source_timezone or 'Unknown'))
+def monitor_actions(repo, redact, monitor):
     if monitor.archived:
-        st.info('ARCHIVED — removed from active monitoring. Historical runs and evidence are preserved.')
-    elif not monitor.enabled:
-        st.info('Paused monitor. Historical runs and evidence remain available; no new windows are scheduled.')
-    if monitor.last_error_summary:
-        st.error(redact((monitor.last_error_category or 'UNKNOWN') + ': ' + monitor.last_error_summary))
-    st.subheader('Source Configuration')
-    definition = monitor.definition
-    st.text('source_scope: ' + redact(definition.source_profile))
-    st.caption('Index settings come from current application configuration; each investigation retains its run-time source settings.')
-    st.text('Index pattern: ' + (redact(connection.index_expression) if connection else 'Unavailable (source configuration missing)'))
-    st.text('Index strategy: ' + (connection.index_strategy if connection else 'Unavailable (source configuration missing)'))
-    st.text('Logical cluster alias: ' + redact(definition.cluster_alias))
-    st.text('Namespace: ' + redact(definition.namespace))
-    st.text('Deployment / workload: ' + redact(definition.workload))
-    st.text('Container: ' + redact(definition.container or 'All'))
-    if definition.document_cluster_id:
-        st.text('document_cluster_id: ' + redact(definition.document_cluster_id))
-    st.subheader('Actions')
-    if not monitor.archived:
-        left, middle, right = st.columns(3)
-        with left:
-            if st.button('Pause monitor' if monitor.enabled else 'Enable monitor', key='toggle_monitor_' + monitor.id):
-                try:
-                    repo.set_enabled(monitor.id, not monitor.enabled, now=now())
-                    st.rerun()
-                except (ValueError, KeyError):
-                    st.error('Monitor changed; refresh before changing its status.')
-        with middle:
-            st.button('Edit monitor', key='edit_monitor_' + monitor.id, on_click=open_edit, args=(monitor.id,))
-        with right:
-            if st.button('Delete monitor', key='delete_monitor_' + monitor.id):
-                st.session_state['delete_confirmation_monitor_id'] = monitor.id
-                st.session_state['monitor_edit_mode'] = None
+        st.caption('Archived monitors are read-only.')
+        return
+    left, right = st.columns([1, 3])
+    with left:
+        if st.button('Pause monitor' if monitor.enabled else 'Enable monitor', key='toggle_monitor_' + monitor.id):
+            try:
+                repo.set_enabled(monitor.id, not monitor.enabled, now=now())
+                st.rerun()
+            except (ValueError, KeyError):
+                st.error('Monitor changed; refresh before changing its status.')
+    with right:
+        st.button('Edit monitor', key='edit_monitor_' + monitor.id, on_click=open_edit, args=(monitor.id,))
+    with st.expander('Administration · Archive monitor'):
+        st.caption('Monitoring stops. Historical runs and evidence remain preserved.')
+        if st.button('Archive monitor', key='delete_monitor_' + monitor.id):
+            st.session_state['delete_confirmation_monitor_id'] = monitor.id
+            st.session_state['monitor_edit_mode'] = None
         if st.session_state['delete_confirmation_monitor_id'] == monitor.id:
             st.warning('This removes the monitor from active monitoring. Historical runs and evidence will be preserved.')
             cancel, confirm = st.columns(2)
@@ -257,47 +260,126 @@ def monitor_details(repo, connection, redact, monitor, latest):
                     st.session_state['delete_confirmation_monitor_id'] = None
                     st.rerun()
             with confirm:
-                if st.button('Confirm delete', key='confirm_delete_' + monitor.id):
+                if st.button('Confirm archive', key='confirm_delete_' + monitor.id):
                     repo.archive(monitor.id, now=now())
                     clear_monitor_selection()
                     st.rerun()
-        if st.session_state['monitor_edit_mode'] == monitor.id:
+
+
+def configuration(connection, redact, monitor):
+    import monitoring_style as style
+    d = monitor.definition
+    left, right = st.columns(2)
+    with left:
+        st.markdown(style.fields([
+            ('Source scope', d.source_profile), ('Namespace', d.namespace), ('Workload', d.workload),
+            ('Container', d.container or 'All'), ('Logical cluster alias', d.cluster_alias),
+            ('Document cluster UUID', d.document_cluster_id or 'No filter'),
+        ], redact), unsafe_allow_html=True)
+    with right:
+        st.markdown(style.fields([
+            ('Window', f'{d.window_seconds} s'), ('Interval', f'{d.interval_seconds} s'),
+            ('Ingestion delay', f'{d.ingestion_delay_seconds} s'), ('Overlap', f'{d.overlap_seconds} s'),
+            ('Source timezone', d.source_timezone or 'Unknown'),
+            ('Initial start', d.initial_start.isoformat()), ('Page size / maximum pages', f'{d.page_size} / {d.max_pages}'),
+        ], redact), unsafe_allow_html=True)
+    with st.expander('Source and monitor details'):
+        st.text('Monitor ID: ' + monitor.id)
+        st.text('Index pattern: ' + (redact(connection.index_expression) if connection else 'Unavailable'))
+        st.text('Index strategy: ' + (connection.index_strategy if connection else 'Unavailable'))
+        st.caption('Index settings come from current application configuration; each investigation retains its run-time source settings.')
+    if not monitor.archived:
+        st.button('Edit configuration', key='edit_configuration_' + monitor.id,
+                  on_click=open_edit, args=(monitor.id,))
+
+
+def monitor_details(repo, connection, redact, monitor, latest):
+    import monitoring_style as style
+    from trace_views import event_lineage
+    overview, history, investigation, trace_panel, config = st.tabs(
+        ['Overview', 'Runs', 'Investigation', 'Pipeline Trace', 'Configuration'],
+        key='monitor_tabs_' + monitor.id, on_change='rerun')
+    with overview:
+        st.subheader('Status')
+        st.markdown(style.kpis(monitor, latest), unsafe_allow_html=True)
+        d = monitor.definition
+        st.markdown(style.fields([
+            ('Monitoring state', monitor.status.value), ('Source scope', d.source_profile),
+            ('Namespace / workload', d.namespace + ' / ' + d.workload), ('Container', d.container or 'All'),
+        ], redact), unsafe_allow_html=True)
+        if monitor.archived:
+            st.info('ARCHIVED — removed from active monitoring. Historical runs and evidence are preserved.')
+        elif not monitor.enabled:
+            st.info('Paused monitor. Historical runs and evidence remain available; no new windows are scheduled.')
+        if monitor.last_error_summary:
+            st.error(redact((monitor.last_error_category or 'UNKNOWN') + ': ' + monitor.last_error_summary))
+        monitor_actions(repo, redact, monitor)
+    with config:
+        configuration(connection, redact, monitor)
+    # Render a single shared edit form, including when opened from Overview.
+    if not monitor.archived and st.session_state['monitor_edit_mode'] == monitor.id:
+        with st.container(border=True):
+            st.subheader('Edit monitor')
             monitor_form(repo, connection, redact, monitor)
-    else:
-        st.caption('Archived monitors are read-only.')
-    st.subheader('Run History')
     runs = repo.history(monitor.id)
-    if not runs:
-        st.info('No runs have been recorded for this monitor.')
-        return
-    st.caption('Most recent 100 windows. Retries reuse the same run; attempts are counted.')
-    st.dataframe([dict(Window=f'[{r.window.start.isoformat()}, {r.window.end.isoformat()})',
-                       Started=r.actual_started_at.isoformat(),
-                       Duration=(r.actual_finished_at - r.actual_started_at).total_seconds() if r.actual_finished_at else None,
-                       Status=r.status.value, Attempts=r.attempts, **asdict(r.counts), Error=r.error_category or '') for r in runs],
-                 hide_index=True, width='stretch')
-    st.subheader('Investigation')
+    with history:
+        st.subheader('Run History')
+        if not runs:
+            st.info('No runs have been recorded for this monitor.')
+        else:
+            st.caption('Most recent 100 windows · Newest first · UTC · Duration in seconds')
+            st.dataframe([dict(Window=f'{r.window.start.isoformat()} → {r.window.end.isoformat()}',
+                               Status=r.status.value,
+                               Duration=(r.actual_finished_at - r.actual_started_at).total_seconds() if r.actual_finished_at else None,
+                               Records=r.counts.events_retrieved, **{'Logical Events': r.counts.logical_events},
+                               Signals=r.counts.qualified_signals, Incidents=r.counts.incidents) for r in runs],
+                         hide_index=True, width='stretch')
+            with st.expander('Run diagnostics · attempts and errors'):
+                st.dataframe([dict(Run=r.id, Started=r.actual_started_at.isoformat(),
+                                   Finished=r.actual_finished_at.isoformat() if r.actual_finished_at else 'In progress',
+                                   Attempts=r.attempts, Error=redact(r.error_category or ''),
+                                   Detail=redact(r.error_summary or ''), **asdict(r.counts)) for r in runs],
+                             hide_index=True, width='stretch')
     completed = [r for r in runs if r.result_reference]
-    if completed:
+    if not completed:
+        for panel in (investigation, trace_panel):
+            with panel:
+                st.info('No successful runs with a persisted investigation yet.')
+        return
+    with history:
         options = [r.id for r in completed]
         if st.session_state['selected_run_id'] not in options:
             st.session_state['selected_run_id'] = options[0]
         run_id = st.selectbox('Open completed run', options,
-                              format_func=lambda key: next(r.window.start.isoformat() for r in completed if r.id == key), key='selected_run_id')
-        result = repo.result(run_id)
-        if result is not None:
-            summary = result.get('source_summary', {})
-            with st.expander('Window, source policy and boundary diagnostics'):
-                # The full per-event status contract is persisted, but this
-                # general view must not bypass the affected-event display cap.
-                st.json({key: value for key, value in summary.items() if key != 'boundary_quality'})
-            run = next(item for item in completed if item.id == run_id)
-            boundary_details(summary, run.counts.logical_events, redact)
-            model = InvestigationPresenter(redact).build(result, source='Deployment Monitor',
-                                                         target=redact(monitor.definition.namespace + ' / ' + monitor.definition.workload))
-            st.subheader('Pipeline Trace / Evidence Explorer')
-            views.investigation(model, trace=load_trace(result, run_id, redact), trace_key='trace_' + run_id)
-        else:
-            st.info('The persisted result for this run is unavailable.')
-    else:
-        st.info('No successful runs with a persisted investigation yet.')
+                              format_func=lambda key: next(r.window.start.isoformat() + ' · ' + r.status.value + ' · ' + r.id[:8]
+                                                           for r in completed if r.id == key), key='selected_run_id')
+        st.caption('This selection controls Investigation and Pipeline Trace. Only persisted results are opened.')
+        run = next(item for item in completed if item.id == run_id)
+        with st.expander('Selected run details'):
+            st.text('Run ID: ' + run.id)
+            st.text('Started: ' + run.actual_started_at.isoformat())
+            st.text('Finished: ' + (run.actual_finished_at.isoformat() if run.actual_finished_at else 'In progress'))
+            st.text('Attempts: ' + str(run.attempts))
+            st.json(asdict(run.counts))
+    result = repo.result(run_id)
+    for panel in (investigation, trace_panel):
+        with panel:
+            st.caption(f'Selected run: {run.id} · {run.status.value} · {run.window.start.isoformat()} → {run.window.end.isoformat()}')
+            st.caption('Change the selected window in Runs.')
+            if result is None:
+                st.info('The persisted result for this run is unavailable.')
+    if result is None:
+        return
+    model = InvestigationPresenter(redact).build(result, source='Deployment Monitor',
+                                                 target=redact(monitor.definition.namespace + ' / ' + monitor.definition.workload))
+    with investigation:
+        summary = result.get('source_summary', {})
+        with st.expander('Window, source policy and boundary diagnostics'):
+            st.json({key: value for key, value in summary.items() if key != 'boundary_quality'})
+        boundary_details(summary, run.counts.logical_events, redact)
+        views.investigation(model, include_pipeline=False)
+    with trace_panel:
+        trace = load_trace(result, run_id, redact)
+        st.subheader('Pipeline Trace / Evidence Explorer')
+        views.stage_details(model, trace=trace, trace_key='trace_' + run_id)
+        event_lineage(trace, key='trace_' + run_id)
