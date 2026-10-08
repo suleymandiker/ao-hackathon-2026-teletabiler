@@ -20,6 +20,19 @@ MAX_EVENT_REFERENCES = 6
 MAX_BOUNDARY_SAMPLES = 200
 MAX_TEMPLATE_CHARS = 8192
 MAX_STORED_TEMPLATE_CHARS = 512
+TEMPLATE_TRUNCATION_MARKER = ' [template truncated] '
+
+
+def bounded_template(template, limit):
+    """Keep deterministic head and tail context without retaining excess text."""
+    if len(template) <= limit:
+        return template
+    if limit <= len(TEMPLATE_TRUNCATION_MARKER):
+        return TEMPLATE_TRUNCATION_MARKER[:limit]
+    remaining = limit - len(TEMPLATE_TRUNCATION_MARKER)
+    head = (remaining + 1) // 2
+    tail = remaining // 2
+    return template[:head] + TEMPLATE_TRUNCATION_MARKER + (template[-tail:] if tail else '')
 
 
 def _count(mapping, key):
@@ -43,6 +56,8 @@ def _reference(record):
 class _Pattern:
     template_id: str
     template: str
+    template_truncated: bool = False
+    original_template_chars: int = 0
     count: int = 0
     first_seen_ms: int | None = None
     last_seen_ms: int | None = None
@@ -72,8 +87,12 @@ class _Pattern:
                                       document_id=document if document == source['record_id'] else None))
 
     def to_dict(self):
+        stored_template = (bounded_template(self.template, MAX_STORED_TEMPLATE_CHARS)
+                           if self.template_truncated else self.template[:MAX_STORED_TEMPLATE_CHARS])
         return dict(template_id=self.template_id,
-                    template=redact_text(self.template[:MAX_STORED_TEMPLATE_CHARS]), count=self.count,
+                    template=redact_text(stored_template), count=self.count,
+                    template_truncated=self.template_truncated,
+                    original_template_chars=self.original_template_chars,
                     first_seen_ms=self.first_seen_ms, last_seen_ms=self.last_seen_ms,
                     severity_counts=dict(self.severity_counts), pods=self.pods, containers=self.containers,
                     new_count=self.new_count, representative_evidence=self.evidence)
@@ -128,6 +147,8 @@ class WindowAccumulator:
         self.anomaly_context = None
         self.streams = set()
         self.stream_counts = {}
+        self.truncated_template_count = 0
+        self.max_template_chars_observed = 0
 
     def configure_anomalies(self, run, metrics, history, pattern_history):
         self.anomaly_context = (run, metrics, history, pattern_history)
@@ -170,13 +191,17 @@ class WindowAccumulator:
 
     def add(self, row, *, new=False):
         tid = str(row['template_id'])
+        template = str(row.get('template') or '')
+        original_chars = len(template)
+        self.max_template_chars_observed = max(self.max_template_chars_observed, original_chars)
         if tid not in self.patterns:
             if len(self.patterns) >= MAX_PATTERNS:
                 raise MonitoringLimitError('PATTERN_CARDINALITY_LIMIT', len(self.patterns) + 1, MAX_PATTERNS)
-            template = str(row.get('template') or '')
-            if len(template) > MAX_TEMPLATE_CHARS:
-                raise MonitoringLimitError('TEMPLATE_LENGTH_LIMIT', len(template), MAX_TEMPLATE_CHARS)
-            self.patterns[tid] = _Pattern(tid, template)
+            truncated = original_chars > MAX_TEMPLATE_CHARS
+            self.truncated_template_count += int(truncated)
+            self.patterns[tid] = _Pattern(tid, bounded_template(template, MAX_TEMPLATE_CHARS),
+                                          template_truncated=truncated,
+                                          original_template_chars=original_chars)
         self.patterns[tid].add(row, new=new)
 
         stamp = source_time_ms(row.get('timestamp'))
@@ -232,3 +257,8 @@ class WindowAccumulator:
 
     def pattern_metrics(self):
         return [pattern.to_dict() for pattern in self.patterns.values()]
+
+    def template_diagnostics(self):
+        """Count distinct retained patterns requiring analytical text truncation."""
+        return dict(truncated_template_count=self.truncated_template_count,
+                    max_template_chars_observed=self.max_template_chars_observed)

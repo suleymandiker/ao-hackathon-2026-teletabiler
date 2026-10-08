@@ -489,7 +489,9 @@ def executor_for(pipeline, records_or_source, *, config=None):
     ('parsed_observation', ValueError, 'parsed_observation'),
     ('template_accumulation', ValueError, 'template_accumulation'),
     ('time_quality', ValueError, 'time_quality'),
-    ('template_limit', None, 'template_accumulation'),
+    ('stream_limit', None, 'boundary_observation'),
+    ('pattern_limit', None, 'template_accumulation'),
+    ('signal_limit', None, 'template_accumulation'),
 ])
 def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
         repo, pipeline, monkeypatch, boundary, error_type, expected_stage):
@@ -528,9 +530,13 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
             def report(self, *args, **kwargs):
                 pass
         monkeypatch.setattr(full_pipeline_v2.TimeQuality, 'from_env', lambda: Quality())
-    else:
+    elif boundary in ('stream_limit', 'pattern_limit', 'signal_limit'):
         error_type = MonitoringLimitError
-        monkeypatch.setattr(window_accumulator, 'MAX_TEMPLATE_CHARS', 0)
+        constant = {'stream_limit': 'MAX_STREAMS', 'pattern_limit': 'MAX_PATTERNS',
+                    'signal_limit': 'MAX_SIGNAL_GROUPS'}[boundary]
+        monkeypatch.setattr(window_accumulator, constant, 0)
+    else:
+        raise AssertionError('Unexpected synthetic failure boundary')
 
     private_value = 'synthetic-private-source-value'
     records = (record('a', 3, 'ERROR: ' + private_value),
@@ -583,9 +589,9 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     assert run.status.value == 'FAILED' and run.error_category == 'PIPELINE'
     assert diagnostics['pipeline_stage'] == expected_stage
     assert diagnostics['exception_type'] == error_type.__name__
-    if boundary == 'template_limit':
+    if boundary in ('stream_limit', 'pattern_limit', 'signal_limit'):
         assert diagnostics['exception_file'] == 'src/backend/monitoring/window_accumulator.py'
-        assert diagnostics['exception_function'] == 'add'
+        assert diagnostics['exception_function'] == ('observe_boundary' if boundary == 'stream_limit' else 'add')
     else:
         assert diagnostics['exception_file'] == 'src/backend/full_pipeline_v2.py'
         assert diagnostics['exception_function'] in ('process_ingested_pages', '_process_logical_events')
@@ -599,9 +605,13 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     assert failed['exception_type'] == error_type.__name__
     assert {key: failed[key] for key in ('exception_file', 'exception_function', 'exception_line')} == {
         key: diagnostics[key] for key in ('exception_file', 'exception_function', 'exception_line')}
-    if boundary == 'template_limit':
-        assert {key: diagnostics[key] for key in ('reason_code', 'observed', 'limit')} == {
-            'reason_code': 'TEMPLATE_LENGTH_LIMIT', 'observed': len('safe template'), 'limit': 0}
+    if boundary in ('stream_limit', 'pattern_limit', 'signal_limit'):
+        assert diagnostics['reason_code'] == {
+            'stream_limit': 'STREAM_CARDINALITY_LIMIT',
+            'pattern_limit': 'PATTERN_CARDINALITY_LIMIT',
+            'signal_limit': 'SIGNAL_CARDINALITY_LIMIT',
+        }[boundary]
+        assert diagnostics['observed'] == 1 and diagnostics['limit'] == 0
         assert {key: failed[key] for key in ('reason_code', 'observed', 'limit')} == {
             key: diagnostics[key] for key in ('reason_code', 'observed', 'limit')}
     else:
@@ -617,7 +627,6 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
 @pytest.mark.parametrize('guard,constant,reason,original_limit', [
     ('stream', 'MAX_STREAMS', 'STREAM_CARDINALITY_LIMIT', 10_000),
     ('pattern', 'MAX_PATTERNS', 'PATTERN_CARDINALITY_LIMIT', 1_000),
-    ('template', 'MAX_TEMPLATE_CHARS', 'TEMPLATE_LENGTH_LIMIT', 8192),
     ('signal', 'MAX_SIGNAL_GROUPS', 'SIGNAL_CARDINALITY_LIMIT', 1_000),
 ])
 def test_accumulator_guards_expose_only_bounded_structural_details(
@@ -663,6 +672,127 @@ def test_exception_site_omits_frames_outside_backend():
         raise ValueError('synthetic-private-value')
     except ValueError as error:
         assert safe_exception_site(error) == {}
+
+
+@pytest.mark.parametrize('length', [8192, 8193, 10613])
+def test_accumulator_compacts_only_oversized_template_text(length):
+    from monitoring.window_accumulator import (
+        MAX_STORED_TEMPLATE_CHARS, MAX_TEMPLATE_CHARS, TEMPLATE_TRUNCATION_MARKER,
+        WindowAccumulator,
+    )
+
+    template = 'HEAD' + 'x' * (length - 8) + 'TAIL'
+    row = {'template_id': 'original-template-id', 'template': template,
+           'service_name': 'synthetic-service', 'severity_text': 'ERROR',
+           'attributes': {}, 'event_id': 'synthetic-event'}
+    accumulator = WindowAccumulator()
+    accumulator.add(row)
+    accumulator.add(row)
+    pattern = accumulator.patterns['original-template-id']
+    stored = accumulator.pattern_metrics()[0]
+    signals = accumulator.signals()
+    expected_truncated = length > MAX_TEMPLATE_CHARS
+
+    assert pattern.template_id == stored['template_id'] == signals[0]['template_id'] == 'original-template-id'
+    assert pattern.count == stored['count'] == signals[0]['count'] == 2
+    assert len(accumulator.patterns) == len(accumulator.groups) == len(signals) == 1
+    assert len(pattern.template) <= MAX_TEMPLATE_CHARS
+    assert len(stored['template']) <= MAX_STORED_TEMPLATE_CHARS
+    assert stored['template_truncated'] is expected_truncated
+    assert stored['original_template_chars'] == length
+    assert accumulator.template_diagnostics() == {
+        'truncated_template_count': int(expected_truncated),
+        'max_template_chars_observed': length,
+    }
+    if expected_truncated:
+        assert pattern.template.startswith('HEAD') and pattern.template.endswith('TAIL')
+        assert TEMPLATE_TRUNCATION_MARKER in pattern.template
+        assert stored['template'].startswith('HEAD') and stored['template'].endswith('TAIL')
+        assert template not in str(stored) and template not in str(signals)
+    else:
+        assert pattern.template == template
+    repeated = WindowAccumulator()
+    repeated.add(row)
+    assert repeated.patterns['original-template-id'].template == pattern.template
+
+
+def test_streaming_window_succeeds_with_oversized_template_and_advances_watermark(
+        repo, pipeline, monkeypatch):
+    import monitoring.execution as execution
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.metrics_source import WindowMetrics
+    from monitoring.worker import MonitorWorker
+    from segmentation_layer.contracts import SegmentationPolicy
+
+    template = 'HEAD' + 'x' * (10613 - 8) + 'TAIL'
+    pipeline.templater.process = lambda event: SimpleNamespace(
+        template_id='original-template-id', template=template, reliable=True)
+    pipeline.downstream.process_aggregates = lambda aggregates, **options: {
+        'stats': {'signal_candidates': len(aggregates), 'qualified_signals': 0,
+                  'correlations': 0, 'incidents': 0, 'rca': 0},
+        'signals': aggregates, 'qualified_signals': [], 'correlations': [],
+        'incidents': [], 'rca': [], 'plans': [],
+    }
+    records = (record('a', 3, 'ERROR: synthetic first record'),
+               record('b', 4, 'ERROR: synthetic second record'))
+    class Client:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    class MetricsSource:
+        requests = 1
+        def __init__(self, client):
+            pass
+        def window(self, run):
+            return WindowMetrics(2, (), {}, {}, 0, 0, True, True, {})
+    class Acquisition:
+        pages_read = 1
+        records_read = 2
+        shards_completed = 1
+        completed_unique_records = 2
+        last_state = {'status': 'COMPLETE'}
+        acquisition_duration_seconds = 0.01
+        def __init__(self, source, metrics_source, definition, **kwargs):
+            pass
+        def pages(self, shards):
+            yield page(records)
+    class Resolver:
+        def resolve(self, sample, policies):
+            return SimpleNamespace(snapshot=SegmentationPolicy('id', r'^ERROR:', 'fixture'),
+                                   diagnostics=lambda: {'sampled_records': len(sample)})
+    monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
+    monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
+    monkeypatch.setattr(execution, 'VerifiedPolicyResolver', Resolver)
+    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password', True, True,
+                              'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
+    logs = []
+    executor = execution.OpenSearchMonitorExecutor(
+        lambda: pipeline, connection_loader=lambda size: config,
+        client_factory=lambda cfg: Client(), source_factory=lambda client: object(),
+        policy_loader=lambda: (), repository=repo,
+        log=lambda event, **values: logs.append((event, values)))
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    worker = MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17),
+                           log=lambda event, **values: logs.append((event, values)))
+
+    assert worker.tick() == 1
+    run = repo.history(monitor.id)[0]
+    assert run.status.value == 'SUCCESS'
+    assert repo.get(monitor.id).last_successful_end == run.window.end
+    assert run.counts.events_retrieved == 2 and run.counts.logical_events == 2
+    result = repo.result(run.id)
+    assert result['source_summary']['truncated_template_count'] == 1
+    assert result['source_summary']['max_template_chars_observed'] == 10613
+    metric = repo.successful_metrics(monitor.id, run.window.end)[0]
+    assert metric['truncated_template_count'] == 1
+    assert metric['max_template_chars_observed'] == 10613
+    pattern = repo.successful_patterns(monitor.id, run.window.end)[0]['original-template-id']
+    assert pattern['count'] == 2 and pattern['template_truncated'] is True
+    assert pattern['original_template_chars'] == 10613
+    assert len(pattern['template']) <= 512
+    assert template not in str(result) + str(metric) + str(pattern) + str(logs)
 
 
 def test_monitor_pipeline_timestamp_fallback_is_per_event_and_timezone_propagates(repo, pipeline):

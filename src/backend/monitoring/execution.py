@@ -339,6 +339,7 @@ class OpenSearchMonitorExecutor:
                                    boundary_quality=accumulator.boundary_quality(),
                                    assembled_stream_count=len(accumulator.streams),
                                    pattern_count=len(accumulator.patterns),
+                                   **accumulator.template_diagnostics(),
                                    exact_window_metrics=metrics.to_dict())
                     stats = result['stats']
                     counts = RunCounts(acquisition.completed_unique_records, unique, stats.get('segmented', 0),
@@ -354,6 +355,7 @@ class OpenSearchMonitorExecutor:
                                    error_pods=accumulator.error_pods,
                                    error_containers=accumulator.error_containers,
                                    pattern_count=len(accumulator.patterns),
+                                   **accumulator.template_diagnostics(),
                                    pages_read=acquisition.pages_read,
                                    acquisition_shards=acquisition.shards_completed)
                     compact['stream_count'] = len(accumulator.streams)
