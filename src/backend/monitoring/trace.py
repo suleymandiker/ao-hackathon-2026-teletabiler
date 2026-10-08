@@ -168,7 +168,7 @@ class TraceCollector:
     def acquisition(self, record, *, timestamp, inside_window, overlap, duplicate):
         ref = 'record:' + str(self.trace.totals['acquisition'] + 1)
         key = self.reference(record)
-        if not duplicate:
+        if not duplicate and len(self.record_refs) < self.trace.limits.max_items_per_stage:
             self.record_refs[key] = ref
         self.add('acquisition', ref, dict(
             source_reference_hash=key, source_timestamp=timestamp,
@@ -185,13 +185,16 @@ class TraceCollector:
                 self.add(stage, ref, dict(disposition=output.reason, admitted=False,
                          decision=asdict(output.evidence) if output.evidence else None,
                          policy_id=output.policy.policy_id if output.policy else None),
-                         [self.record_refs[self.reference(output.record)]])
+                         [self.record_refs.get(self.reference(output.record),
+                                               'record-hash:' + self.reference(output.record))])
                 return
-            parents = [self.record_refs[self.reference(r)] for r in output.records]
+            parents = [self.record_refs.get(self.reference(r), 'record-hash:' + self.reference(r))
+                       for r in output.records[:self.trace.limits.max_fields_per_item]]
             first = next(r for r, e in zip(output.records, output.evidence) if e.included)
             last = output.records[-1]
-            if admitted:
+            if admitted and len(self.logical_refs) < self.trace.limits.max_items_per_stage:
                 self.logical_refs[self.owned_count] = ref
+            if admitted:
                 self.owned_count += 1
             self.add(stage, ref, dict(text=output.text, admitted=admitted,
                 stream=asdict(output.records[0].stream_identity), stream_key=asdict(output.stream_key),
@@ -214,7 +217,8 @@ class TraceCollector:
             if outcome is not None:
                 data.update(recognition=outcome.recognition, delivery=outcome.delivery,
                             parser_id=outcome.parser_id, reason_code=outcome.reason_code)
-            self.add(stage, f'canonical:{order + 1}', data, [self.logical_refs[order]])
+            self.add(stage, f'canonical:{order + 1}', data,
+                     [self.logical_refs.get(order, f'logical:{order + 1}')])
         elif stage == 'patterns':
             order = value['source_order']
             self.add(stage, f'occurrence:{order + 1}',

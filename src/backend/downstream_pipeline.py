@@ -40,11 +40,20 @@ class DownstreamAIOpsPipeline:
                 yield event
 
         options = {'observer': observer} if observer is not None else {}
-        signals = self.noise_gate.qualify(self.aggregator.aggregate(observed_events(), **options))
+        aggregates = self.aggregator.aggregate(observed_events(), **options)
+        return self.process_aggregates(aggregates, observer=observer, reference=reference)
+
+    def process_aggregates(self, aggregates, *, observer: PipelineObserver | None = None,
+                           reference=None, max_qualified_signals=None):
+        """Run the authoritative downstream decisions on compact signal inputs."""
+        options = {'observer': observer} if observer is not None else {}
+        signals = self.noise_gate.qualify(aggregates)
         # No current downstream feature needs recency/decay. Retain the factual
         # reference as local diagnostics, never fill missing event coordinates.
         analysis_time = AnalysisTimeContext(reference)
         qualified = [s for s in signals if s.get('qualified')]
+        if max_qualified_signals is not None and len(qualified) > max_qualified_signals:
+            raise ValueError('Monitoring qualified-signal safety limit reached')
         correlations = self.correlator.correlate(qualified)
         incidents = self.enricher.enrich(self.incidents.build(signals, correlations), signals)
         rca = self.rca.analyze(incidents, correlations, signals, **options)

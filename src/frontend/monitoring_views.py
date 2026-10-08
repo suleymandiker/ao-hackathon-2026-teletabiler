@@ -487,6 +487,15 @@ def monitor_details(repo, connection, redact, monitor, latest):
         summary = result.get('source_summary', {})
         with st.expander('Acquisition'):
             st.text(f'{run.counts.events_retrieved:,} logs retrieved · {summary.get("pages_read", "Unknown")} pages')
+            exact = summary.get('exact_window_metrics') or {}
+            if exact:
+                st.caption(f'{exact.get("total_physical_logs", 0):,} physical logs in the exact window · '
+                           f'{run.counts.logical_events:,} logical events · '
+                           f'{summary.get("acquisition_shards", 0):,} acquisition shards')
+                anomalous = [signal for signal in result.get('signals', [])
+                             if signal.get('qualified') and signal.get('monitor_anomaly')]
+                if anomalous:
+                    st.caption(f'{len(anomalous)} qualified volume, rate, pattern or severity anomalies')
         with st.expander('Investigation', expanded=st.session_state.get('investigate_run_id') == run_id):
             views.investigation(model, include_pipeline=False)
         with st.expander('Technical diagnostics'):

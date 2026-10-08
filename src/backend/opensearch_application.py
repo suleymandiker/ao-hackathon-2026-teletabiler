@@ -271,7 +271,7 @@ def presentation_result(result, summary, config):
                for entry in result.get('event_provenance', [])}
     shown['source_summary'] = {
         **clean(summary), 'assembled_events': result.get('stats', {}).get('segmented', 0),
-        'assembled_stream_count': len(streams),
+        'assembled_stream_count': len(streams) if streams else summary.get('assembled_stream_count', 0),
         'unassembled_count': diagnostics.get('unassembled_count', 0),
         'unassembled_by_reason': {reason: diagnostics.get('unassembled_by_reason', {}).get(reason, 0)
                                   for reason in known_reasons if diagnostics.get('unassembled_by_reason', {}).get(reason, 0)},

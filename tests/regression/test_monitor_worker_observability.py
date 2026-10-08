@@ -142,7 +142,7 @@ def test_due_once_retains_execution_logs_and_watermark(worker_module, tmp_path, 
             assert consumed == set()
             return ExecutionResult({'source_summary': {}}, RunCounts(), {})
 
-    monkeypatch.setattr(worker_module, 'OpenSearchMonitorExecutor', lambda pipeline: Executor())
+    monkeypatch.setattr(worker_module, 'OpenSearchMonitorExecutor', lambda pipeline, repository=None: Executor())
     assert worker_module.main(['--once']) == 0
     logged = events(capsys)
     assert [row['event'] for row in logged] == [

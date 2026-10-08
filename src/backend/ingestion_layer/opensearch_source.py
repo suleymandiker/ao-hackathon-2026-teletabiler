@@ -27,6 +27,9 @@ class OpenSearchSourceError(ValueError):
     """Invalid read, cursor or page; diagnostics contain no source values."""
 
 
+MAX_MONITOR_MESSAGE_CHARS = 65_536
+
+
 _SOURCE_FIELDS = (
     "timestamp", "message", "cluster_id", "sequence", "namespace", "workload",
     "pod", "pod_instance", "pod_owner", "container", "container_instance", "channel",
@@ -128,9 +131,10 @@ class OpenSearchSource:
     The caller carries the opaque cursor between reads of a fixed interval.
     """
 
-    def __init__(self, client: OpenSearchClient):
+    def __init__(self, client: OpenSearchClient, *, max_message_chars=None):
         self._client = client
         self._config = client.config
+        self._max_message_chars = max_message_chars
 
     def read_page(
         self, *, start: datetime, end: datetime,
@@ -259,6 +263,9 @@ class OpenSearchSource:
                   for name in _SOURCE_FIELDS}
         if type(values["message"]) is not str:
             raise OpenSearchSourceError("Missing or non-string message")
+        max_message_chars = getattr(self, '_max_message_chars', None)
+        if max_message_chars is not None and len(values["message"]) > max_message_chars:
+            raise OpenSearchSourceError("Source record exceeds bounded message size")
         timestamp = values["timestamp"]
         if (type(timestamp) not in (str, int, float)
                 or (type(timestamp) is str and not timestamp.strip())

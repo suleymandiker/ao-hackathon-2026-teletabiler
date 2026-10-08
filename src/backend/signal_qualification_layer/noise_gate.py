@@ -25,6 +25,15 @@ class SignalNoiseGate:
         out=[]
         for raw in signals:
             s=dict(raw); count=int(s.get('count',0)); sev=int(s.get('severity_min',7)); srcsev=int(s.get('source_severity_max',0) or 0)
+            if isinstance(s.get('monitor_anomaly'), dict):
+                s.update(qualification_score=1.0, qualified=True,
+                         qualification_evidence=['deterministic_monitor_baseline'],
+                         qualification_reason='nitelikli_sinyal',
+                         qualification_details=asdict(QualificationEvidence(
+                             'deterministic_monitor_baseline', None, None, True,
+                             'minimum historical observations and median/MAD threshold')))
+                out.append(s)
+                continue
             typ=str(s.get('alarm_type') or '').lower(); reliable=float(s.get('reliable_ratio',0)); text=str(s.get('template') or '')
             evidence=[]; score=0.0
             if not typ:

@@ -1,9 +1,11 @@
 """Run separately from Streamlit: python tools/monitor_worker.py --once."""
 import argparse
+from contextlib import ExitStack
 from functools import lru_cache
 import math
 from pathlib import Path
 import os
+import sqlite3
 import sys
 import time
 
@@ -42,11 +44,25 @@ def main(argv=None):
     path = database_path()
     structured_log('WORKER_START', database=str(path), once=args.once, max_runs=args.max_runs)
     try:
-        with exclusive_worker(path.with_suffix('.worker.lock')):
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(exclusive_worker(path.with_suffix('.worker.lock')))
+            except WorkerLockBusy:
+                structured_log('WORKER_LOCK_BUSY', message='Another monitor worker already owns the scheduler lock.')
+                return 1
+            except OSError:
+                structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
+                               summary='Check worker ownership and monitoring storage; only one worker is supported.')
+                return 1
             structured_log('WORKER_LOCK_ACQUIRED')
-            repository = SQLiteMonitorRepository(path)
-            repository.recover_running(system_clock())
-            worker = MonitorWorker(repository, OpenSearchMonitorExecutor(pipeline))
+            try:
+                repository = SQLiteMonitorRepository(path)
+                repository.recover_running(system_clock())
+            except (OSError, sqlite3.Error, ValueError):
+                structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
+                               summary='Check worker ownership and monitoring storage; only one worker is supported.')
+                return 1
+            worker = None
             last_idle_at = None
             last_due_at = None
             while True:
@@ -56,7 +72,13 @@ def main(argv=None):
                 if summary.due_monitors and (last_due_at is None or elapsed - last_due_at >= args.heartbeat_seconds):
                     structured_log('WORKER_DUE', due_monitors=summary.due_monitors)
                     last_due_at = elapsed
-                completed = worker.tick(max_runs=args.max_runs)
+                completed = 0
+                if summary.due_monitors:
+                    if worker is None:
+                        worker = MonitorWorker(repository,
+                            OpenSearchMonitorExecutor(pipeline, repository=repository),
+                            clock=system_clock)
+                    completed = worker.tick(max_runs=args.max_runs, now=now)
                 if not completed and not summary.due_monitors and (
                     args.once or last_idle_at is None or elapsed - last_idle_at >= args.heartbeat_seconds
                 ):
@@ -68,16 +90,9 @@ def main(argv=None):
                 if args.once:
                     return 0
                 time.sleep(args.poll_seconds)
-    except WorkerLockBusy:
-        structured_log('WORKER_LOCK_BUSY', message='Another monitor worker already owns the scheduler lock.')
-        return 1
     except KeyboardInterrupt:
         structured_log('WORKER_STOP', reason='interrupt')
         return 0
-    except Exception:
-        structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
-                       summary='Check worker ownership and monitoring storage; only one worker is supported.')
-        return 1
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ One success transaction owns the result, reference receipts and watermark.
 """
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -28,12 +28,18 @@ class MonitorRepository(Protocol):
     def claim(self, now: datetime) -> MonitorRun | None: ...
     def schedule_summary(self, now: datetime) -> 'ScheduleSummary': ...
     def recover_running(self, now: datetime) -> None: ...
-    def succeed(self, run: MonitorRun, result: dict, counts: RunCounts, receipts: dict[str, str], *, now: datetime) -> None: ...
+    def succeed(self, run: MonitorRun, result: dict, counts: RunCounts, receipts: dict[str, str], *,
+                now: datetime, metrics: dict | None = None, pattern_metrics=()) -> None: ...
     def fail(self, run: MonitorRun, category: str, *, now: datetime, diagnostics: dict | None = None) -> None: ...
     def history(self, monitor_id: str, limit: int = 100) -> list[MonitorRun]: ...
     def result(self, run_id: str) -> dict | None: ...
     def acquisition_diagnostics(self, run_id: str) -> dict | None: ...
     def consumed(self, monitor_id: str, since: datetime) -> set[str]: ...
+    def record_shard(self, run: MonitorRun, shard, status: str, **counts) -> None: ...
+    def acquisition_ledger(self, run: MonitorRun, since: datetime): ...
+    def successful_metrics(self, monitor_id: str, before: datetime, limit: int = 30) -> list[dict]: ...
+    def successful_patterns(self, monitor_id: str, before: datetime, limit: int = 5) -> list[dict]: ...
+    def acquisition_shards(self, run_id: str) -> list[dict]: ...
 
 
 @dataclass(frozen=True)
@@ -69,11 +75,13 @@ class SQLiteMonitorRepository:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3):
+            if version not in (0, 1, 2, 3, 4):
                 raise ValueError('Unsupported monitoring schema version')
             # Refuse accidental use of an existing policy/template database.
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if names - {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts'}:
+            if names - {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
+                         'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
+                         'monitor_run_dedupe'}:
                 raise ValueError('Monitoring requires its own database')
             statements = (
                 '''CREATE TABLE IF NOT EXISTS monitors (
@@ -93,8 +101,25 @@ class SQLiteMonitorRepository:
                 '''CREATE TABLE IF NOT EXISTS monitor_receipts (
                     monitor_id TEXT NOT NULL REFERENCES monitors(id), reference_hash TEXT NOT NULL,
                     source_time TEXT NOT NULL, PRIMARY KEY(monitor_id, reference_hash))''',
+                '''CREATE TABLE IF NOT EXISTS monitor_run_metrics (
+                    run_id TEXT PRIMARY KEY REFERENCES monitor_runs(id), payload TEXT NOT NULL)''',
+                '''CREATE TABLE IF NOT EXISTS monitor_pattern_metrics (
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id), template_id TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(run_id, template_id))''',
+                '''CREATE TABLE IF NOT EXISTS monitor_acquisition_shards (
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id), attempt INTEGER NOT NULL,
+                    shard_id TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
+                    depth INTEGER NOT NULL, status TEXT NOT NULL, pages_read INTEGER NOT NULL DEFAULT 0,
+                    records_read INTEGER NOT NULL DEFAULT 0, unique_records INTEGER NOT NULL DEFAULT 0,
+                    completed_at TEXT, failure_category TEXT,
+                    PRIMARY KEY(run_id, attempt, shard_id))''',
+                '''CREATE TABLE IF NOT EXISTS monitor_run_dedupe (
+                    run_id TEXT NOT NULL REFERENCES monitor_runs(id), reference_hash TEXT NOT NULL,
+                    source_time TEXT NOT NULL, owned INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(run_id, reference_hash))''',
                 'CREATE INDEX IF NOT EXISTS monitor_due ON monitors(enabled, next_run_at)',
                 'CREATE INDEX IF NOT EXISTS receipt_time ON monitor_receipts(monitor_id, source_time)',
+                'CREATE INDEX IF NOT EXISTS monitor_metrics_history ON monitor_runs(monitor_id,status,window_end)',
             )
             for statement in statements:
                 db.execute(statement)
@@ -108,7 +133,7 @@ class SQLiteMonitorRepository:
             run_columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
             if 'acquisition_diagnostics' not in run_columns:
                 db.execute('ALTER TABLE monitor_runs ADD COLUMN acquisition_diagnostics TEXT')
-            db.execute('PRAGMA user_version=3')
+            db.execute('PRAGMA user_version=4')
 
     @contextmanager
     def _transaction(self):
@@ -209,7 +234,7 @@ class SQLiteMonitorRepository:
         with self._transaction() as db:
             rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0 AND next_run_at<=?
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
-                ORDER BY next_run_at,id''', (now.isoformat(),)).fetchall()
+                ORDER BY updated_at,next_run_at,id''', (now.isoformat(),)).fetchall()
             for row in rows:
                 monitor = self._monitor(row)
                 window = next_window(monitor)
@@ -222,6 +247,7 @@ class SQLiteMonitorRepository:
                 token = new_id()
                 if existing:
                     run_id = existing['id']
+                    db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run_id,))
                     db.execute("""UPDATE monitor_runs SET status='RUNNING', claim_token=?, started_at=?,
                          finished_at=NULL, attempts=attempts+1, error_category=NULL,error_summary=NULL,
                          acquisition_diagnostics=NULL WHERE id=?""",
@@ -240,9 +266,10 @@ class SQLiteMonitorRepository:
     def schedule_summary(self, now):
         """Read scheduling state without claiming runs or changing persisted state."""
         now = utc(now)
-        db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=10)
+        db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         try:
+            db.execute('PRAGMA query_only=ON')
             enabled = db.execute('SELECT COUNT(*) FROM monitors WHERE enabled=1 AND archived=0').fetchone()[0]
             rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
@@ -270,7 +297,7 @@ class SQLiteMonitorRepository:
         return db.execute("SELECT 1 FROM monitor_runs WHERE id=? AND status='RUNNING' AND claim_token=?",
                           (run.id, run.claim_token)).fetchone() is not None
 
-    def succeed(self, run, result, counts, receipts, *, now):
+    def succeed(self, run, result, counts, receipts, *, now, metrics=None, pattern_metrics=()):
         payload = encode(result)  # Fail before any writes if serialization fails.
         now = utc(now)
         with self._transaction() as db:
@@ -282,6 +309,14 @@ class SQLiteMonitorRepository:
             db.execute('INSERT INTO monitor_results VALUES (?,?)', (run.id, payload))
             db.executemany('INSERT INTO monitor_receipts VALUES (?,?,?)',
                            [(run.monitor_id, key, value) for key, value in receipts.items()])
+            db.execute('''INSERT OR IGNORE INTO monitor_receipts(monitor_id,reference_hash,source_time)
+                SELECT ?,reference_hash,source_time FROM monitor_run_dedupe
+                WHERE run_id=? AND owned=1''', (run.monitor_id, run.id))
+            db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
+            if metrics is not None:
+                db.execute('INSERT OR REPLACE INTO monitor_run_metrics VALUES (?,?)', (run.id, encode(metrics)))
+                db.executemany('INSERT OR REPLACE INTO monitor_pattern_metrics VALUES (?,?,?)',
+                               [(run.id, item['template_id'], encode(item)) for item in pattern_metrics])
             db.execute("""UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,result_reference=? WHERE id=?""",
                        (now.isoformat(), encode(asdict(counts)), run.id, run.id))
             following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
@@ -308,6 +343,7 @@ class SQLiteMonitorRepository:
         with self._transaction() as db:
             if not self._owned(db, run):
                 return
+            db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
             db.execute("""UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=?,
                        acquisition_diagnostics=? WHERE id=?""",
@@ -345,3 +381,92 @@ class SQLiteMonitorRepository:
         with self._transaction() as db:
             return {row[0] for row in db.execute('SELECT reference_hash FROM monitor_receipts WHERE monitor_id=? AND source_time>=?',
                                                (monitor_id, utc(since).isoformat()))}
+
+    def acquisition_ledger(self, run, since):
+        return RunDedupeLedger(self.path, run.id, run.monitor_id, utc(since).isoformat())
+
+    def record_shard(self, run, shard, status, *, pages=0, records=0, unique=0, failure=None):
+        with self._transaction() as db:
+            if not self._owned(db, run):
+                raise ValueError('Run claim no longer owned')
+            db.execute('''INSERT INTO monitor_acquisition_shards
+                (run_id,attempt,shard_id,start_at,end_at,depth,status,pages_read,records_read,
+                 unique_records,completed_at,failure_category) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,attempt,shard_id) DO UPDATE SET
+                status=excluded.status,pages_read=excluded.pages_read,records_read=excluded.records_read,
+                unique_records=excluded.unique_records,completed_at=excluded.completed_at,
+                failure_category=excluded.failure_category''',
+                (run.id, run.attempts, shard.shard_id, shard.start.isoformat(), shard.end.isoformat(),
+                 shard.depth, status, pages, records, unique,
+                 datetime.now(timezone.utc).isoformat() if status in ('COMPLETE', 'FAILED', 'SPLIT') else None,
+                 failure))
+
+    def acquisition_shards(self, run_id):
+        with self._transaction() as db:
+            return [dict(row) for row in db.execute('''SELECT shard_id,start_at,end_at,depth,status,
+                pages_read,records_read,unique_records,completed_at,failure_category,attempt
+                FROM monitor_acquisition_shards WHERE run_id=? ORDER BY attempt,shard_id''', (run_id,))]
+
+    def successful_metrics(self, monitor_id, before, limit=30):
+        if not 1 <= limit <= 100:
+            raise ValueError('Metrics history limit must be 1..100')
+        with self._transaction() as db:
+            return [json.loads(row[0]) for row in db.execute('''SELECT m.payload FROM monitor_run_metrics m
+                JOIN monitor_runs r ON r.id=m.run_id WHERE r.monitor_id=? AND r.status='SUCCESS'
+                AND r.window_end<=? ORDER BY r.window_end DESC LIMIT ?''',
+                (monitor_id, utc(before).isoformat(), limit))]
+
+    def successful_patterns(self, monitor_id, before, limit=5):
+        with self._transaction() as db:
+            run_ids = [row[0] for row in db.execute('''SELECT r.id FROM monitor_runs r
+                JOIN monitor_run_metrics m ON m.run_id=r.id WHERE r.monitor_id=? AND r.status='SUCCESS'
+                AND r.window_end<=? ORDER BY r.window_end DESC LIMIT ?''',
+                (monitor_id, utc(before).isoformat(), limit))]
+            return [{row['template_id']: json.loads(row['payload']) for row in db.execute(
+                     'SELECT template_id,payload FROM monitor_pattern_metrics WHERE run_id=?', (run_id,))}
+                    for run_id in run_ids]
+
+
+class RunDedupeLedger:
+    """Disk-backed reference hashes; one transaction per processed page."""
+
+    def __init__(self, path, run_id, monitor_id, since):
+        self.db = sqlite3.connect(path, timeout=10)
+        self.run_id, self.monitor_id, self.since = run_id, monitor_id, since
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if self.db.in_transaction:
+            self.db.rollback()
+        self.db.close()
+
+    @contextmanager
+    def page(self):
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            yield
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def seen(self, key, source_time):
+        cursor = self.db.execute('INSERT OR IGNORE INTO monitor_run_dedupe VALUES (?,?,?,0)',
+                                 (self.run_id, key, source_time))
+        return cursor.rowcount == 0
+
+    def consumed(self, key):
+        return self.db.execute('''SELECT 1 FROM monitor_receipts
+            WHERE monitor_id=? AND reference_hash=? AND source_time>=?''',
+            (self.monitor_id, key, self.since)).fetchone() is not None
+
+    def owned(self, key):
+        row = self.db.execute('SELECT owned FROM monitor_run_dedupe WHERE run_id=? AND reference_hash=?',
+                              (self.run_id, key)).fetchone()
+        return row is not None and row[0] == 1
+
+    def mark_owned(self, keys):
+        self.db.executemany('UPDATE monitor_run_dedupe SET owned=1 WHERE run_id=? AND reference_hash=?',
+                            [(self.run_id, key) for key in keys])
