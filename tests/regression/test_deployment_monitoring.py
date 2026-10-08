@@ -327,6 +327,55 @@ def test_result_receipt_watermark_transaction_rolls_back(repo):
     assert repo.history(monitor.id)[0].status.value == 'RUNNING'
 
 
+def test_success_persists_nested_datetime_analytical_payloads(repo):
+    from monitoring.domain import RunCounts
+
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    observed = BASE + timedelta(seconds=5, microseconds=917555)
+    evidence = {'timestamp': observed, 'index': 'test-index', 'document_id': 'doc-1'}
+    result = {'signals': [{'representative_evidence': [evidence]}]}
+    metrics = {'total_physical_logs': 1,
+               'observed_at': observed.astimezone(timezone(timedelta(hours=3)))}
+    pattern = {'template_id': 'template-1', 'count': 1,
+               'first_seen': observed, 'last_seen': observed,
+               'representative_evidence': [evidence]}
+
+    repo.succeed(run, result, RunCounts(logical_events=1), {}, now=BASE + timedelta(minutes=17),
+                 metrics=metrics, pattern_metrics=(pattern,))
+
+    expected = observed.isoformat()
+    assert repo.history(monitor.id)[0].status.value == 'SUCCESS'
+    assert repo.get(monitor.id).last_successful_end == run.window.end
+    assert repo.result(run.id)['signals'][0]['representative_evidence'][0]['timestamp'] == expected
+    assert repo.successful_metrics(monitor.id, run.window.end)[0]['observed_at'] == expected
+    stored_pattern = repo.successful_patterns(monitor.id, run.window.end)[0]['template-1']
+    assert stored_pattern['first_seen'] == stored_pattern['last_seen'] == expected
+    assert stored_pattern['representative_evidence'][0]['timestamp'] == expected
+    with sqlite3.connect(repo.path) as db:
+        assert db.execute('SELECT count(*) FROM monitor_results').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM monitor_run_metrics').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM monitor_pattern_metrics').fetchone()[0] == 1
+
+
+def test_unsupported_pattern_payload_rolls_back_success_transaction(repo):
+    from monitoring.domain import RunCounts
+
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=17))
+    with pytest.raises(TypeError, match='Object of type object is not JSON serializable'):
+        repo.succeed(run, {'safe': True}, RunCounts(), {'receipt': BASE.isoformat()},
+                     now=BASE + timedelta(minutes=17), metrics={'total_physical_logs': 1},
+                     pattern_metrics=({'template_id': 'template-1', 'invalid': object()},))
+
+    assert repo.history(monitor.id)[0].status.value == 'RUNNING'
+    assert repo.get(monitor.id).last_successful_end is None
+    assert repo.result(run.id) is None
+    with sqlite3.connect(repo.path) as db:
+        for table in ('monitor_results', 'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_receipts'):
+            assert db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+
+
 def test_worker_failure_is_safe_and_other_monitors_continue(repo):
     first = repo.create(definition(), enabled=True, now=BASE)
     second = repo.create(definition(name='other'), enabled=True, now=BASE)

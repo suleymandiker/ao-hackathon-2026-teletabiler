@@ -5,7 +5,8 @@ One success transaction owns the result, reference receipts and watermark.
 """
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from enum import Enum
 import json
 from pathlib import Path
 import sqlite3
@@ -49,8 +50,25 @@ class ScheduleSummary:
     next_due_at: datetime | None
 
 
+def _json_safe(value):
+    """Convert only supported monitoring payload types at the storage boundary."""
+    if value is None or (isinstance(value, (bool, int, float, str)) and not isinstance(value, Enum)):
+        return value
+    if isinstance(value, datetime):
+        return utc(value).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return _json_safe(value.value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    raise TypeError(f'Object of type {type(value).__name__} is not JSON serializable')
+
+
 def encode(value):
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+    return json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
 
 def definition_json(definition):
