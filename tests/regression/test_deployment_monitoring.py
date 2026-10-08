@@ -627,6 +627,76 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     assert retry.id == run.id and retry.window == run.window
 
 
+def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(repo, monkeypatch):
+    import monitoring.execution as execution
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.metrics_source import WindowMetrics
+    from monitoring.worker import MonitorWorker
+
+    repo.compact_mode = True
+    events = []
+    secret = 'synthetic-private-source-value'
+    bad = record('left', 3, secret)
+    bad = replace(bad, stream_identity=replace(bad.stream_identity, namespace='wrong'))
+    class Client:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    class MetricsSource:
+        requests = 1
+        def __init__(self, client):
+            pass
+        def window(self, run):
+            return WindowMetrics(1, (), {}, {}, 0, 0, True, True, {})
+    class Acquisition:
+        pages_read = 1
+        records_read = 1
+        shards_completed = 1
+        completed_unique_records = 1
+        last_state = {'shard_id': '0L', 'status': 'COMPLETE', 'pages_read': 1,
+                      'records_read': 1, 'unique_records': 1}
+        acquisition_duration_seconds = 0.01
+        def __init__(self, source, metrics_source, definition, **kwargs):
+            pass
+        def pages(self, shards):
+            events.append('ACQUISITION_SHARD_COMPLETE')
+            yield page((bad,))
+            events.append('ACQUISITION_SHARD_START_0R')
+    monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
+    monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
+    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password',
+                              True, True, 'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
+    logs = []
+    executor = execution.OpenSearchMonitorExecutor(
+        lambda: pytest.fail('Invalid acquired record must not start pipeline'),
+        connection_loader=lambda size: config, client_factory=lambda cfg: Client(),
+        source_factory=lambda client: object(), repository=repo,
+        log=lambda event, **values: logs.append((event, values)))
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    worker = MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17),
+                           log=lambda event, **values: logs.append((event, values)))
+    assert worker.tick() == 0
+    run = repo.history(monitor.id)[0]
+    assert run.status.value == 'FAILED' and run.error_category == 'OPENSEARCH_QUERY'
+    assert repo.get(monitor.id).last_successful_end is None
+    assert events == ['ACQUISITION_SHARD_COMPLETE']
+    with repo._read_connection() as db:
+        row = db.execute('SELECT safe_reason_code,error_stage FROM monitor_runs WHERE id=?',
+                         (run.id,)).fetchone()
+        assert tuple(row) == ('INVALID_RESPONSE', 'content_acquisition')
+        assert db.execute('SELECT count(*) FROM monitor_baseline_state').fetchone()[0] == 0
+        assert db.execute('SELECT count(*) FROM monitor_findings').fetchone()[0] == 0
+    diagnostics = repo.acquisition_diagnostics(run.id)
+    assert diagnostics['reason_code'] == 'INVALID_RESPONSE'
+    assert diagnostics['error_stage'] == 'content_acquisition'
+    assert diagnostics['last_shard']['status'] == 'COMPLETE'
+    assert ('FAILED', {'run_id': run.id, 'category': 'OPENSEARCH_QUERY',
+            'safe_reason_code': 'INVALID_RESPONSE', 'error_stage': 'content_acquisition'}) in logs
+    assert secret not in str(logs) + str(diagnostics)
+
+
 @pytest.mark.parametrize('guard,constant,reason,original_limit', [
     ('stream', 'MAX_STREAMS', 'STREAM_CARDINALITY_LIMIT', 10_000),
     ('pattern', 'MAX_PATTERNS', 'PATTERN_CARDINALITY_LIMIT', 1_000),

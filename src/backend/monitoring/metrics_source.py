@@ -77,13 +77,25 @@ class OpenSearchMetricsSource:
             body['aggs'] = aggregations
         self.requests += 1
         payload = self.client.post_json('/' + quote(index, safe='*,.-_') + '/_search', body)
-        if not isinstance(payload, dict) or payload.get('timed_out') is not False:
+        if not isinstance(payload, dict):
+            raise OpenSearchSourceError('Metrics response must be an object')
+        if payload.get('timed_out') is True:
             raise OpenSearchSourceError('Metrics search timed out or lacks completion evidence')
+        if payload.get('timed_out') is not False:
+            raise OpenSearchSourceError('Metrics response lacks completion evidence')
         shards = payload.get('_shards')
-        if not isinstance(shards, dict) or type(shards.get('failed')) is not int or shards['failed']:
-            raise OpenSearchSourceError('Metrics shard failure or missing shard status')
-        total = (payload.get('hits') or {}).get('total')
-        if not isinstance(total, dict) or type(total.get('value')) is not int or total.get('relation') != 'eq':
+        if not isinstance(shards, dict) or type(shards.get('failed')) is not int:
+            raise OpenSearchSourceError('Metrics response missing shard status')
+        if shards['failed'] < 0:
+            raise OpenSearchSourceError('Metrics response invalid shard status')
+        if shards['failed']:
+            raise OpenSearchSourceError('Metrics shard failure')
+        hits = payload.get('hits')
+        if not isinstance(hits, dict):
+            raise OpenSearchSourceError('Metrics response missing hit count')
+        total = hits.get('total')
+        if (not isinstance(total, dict) or type(total.get('value')) is not int or
+                total['value'] < 0 or total.get('relation') != 'eq'):
             raise OpenSearchSourceError('Exact metrics count unavailable')
         return total['value'], payload.get('aggregations') or {}, index
 

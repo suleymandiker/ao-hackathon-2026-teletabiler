@@ -191,6 +191,9 @@ class SQLiteMonitorRepository:
             if version not in (0, 1, 2, 3, 4, 5):
                 raise ValueError('Unsupported monitoring schema version')
             if version == 5:
+                columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
+                if 'reason_streak' not in columns:
+                    db.execute('ALTER TABLE monitor_runs ADD COLUMN reason_streak INTEGER NOT NULL DEFAULT 0')
                 return
             # Refuse accidental use of an existing policy/template database.
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -265,6 +268,7 @@ class SQLiteMonitorRepository:
                 'physical_logs': 'INTEGER', 'pattern_count': 'INTEGER',
                 'duration_ms': 'INTEGER', 'error_stage': 'TEXT',
                 'safe_reason_code': 'TEXT',
+                'reason_streak': 'INTEGER NOT NULL DEFAULT 0',
             }
             for name, kind in run_fields.items():
                 if name not in run_columns:
@@ -574,7 +578,7 @@ class SQLiteMonitorRepository:
             db.execute('''UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,
                 physical_logs=?,pattern_count=?,duration_ms=?,result_reference=NULL,
                 error_category=NULL,error_summary=NULL,acquisition_diagnostics=NULL,
-                error_stage=NULL,safe_reason_code=NULL WHERE id=?''',
+                error_stage=NULL,safe_reason_code=NULL,reason_streak=0 WHERE id=?''',
                 (now.isoformat(), encode(asdict(counts)), int(metrics['total_physical_logs']),
                  len(patterns), duration_ms, run.id))
             following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
@@ -615,24 +619,30 @@ class SQLiteMonitorRepository:
                     if key not in ('effective_query', 'query', 'request_body', 'response_body')}
             payload = encode(presentation_result({}, safe, None)['source_summary'])
         now = utc(now)
-        from monitoring.errors import NON_RETRYABLE_ACQUISITION_REASONS
+        from monitoring.errors import (ACQUISITION_REASONS, NON_RETRYABLE_ACQUISITION_REASONS,
+                                       PIPELINE_STAGES)
         with self._transaction() as db:
             if not self._owned(db, run):
                 return
             if not self.compact_mode:
                 db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
-            previous = db.execute('SELECT safe_reason_code,attempts FROM monitor_runs WHERE id=?',
+            previous = db.execute('SELECT safe_reason_code,reason_streak FROM monitor_runs WHERE id=?',
                                   (run.id,)).fetchone()
             reason = diagnostics.get('reason_code') if isinstance(diagnostics, dict) else None
-            if reason not in NON_RETRYABLE_ACQUISITION_REASONS:
+            if category.startswith('OPENSEARCH') and reason not in ACQUISITION_REASONS:
+                reason = 'QUERY_FAILURE_UNKNOWN'
+            elif reason not in ACQUISITION_REASONS:
                 reason = None
-            blocked = bool(reason and previous['safe_reason_code'] == reason and previous['attempts'] >= 3)
+            stage = (diagnostics.get('error_stage') or diagnostics.get('pipeline_stage')) if diagnostics else None
+            stage = stage if stage in PIPELINE_STAGES else None
+            streak = ((previous['reason_streak'] + 1 if previous['safe_reason_code'] == reason else 1)
+                      if reason in NON_RETRYABLE_ACQUISITION_REASONS else 0)
+            blocked = streak >= 3
             db.execute("""UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=?,
-                       acquisition_diagnostics=?,error_stage=?,safe_reason_code=? WHERE id=?""",
+                       acquisition_diagnostics=?,error_stage=?,safe_reason_code=?,reason_streak=? WHERE id=?""",
                        (now.isoformat(), category, MESSAGES[category], payload,
-                        str(diagnostics.get('pipeline_stage') or '')[:80] if diagnostics else None,
-                        reason or (str(diagnostics.get('reason_code') or '')[:80] if diagnostics else None),
+                        stage, reason, streak,
                         run.id))
             db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
                 revision=revision+1,latest_run_id=?,latest_status='FAILED',latest_completed_at=? WHERE id=?''',

@@ -240,6 +240,139 @@ def test_nonretryable_failure_blocks_same_window_after_three_attempts(tmp_path):
     assert repo.get(monitor.id).last_successful_end == retry.window.end
 
 
+def test_legacy_attempt_count_does_not_shortcut_new_reason_streak(tmp_path):
+    repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    run = repo.claim(BASE + timedelta(minutes=7))
+    with repo._transaction() as db:
+        db.execute('UPDATE monitor_runs SET attempts=63 WHERE id=?', (run.id,))
+    for number in range(1, 4):
+        now = BASE + timedelta(minutes=7 * number)
+        if number > 1:
+            run = repo.claim(now)
+        repo.fail(run, 'OPENSEARCH_QUERY', now=now,
+                  diagnostics={'reason_code': 'INVALID_RESPONSE', 'error_stage': 'content_acquisition'})
+        assert repo.get(monitor.id).status.value == ('BLOCKED' if number == 3 else 'ERROR')
+        with repo._read_connection() as db:
+            row = db.execute('SELECT safe_reason_code,error_stage,reason_streak FROM monitor_runs WHERE id=?',
+                             (run.id,)).fetchone()
+        assert tuple(row) == ('INVALID_RESPONSE', 'content_acquisition', number)
+    assert repo.get(monitor.id).last_successful_end is None
+
+
+def test_reason_change_restarts_blocking_streak_and_success_clears_it(tmp_path):
+    repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    for number, reason in enumerate(('INVALID_CURSOR', 'INVALID_CURSOR',
+                                     'INVALID_RESPONSE', 'INVALID_RESPONSE',
+                                     'INVALID_RESPONSE'), 1):
+        now = BASE + timedelta(minutes=7 * number)
+        run = repo.claim(now)
+        repo.fail(run, 'OPENSEARCH_QUERY', now=now, diagnostics={'reason_code': reason})
+        with repo._read_connection() as db:
+            streak = db.execute('SELECT reason_streak FROM monitor_runs WHERE id=?', (run.id,)).fetchone()[0]
+        assert streak == (number if number <= 2 else number - 2)
+        assert repo.get(monitor.id).status.value == ('BLOCKED' if number == 5 else 'ERROR')
+    blocked = repo.get(monitor.id)
+    assert blocked.next_run_at >= now + timedelta(hours=1)
+    assert repo.claim(now + timedelta(minutes=10)) is None
+    retry = repo.claim(blocked.next_run_at)
+    assert retry.id == run.id and retry.window == run.window
+    repo.succeed(retry, {}, RunCounts(), {}, now=blocked.next_run_at,
+                 metrics={'total_physical_logs': 0}, pattern_metrics=())
+    assert repo.get(monitor.id).status.value == 'ACTIVE'
+    assert repo.get(monitor.id).last_successful_end == run.window.end
+    with repo._read_connection() as db:
+        assert db.execute('SELECT reason_streak FROM monitor_runs WHERE id=?', (run.id,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('reason,retryable', [
+    ('SEARCH_TIMEOUT', True), ('HTTP_429', True), ('HTTP_5XX', True),
+    ('SHARD_FAILURE', True), ('INVALID_RESPONSE', False),
+    ('QUERY_FAILURE_UNKNOWN', False),
+])
+def test_right_child_count_failure_has_safe_planning_stage(reason, retryable):
+    from ingestion_layer.contracts import SourcePage
+    from ingestion_layer.opensearch_client import OpenSearchClientError
+    from monitoring.sharded_acquisition import AcquisitionShard, StreamingAcquisition
+
+    events = []
+    class Source:
+        def read_page(self, **kwargs):
+            return SourcePage((), True, None, False, False)
+    class Metrics:
+        right_calls = 0
+        def count(self, start, end, definition):
+            if start == BASE:
+                return 3000 if end == BASE + timedelta(minutes=5) else 0
+            if (start != BASE + timedelta(minutes=2, seconds=30) or
+                    end != BASE + timedelta(minutes=5)):
+                return 0
+            self.right_calls += 1
+            raise OpenSearchClientError('synthetic-private-response', reason, retryable)
+    metrics = Metrics()
+    acquisition = StreamingAcquisition(Source(), metrics, definition(),
+                                       log=lambda event, **values: events.append((event, values)),
+                                       sleep=lambda delay: None)
+    if retryable:
+        assert len(list(acquisition.pages((AcquisitionShard(BASE, BASE + timedelta(minutes=5)),)))) == 3
+        assert acquisition.shards_completed == 3
+        assert any(event == 'ACQUISITION_SPLIT' and values['shard_id'] == '0R'
+                   for event, values in events)
+    else:
+        with pytest.raises(OpenSearchClientError):
+            list(acquisition.pages((AcquisitionShard(BASE, BASE + timedelta(minutes=5)),)))
+        assert acquisition.shards_completed == 1
+        assert acquisition.last_state['shard_id'] == '0R'
+        assert acquisition.last_state['error_stage'] == 'shard_planning'
+        assert acquisition.last_state['failure_category'] == reason
+    assert ('ACQUISITION_SHARD_COMPLETE', {'shard_id': '0L', 'pages_read': 1,
+            'records_read': 0, 'unique_records': 0}) in events
+    assert any(event == 'ACQUISITION_SHARD_START' and values['shard_id'] == '0R'
+               for event, values in events)
+    assert metrics.right_calls == (3 if retryable else 1)
+    assert 'synthetic-private-response' not in str(events)
+
+
+@pytest.mark.parametrize('payload,reason', [
+    ({}, 'INVALID_RESPONSE'),
+    ({'timed_out': False}, 'INVALID_RESPONSE'),
+    ({'timed_out': False, '_shards': {'failed': 0}, 'hits': []}, 'INVALID_RESPONSE'),
+    ({'timed_out': False, '_shards': {'failed': 1}}, 'SHARD_FAILURE'),
+    ({'timed_out': True, '_shards': {'failed': 0}}, 'SEARCH_TIMEOUT'),
+])
+def test_metrics_count_classifies_structural_and_transient_responses(payload, reason):
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from ingestion_layer.opensearch_source import OpenSearchSourceError
+    from monitoring.metrics_source import OpenSearchMetricsSource
+
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'user', 'password', True,
+                              True, 'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
+    class Client:
+        def __init__(self):
+            self.config = config
+        def post_json(self, path, body, params=None):
+            return payload
+    with pytest.raises(OpenSearchSourceError) as captured:
+        OpenSearchMetricsSource(Client()).count(BASE, BASE + timedelta(minutes=5), definition())
+    assert captured.value.reason_code == reason
+    assert captured.value.retryable is (reason in {'SEARCH_TIMEOUT', 'SHARD_FAILURE'})
+
+
+@pytest.mark.parametrize('message,reason', [
+    ('Invalid or incompatible OpenSearch cursor', 'INVALID_CURSOR'),
+    ('Missing or non-string message', 'MISSING_REQUIRED_FIELD'),
+    ('Missing or invalid source timestamp', 'INVALID_TIMESTAMP'),
+    ('Missing or non-integer sequence', 'INVALID_SEQUENCE'),
+    ('Search response must be an object', 'INVALID_RESPONSE'),
+])
+def test_required_source_contract_failures_have_nonretryable_safe_reasons(message, reason):
+    from ingestion_layer.opensearch_source import OpenSearchSourceError
+    error = OpenSearchSourceError(message)
+    assert error.reason_code == reason
+    assert error.retryable is False
+
+
 def test_v4_history_backfills_equivalent_ordered_baseline(tmp_path):
     path = tmp_path / 'monitor.sqlite3'
     legacy = SQLiteMonitorRepository(path)

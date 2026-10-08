@@ -12,7 +12,7 @@ from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourc
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
-from monitoring.errors import MonitoringError, safe_failure_details, ACQUISITION_REASONS
+from monitoring.errors import MonitoringError, safe_failure_details, ACQUISITION_REASONS, safe_pipeline_stage
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
@@ -186,7 +186,7 @@ class OpenSearchMonitorExecutor:
             nonlocal pipeline_stage
             pipeline_stage = stage
 
-        def failure(category, *, error=None, reason_code=None):
+        def failure(category, *, error=None, reason_code=None, stage=None):
             if acquisition is not None:
                 summary.update(pages_read=acquisition.pages_read,
                                records_read=acquisition.records_read,
@@ -199,13 +199,22 @@ class OpenSearchMonitorExecutor:
                 summary['stop_reason'] = 'acquisition_failed'
             if category == 'PIPELINE' and error is not None:
                 summary.update(safe_failure_details(pipeline_stage, error))
-            if reason_code is None and acquisition is not None and acquisition.last_state is not None:
-                reason_code = acquisition.last_state.get('failure_category')
+            shard_failure = (acquisition.last_state if acquisition is not None and
+                             acquisition.last_state is not None and
+                             acquisition.last_state.get('status') == 'FAILED' else None)
+            if reason_code is None and shard_failure is not None:
+                reason_code = shard_failure.get('failure_category')
+            if category.startswith('OPENSEARCH') and reason_code not in ACQUISITION_REASONS:
+                reason_code = 'QUERY_FAILURE_UNKNOWN'
             if reason_code in ACQUISITION_REASONS:
                 summary['reason_code'] = reason_code
             else:
                 reason_code = None
-            error = MonitoringError(category, reason_code=reason_code)
+            if category.startswith('OPENSEARCH'):
+                summary['error_stage'] = safe_pipeline_stage(
+                    stage or (shard_failure or {}).get('error_stage') or pipeline_stage)
+            error = MonitoringError(category, reason_code=reason_code,
+                                    stage=summary.get('error_stage'))
             safe_summary = {key: value for key, value in summary.items()
                             if key not in ('effective_query', 'query', 'request_body', 'response_body')}
             error.acquisition_diagnostics = redact_ai_secret(
@@ -270,7 +279,8 @@ class OpenSearchMonitorExecutor:
                                     stamp = source_time(record)
                                     identity = record.stream_identity
                                     if stamp is None:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP')
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
+                                                              stage='content_acquisition')
                                     if (not start <= stamp < end or identity is None or
                                             record.source_reference.source_scope != config.source_scope or
                                             identity.namespace != definition.namespace or
@@ -278,7 +288,8 @@ class OpenSearchMonitorExecutor:
                                             (definition.container and identity.container != definition.container) or
                                             (definition.document_cluster_id and
                                              identity.source_scope != definition.document_cluster_id)):
-                                        raise MonitoringError('OPENSEARCH_QUERY')
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                              stage='content_acquisition')
                                     key = reference_key(record)
                                     repeated = ledger.seen(key, stamp.isoformat())
                                     trace.acquisition(record, timestamp=stamp,
@@ -315,7 +326,8 @@ class OpenSearchMonitorExecutor:
                                 break
                         if not buffered_pages:
                             if first_empty is None:
-                                raise MonitoringError('OPENSEARCH_QUERY')
+                                raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                      stage='content_acquisition')
                             buffered_pages = [first_empty]
                         if sample and metrics.total:
                             mark_pipeline_stage('policy_resolution')
@@ -353,7 +365,8 @@ class OpenSearchMonitorExecutor:
                         if any(count for reason, count in reasons.items() if reason not in allowed_reasons):
                             raise MonitoringError('POLICY')
                     if unique_inside_window != metrics.total:
-                        raise MonitoringError('OPENSEARCH_QUERY')
+                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                              stage='content_acquisition')
                     summary.update(pages_read=acquisition.pages_read,
                                    records_read=acquisition.records_read,
                                    unique_records=unique, duplicate_records=duplicates,
@@ -398,7 +411,7 @@ class OpenSearchMonitorExecutor:
                                            sanitize(compact),
                                            tuple(sanitize(item) for item in accumulator.pattern_metrics()))
         except MonitoringError as error:
-            raise failure(error.category, reason_code=error.reason_code) from None
+            raise failure(error.category, reason_code=error.reason_code, stage=error.stage) from None
         except OpenSearchClientError as error:
             category = ('OPENSEARCH_AUTH' if error.reason_code == 'AUTH_FAILURE'
                         else 'OPENSEARCH_TIMEOUT' if error.reason_code == 'CONNECTION_TIMEOUT'

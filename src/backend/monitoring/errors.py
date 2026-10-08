@@ -129,7 +129,9 @@ def safe_pipeline_details(diagnostics):
 
 
 class MonitoringError(Exception):
-    def __init__(self, category, *, reason_code=None):
+    def __init__(self, category, *, reason_code=None, stage=None):
         self.category = category if category in MESSAGES else 'UNKNOWN'
         self.reason_code = reason_code if reason_code in ACQUISITION_REASONS else None
+        self.retryable = self.reason_code in ACQUISITION_REASONS - NON_RETRYABLE_ACQUISITION_REASONS
+        self.stage = stage if stage in PIPELINE_STAGES else None
         super().__init__(MESSAGES[self.category])

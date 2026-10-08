@@ -91,10 +91,14 @@ class MonitorWorker:
                 except Exception:
                     category = 'PERSISTENCE'
                 details = safe_pipeline_details(diagnostics) if category == 'PIPELINE' else {}
-                if category.startswith('OPENSEARCH') and isinstance(diagnostics, dict):
-                    reason = diagnostics.get('reason_code')
-                    if reason in ACQUISITION_REASONS:
-                        details['reason_code'] = reason
+                if category.startswith('OPENSEARCH'):
+                    reason = diagnostics.get('reason_code') if isinstance(diagnostics, dict) else None
+                    details['safe_reason_code'] = (reason if reason in ACQUISITION_REASONS
+                                                   else 'QUERY_FAILURE_UNKNOWN')
+                    stage = diagnostics.get('error_stage') if isinstance(diagnostics, dict) else None
+                    if stage in ('source_setup', 'metrics_acquisition', 'shard_planning',
+                                 'content_acquisition'):
+                        details['error_stage'] = stage
                 self.log('FAILED', run_id=run.id, category=category, **details)
             finally:
                 receipt_state = getattr(result, 'receipts', None)

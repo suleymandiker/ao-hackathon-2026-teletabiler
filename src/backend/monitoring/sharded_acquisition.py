@@ -95,11 +95,11 @@ class StreamingAcquisition:
         self.last_state = None
         self.acquisition_duration_seconds = 0.0
 
-    def _state(self, shard, status, *, pages=0, records=0, unique=0, failure=None):
+    def _state(self, shard, status, *, pages=0, records=0, unique=0, failure=None, stage=None):
         self.last_state = dict(shard_id=shard.shard_id, start=shard.start.isoformat(),
                                end=shard.end.isoformat(), depth=shard.depth,
                                status=status, pages_read=pages, records_read=records,
-                               unique_records=unique, failure_category=failure)
+                               unique_records=unique, failure_category=failure, error_stage=stage)
         if self.shard_sink is not None:
             self.shard_sink(shard, status, pages=pages, records=records, unique=unique, failure=failure)
 
@@ -122,13 +122,20 @@ class StreamingAcquisition:
                  start=shard.start.isoformat(), end=shard.end.isoformat(), depth=shard.depth)
         self._state(shard, 'RUNNING')
         counted_at = time.monotonic()
+        count_error = None
         try:
             expected = self._request(lambda: self.metrics_source.count(shard.start, shard.end, self.definition))
         except Exception as error:
-            self._state(shard, 'FAILED', failure=getattr(error, 'reason_code', 'QUERY_FAILURE_UNKNOWN'))
-            raise
+            count_error = error
         finally:
             self.acquisition_duration_seconds += time.monotonic() - counted_at
+        if count_error is not None:
+            reason = getattr(count_error, 'reason_code', 'QUERY_FAILURE_UNKNOWN')
+            if reason in SPLITTABLE_PRESSURE_REASONS and self._can_split(shard):
+                yield from self._split(shard)
+                return
+            self._state(shard, 'FAILED', failure=reason, stage='shard_planning')
+            raise count_error
         capacity = min(MAX_BUFFERED_RECORDS,
                        self.definition.page_size * max(1, self.definition.max_pages - 1))
         if expected > capacity:
@@ -158,7 +165,7 @@ class StreamingAcquisition:
                     split_for_pressure = True
                 else:
                     self._state(shard, 'FAILED', pages=page_number - 1, records=records,
-                                unique=len(unique), failure=reason)
+                                unique=len(unique), failure=reason, stage='content_acquisition')
                     raise
             finally:
                 self.acquisition_duration_seconds += time.monotonic() - requested_at
@@ -184,7 +191,7 @@ class StreamingAcquisition:
                 break
             if page.next_cursor is None or page.next_cursor == cursor:
                 self._state(shard, 'FAILED', pages=page_number, records=records,
-                            unique=len(unique), failure='OPENSEARCH_QUERY')
+                            unique=len(unique), failure='INVALID_CURSOR', stage='content_acquisition')
                 raise OpenSearchSourceError('Acquisition continuation unavailable')
             cursor = page.next_cursor
         if not exhausted or len(unique) < expected:
@@ -195,7 +202,7 @@ class StreamingAcquisition:
             return
         if len(unique) != expected:
             self._state(shard, 'FAILED', pages=page_number, records=records,
-                        unique=len(unique), failure='OPENSEARCH_QUERY')
+                        unique=len(unique), failure='INVALID_RESPONSE', stage='content_acquisition')
             raise OpenSearchSourceError('Source changed during exact shard acquisition')
         self._state(shard, 'COMPLETE', pages=page_number, records=records, unique=len(unique))
         self.log('ACQUISITION_SHARD_COMPLETE', shard_id=shard.shard_id,
