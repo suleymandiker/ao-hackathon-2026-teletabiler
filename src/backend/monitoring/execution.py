@@ -12,7 +12,7 @@ from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourc
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
-from monitoring.errors import MonitoringError, safe_exception_type, safe_pipeline_stage
+from monitoring.errors import MonitoringError, safe_failure_details
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
@@ -186,8 +186,7 @@ class OpenSearchMonitorExecutor:
             elif category.startswith('OPENSEARCH'):
                 summary['stop_reason'] = 'acquisition_failed'
             if category == 'PIPELINE' and error is not None:
-                summary.update(pipeline_stage=safe_pipeline_stage(pipeline_stage),
-                               exception_type=safe_exception_type(error))
+                summary.update(safe_failure_details(pipeline_stage, error))
             error = MonitoringError(category)
             error.acquisition_diagnostics = redact_ai_secret(
                 application.presentation_result({}, summary, config)['source_summary'])
@@ -437,8 +436,7 @@ class OpenSearchMonitorExecutor:
             elif category.startswith('OPENSEARCH'):
                 summary['stop_reason'] = 'acquisition_failed'
             if category == 'PIPELINE' and error is not None:
-                summary.update(pipeline_stage=safe_pipeline_stage(pipeline_stage),
-                               exception_type=safe_exception_type(error))
+                summary.update(safe_failure_details(pipeline_stage, error))
             error = MonitoringError(category)
             error.acquisition_diagnostics = redact_ai_secret(application.presentation_result({}, summary, config)['source_summary'])
             return error

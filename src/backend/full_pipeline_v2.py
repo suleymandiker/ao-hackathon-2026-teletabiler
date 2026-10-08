@@ -204,10 +204,12 @@ class FullAIOpsPipelineV2:
                             })
                     elif admitted(output):
                         yield output
+                        mark_stage('assembly')
             mark_stage('assembly')
             for output in session.close():
                 if admitted(output):
                     yield output
+                    mark_stage('assembly')
 
         events = logical_events()
         try:
@@ -262,7 +264,7 @@ class FullAIOpsPipelineV2:
             if stage_callback is not None:
                 stage_callback(name)
 
-        mark_stage('parsing')
+        mark_stage('time_quality')
         time_quality = TimeQuality.from_env()
         templated: List[Dict[str,Any]]=[]
         trace_limit = 200
@@ -294,21 +296,25 @@ class FullAIOpsPipelineV2:
                     outcome = parse_with_outcome(raw, **parse_options)
                     event = outcome.event
                     if time_quality is not None:
+                        mark_stage('time_quality')
                         parsed_time = time_quality.parsed(event, outcome.parser_id)
                 else:
                     event = self.parser.process(raw, **parse_options)
                     if time_quality is not None:
+                        mark_stage('time_quality')
                         parsed_time = time_quality.parsed(event)
             else:
                 event=self.parser.process(raw, **parse_options)
             if isinstance(logical, AssembledEvent):
+                mark_stage('provenance_enrichment')
                 provenance = self._assembled_provenance(logical)
                 if event_provenance is not None:
                     event_provenance.append({'event_id': event.get('event_id') if event else None,
                                              'provenance': provenance})
                 if monitoring_accumulator is not None:
-                    mark_stage('accumulator')
+                    mark_stage('boundary_observation')
                     monitoring_accumulator.observe_boundary(logical, event.get('event_id') if event else None)
+                    mark_stage('provenance_enrichment')
                 if event:
                     # Attach diagnostics AFTER the builder has assigned identity.
                     # Preserve source attributes on collision, using the same
@@ -327,14 +333,15 @@ class FullAIOpsPipelineV2:
             if not event: continue
             stats['parsed']+=1
             if monitoring_accumulator is not None:
-                mark_stage('accumulator')
+                mark_stage('parsed_observation')
                 monitoring_accumulator.observe_parsed(event)
+            mark_stage('template_processing')
             if len(trace['parser']) < trace_limit:
                 trace['parser'].append(dict(event))
-            mark_stage('template_processing')
             result=self.templater.process(event)
             if not result:
                 if time_quality is not None:
+                    mark_stage('time_quality')
                     time_quality.not_delivered(parsed_time)
                 continue
             row=dict(event); row.update({'template_id':result.template_id,'template':result.template,'template_reliable':result.reliable})
@@ -348,11 +355,14 @@ class FullAIOpsPipelineV2:
             if monitoring_accumulator is None:
                 templated.append(row)
             else:
-                mark_stage('accumulator')
+                mark_stage('template_accumulation')
                 monitoring_accumulator.add(row, new=bool(decision.get('promoted')))
+            mark_stage('template_processing')
             stats['templated']+=1; stats['template_unreliable']+=0 if result.reliable else 1
             if time_quality is not None:
+                mark_stage('time_quality')
                 time_quality.downstream(row, parsed_time)
+            mark_stage('template_processing')
             if len(trace['template']) < trace_limit:
                 trace['template'].append(dict(row))
         print(f"[PIPELINE] Segmentasyon={stats['segmented']} | Ayrıştırma={stats['parsed']} | Şablonlama={stats['templated']}")
@@ -360,11 +370,16 @@ class FullAIOpsPipelineV2:
         if monitoring_accumulator is None:
             downstream=self.downstream.process(templated, **({'observer': observer} if observer is not None else {}))
         else:
-            downstream=self.downstream.process_aggregates(monitoring_accumulator.signals(), observer=observer,
+            mark_stage('template_accumulation')
+            aggregates = monitoring_accumulator.signals()
+            mark_stage('downstream')
+            downstream=self.downstream.process_aggregates(aggregates, observer=observer,
                                                            reference=monitoring_accumulator.latest_event_ms,
                                                            max_qualified_signals=200)
         if time_quality is not None:
+            mark_stage('time_quality')
             time_quality.report(downstream)
+        mark_stage('result_building')
         downstream['stats']={**stats,**downstream['stats']}
         downstream['pipeline_trace'] = {
             'sample_limit': trace_limit,

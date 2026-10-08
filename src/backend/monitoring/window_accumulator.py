@@ -8,9 +8,11 @@ import json
 from aggregation_layer.aggregator import _infer_identity, _resource, _severity_number
 from analysis_time import source_time_ms
 from evidence_redaction import redact_text
+from monitoring.errors import MonitoringLimitError
 from parser_layer.timestamp.source_policy import BASES
 
 
+MAX_STREAMS = 10_000
 MAX_PATTERNS = 1_000
 MAX_SIGNAL_GROUPS = 1_000
 MAX_DISTRIBUTION_KEYS = 32
@@ -139,8 +141,8 @@ class WindowAccumulator:
         stream_id = hashlib.sha256(json.dumps((stream.source_scope, stream.pod_instance,
                                                 stream.container_instance, stream.channel),
                                                separators=(',', ':')).encode()).hexdigest()
-        if len(self.streams) >= 10_000 and stream_id not in self.streams:
-            raise ValueError('Monitoring stream cardinality limit reached')
+        if len(self.streams) >= MAX_STREAMS and stream_id not in self.streams:
+            raise MonitoringLimitError('STREAM_CARDINALITY_LIMIT', len(self.streams) + 1, MAX_STREAMS)
         self.streams.add(stream_id)
         _count(self.stream_counts, stream_id)
         if status == 'complete' or len(self.boundary_samples) >= MAX_BOUNDARY_SAMPLES:
@@ -170,10 +172,10 @@ class WindowAccumulator:
         tid = str(row['template_id'])
         if tid not in self.patterns:
             if len(self.patterns) >= MAX_PATTERNS:
-                raise ValueError('Monitoring pattern cardinality limit reached')
+                raise MonitoringLimitError('PATTERN_CARDINALITY_LIMIT', len(self.patterns) + 1, MAX_PATTERNS)
             template = str(row.get('template') or '')
             if len(template) > MAX_TEMPLATE_CHARS:
-                raise ValueError('Monitoring template exceeds bounded state limit')
+                raise MonitoringLimitError('TEMPLATE_LENGTH_LIMIT', len(template), MAX_TEMPLATE_CHARS)
             self.patterns[tid] = _Pattern(tid, template)
         self.patterns[tid].add(row, new=new)
 
@@ -186,7 +188,7 @@ class WindowAccumulator:
         key = (alarm_type or tid, tid, identity, bucket)
         if key not in self.groups:
             if len(self.groups) >= MAX_SIGNAL_GROUPS:
-                raise ValueError('Monitoring signal cardinality limit reached')
+                raise MonitoringLimitError('SIGNAL_CARDINALITY_LIMIT', len(self.groups) + 1, MAX_SIGNAL_GROUPS)
             self.groups[key] = _SignalGroup(dict(template_id=tid, template=self.patterns[tid].template,
                 service_name=service, component=component, host=host,
                 namespace=str(row.get('namespace') or (row.get('resource') or {}).get('namespace') or 'unknown'),

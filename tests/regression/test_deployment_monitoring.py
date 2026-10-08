@@ -484,12 +484,20 @@ def executor_for(pipeline, records_or_source, *, config=None):
     ('session', RuntimeError, 'segmentation_session'),
     ('parser', ValueError, 'parsing'),
     ('template', TypeError, 'template_processing'),
+    ('provenance', ValueError, 'provenance_enrichment'),
+    ('boundary_observation', ValueError, 'boundary_observation'),
+    ('parsed_observation', ValueError, 'parsed_observation'),
+    ('template_accumulation', ValueError, 'template_accumulation'),
+    ('time_quality', ValueError, 'time_quality'),
+    ('template_limit', None, 'template_accumulation'),
 ])
 def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
         repo, pipeline, monkeypatch, boundary, error_type, expected_stage):
     import full_pipeline_v2
     import monitoring.execution as execution
+    import monitoring.window_accumulator as window_accumulator
     from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.errors import MonitoringLimitError
     from monitoring.metrics_source import WindowMetrics
     from monitoring.worker import MonitorWorker
     from segmentation_layer.contracts import SegmentationPolicy
@@ -501,11 +509,32 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
         monkeypatch.setattr(full_pipeline_v2, 'SegmentationSession', explode)
     elif boundary == 'parser':
         monkeypatch.setattr(pipeline.parser, 'process_with_outcome', explode)
-    else:
+    elif boundary == 'template':
         monkeypatch.setattr(pipeline.templater, 'process', explode)
+    elif boundary == 'provenance':
+        monkeypatch.setattr(pipeline, '_assembled_provenance', explode)
+    elif boundary == 'boundary_observation':
+        monkeypatch.setattr(window_accumulator.WindowAccumulator, 'observe_boundary', explode)
+    elif boundary == 'parsed_observation':
+        monkeypatch.setattr(window_accumulator.WindowAccumulator, 'observe_parsed', explode)
+    elif boundary == 'template_accumulation':
+        monkeypatch.setattr(window_accumulator.WindowAccumulator, 'add', explode)
+    elif boundary == 'time_quality':
+        class Quality:
+            def parsed(self, *args, **kwargs):
+                return None
+            def downstream(self, *args, **kwargs):
+                explode()
+            def report(self, *args, **kwargs):
+                pass
+        monkeypatch.setattr(full_pipeline_v2.TimeQuality, 'from_env', lambda: Quality())
+    else:
+        error_type = MonitoringLimitError
+        monkeypatch.setattr(window_accumulator, 'MAX_TEMPLATE_CHARS', 0)
 
-    records = (record('a', 3, 'ERROR: first failure'),
-               record('b', 4, 'ERROR: second failure'))
+    private_value = 'synthetic-private-source-value'
+    records = (record('a', 3, 'ERROR: ' + private_value),
+               record('b', 4, 'ERROR: synthetic second line'))
     class Client:
         def __enter__(self):
             return self
@@ -554,6 +583,13 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     assert run.status.value == 'FAILED' and run.error_category == 'PIPELINE'
     assert diagnostics['pipeline_stage'] == expected_stage
     assert diagnostics['exception_type'] == error_type.__name__
+    if boundary == 'template_limit':
+        assert diagnostics['exception_file'] == 'src/backend/monitoring/window_accumulator.py'
+        assert diagnostics['exception_function'] == 'add'
+    else:
+        assert diagnostics['exception_file'] == 'src/backend/full_pipeline_v2.py'
+        assert diagnostics['exception_function'] in ('process_ingested_pages', '_process_logical_events')
+    assert type(diagnostics['exception_line']) is int and diagnostics['exception_line'] > 0
     assert diagnostics['policy_selection']['sampled_records'] == 2
     assert diagnostics['pages_read'] == 1 and diagnostics['records_read'] == 2
     assert repo.result(run.id) is None
@@ -561,9 +597,72 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     failed = next(values for event, values in logs if event == 'FAILED')
     assert failed['pipeline_stage'] == expected_stage
     assert failed['exception_type'] == error_type.__name__
-    assert secret not in str(diagnostics) + str(logs) + str(repo.history(monitor.id))
+    assert {key: failed[key] for key in ('exception_file', 'exception_function', 'exception_line')} == {
+        key: diagnostics[key] for key in ('exception_file', 'exception_function', 'exception_line')}
+    if boundary == 'template_limit':
+        assert {key: diagnostics[key] for key in ('reason_code', 'observed', 'limit')} == {
+            'reason_code': 'TEMPLATE_LENGTH_LIMIT', 'observed': len('safe template'), 'limit': 0}
+        assert {key: failed[key] for key in ('reason_code', 'observed', 'limit')} == {
+            key: diagnostics[key] for key in ('reason_code', 'observed', 'limit')}
+    else:
+        assert all(key not in diagnostics for key in ('reason_code', 'observed', 'limit'))
+    persisted_and_logged = str(diagnostics) + str(logs) + str(repo.history(monitor.id))
+    assert secret not in persisted_and_logged
+    assert private_value not in persisted_and_logged
+    assert 'safe template' not in persisted_and_logged
     retry = repo.claim(BASE + timedelta(minutes=33))
     assert retry.id == run.id and retry.window == run.window
+
+
+@pytest.mark.parametrize('guard,constant,reason,original_limit', [
+    ('stream', 'MAX_STREAMS', 'STREAM_CARDINALITY_LIMIT', 10_000),
+    ('pattern', 'MAX_PATTERNS', 'PATTERN_CARDINALITY_LIMIT', 1_000),
+    ('template', 'MAX_TEMPLATE_CHARS', 'TEMPLATE_LENGTH_LIMIT', 8192),
+    ('signal', 'MAX_SIGNAL_GROUPS', 'SIGNAL_CARDINALITY_LIMIT', 1_000),
+])
+def test_accumulator_guards_expose_only_bounded_structural_details(
+        monkeypatch, guard, constant, reason, original_limit):
+    import monitoring.window_accumulator as module
+    from monitoring.errors import MonitoringLimitError, safe_failure_details
+
+    assert getattr(module, constant) == original_limit
+    monkeypatch.setattr(module, constant, 0)
+    accumulator = module.WindowAccumulator()
+    if guard == 'stream':
+        stream = SimpleNamespace(source_scope='synthetic', pod_instance='pod',
+                                 container_instance='container', channel='stdout')
+        assembled = SimpleNamespace(boundary_status='complete', emission_reason='next_header',
+                                    stream_key=stream)
+        operation = lambda: accumulator.observe_boundary(assembled, None)
+        expected_function = 'observe_boundary'
+    else:
+        monkeypatch.setattr(module, '_infer_identity', lambda row: ('unknown', 'unknown'))
+        monkeypatch.setattr(module, '_resource', lambda row, name: 'unknown')
+        operation = lambda: accumulator.add({'template_id': 'synthetic-id', 'template': 'x'})
+        expected_function = 'add'
+
+    with pytest.raises(MonitoringLimitError) as captured:
+        operation()
+    error = captured.value
+    details = safe_failure_details('template_accumulation', error)
+    assert error.args == (reason,)
+    assert (error.reason_code, error.observed, error.limit) == (reason, 1, 0)
+    assert {key: details[key] for key in ('reason_code', 'observed', 'limit')} == {
+        'reason_code': reason, 'observed': 1, 'limit': 0}
+    assert details['exception_type'] == 'MonitoringLimitError'
+    assert details['exception_file'] == 'src/backend/monitoring/window_accumulator.py'
+    assert details['exception_function'] == expected_function
+    assert type(details['exception_line']) is int and details['exception_line'] > 0
+    assert 'synthetic-id' not in str(details)
+
+
+def test_exception_site_omits_frames_outside_backend():
+    from monitoring.errors import safe_exception_site
+
+    try:
+        raise ValueError('synthetic-private-value')
+    except ValueError as error:
+        assert safe_exception_site(error) == {}
 
 
 def test_monitor_pipeline_timestamp_fallback_is_per_event_and_timezone_propagates(repo, pipeline):
