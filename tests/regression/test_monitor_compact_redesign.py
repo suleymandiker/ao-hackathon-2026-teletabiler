@@ -53,6 +53,50 @@ def test_future_schema_is_rejected_on_ui_read_path(tmp_path):
         SQLiteMonitorRepository(path, initialize=False)
 
 
+def test_sqlite_statistics_survive_repository_restart_and_maintenance(tmp_path):
+    path = tmp_path / 'monitor.sqlite3'
+    repo = SQLiteMonitorRepository(path, compact_mode=True)
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    with sqlite3.connect(path) as db:
+        db.execute('ANALYZE')
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'").fetchone()
+    repo.maintenance(BASE + timedelta(days=1), optimize=True)
+    reopened = SQLiteMonitorRepository(path, compact_mode=True)
+    assert reopened.get(monitor.id).id == monitor.id
+    with sqlite3.connect(path) as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'").fetchone()
+
+
+@pytest.mark.parametrize('table', ('unrelated_application_table', 'sqliteX_application_table'))
+def test_repository_still_rejects_unrelated_application_tables(tmp_path, table):
+    from monitoring.repository import MonitoringSchemaError
+
+    path = tmp_path / 'monitor.sqlite3'
+    SQLiteMonitorRepository(path, compact_mode=True)
+    with sqlite3.connect(path) as db:
+        db.execute(f'CREATE TABLE {table}(id INTEGER)')
+    with pytest.raises(MonitoringSchemaError) as caught:
+        SQLiteMonitorRepository(path, compact_mode=True)
+    assert caught.value.reason_code == 'OWNERSHIP_MISMATCH'
+
+
+def test_v5_statistics_and_missing_reason_streak_migrate_without_reset(tmp_path):
+    path = tmp_path / 'monitor.sqlite3'
+    repo = SQLiteMonitorRepository(path, compact_mode=True)
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    with sqlite3.connect(path) as db:
+        db.execute('ALTER TABLE monitor_runs DROP COLUMN reason_streak')
+        db.execute('ANALYZE')
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+    reopened = SQLiteMonitorRepository(path, compact_mode=True)
+    assert reopened.get(monitor.id).id == monitor.id
+    with sqlite3.connect(path) as db:
+        columns = {row[1] for row in db.execute('PRAGMA table_info(monitor_runs)')}
+        assert 'reason_streak' in columns
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+
+
 def test_compact_success_publishes_atomic_state_without_legacy_detail(tmp_path):
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
     monitor = repo.create(definition(), enabled=True, now=BASE)

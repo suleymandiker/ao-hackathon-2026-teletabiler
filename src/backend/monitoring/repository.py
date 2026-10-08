@@ -21,6 +21,33 @@ from monitoring.domain import (
 from monitoring.errors import MESSAGES
 
 
+class MonitoringSchemaError(ValueError):
+    """Stable monitoring database ownership/version failure."""
+
+    def __init__(self, message, reason_code):
+        self.reason_code = (reason_code if reason_code in
+                            ('OWNERSHIP_MISMATCH', 'UNSUPPORTED_SCHEMA_VERSION') else 'SCHEMA_INVALID')
+        super().__init__(message)
+
+
+_MONITORING_TABLES = frozenset({
+    'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
+    'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
+    'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state',
+})
+
+
+def _application_table_names(db):
+    """Exclude SQLite-reserved metadata, while retaining every application table."""
+    return {row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) NOT GLOB 'sqlite_*'")}
+
+
+def _validate_monitoring_ownership(db):
+    if _application_table_names(db) - _MONITORING_TABLES:
+        raise MonitoringSchemaError('Monitoring requires its own database', 'OWNERSHIP_MISMATCH')
+
+
 class MonitorRepository(Protocol):
     def create(self, definition: MonitorDefinition, *, enabled: bool, now: datetime) -> DeploymentMonitor: ...
     def get(self, monitor_id: str) -> DeploymentMonitor: ...
@@ -168,7 +195,8 @@ class SQLiteMonitorRepository:
             with self._read_connection() as db:
                 version = db.execute('PRAGMA user_version').fetchone()[0]
                 if version not in (4, 5):
-                    raise ValueError('Unsupported monitoring schema version')
+                    raise MonitoringSchemaError('Unsupported monitoring schema version',
+                                                'UNSUPPORTED_SCHEMA_VERSION')
 
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,30 +205,22 @@ class SQLiteMonitorRepository:
             setup.execute('PRAGMA busy_timeout=10000')
             version = setup.execute('PRAGMA user_version').fetchone()[0]
             if version not in (0, 1, 2, 3, 4, 5):
-                raise ValueError('Unsupported monitoring schema version')
-            names = {row[0] for row in setup.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            allowed = {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
-                       'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
-                       'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state'}
-            if names - allowed:
-                raise ValueError('Monitoring requires its own database')
+                raise MonitoringSchemaError('Unsupported monitoring schema version',
+                                            'UNSUPPORTED_SCHEMA_VERSION')
+            _validate_monitoring_ownership(setup)
             setup.execute('PRAGMA journal_mode=WAL')
             setup.execute('PRAGMA synchronous=NORMAL')
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
             if version not in (0, 1, 2, 3, 4, 5):
-                raise ValueError('Unsupported monitoring schema version')
+                raise MonitoringSchemaError('Unsupported monitoring schema version',
+                                            'UNSUPPORTED_SCHEMA_VERSION')
+            _validate_monitoring_ownership(db)
             if version == 5:
                 columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
                 if 'reason_streak' not in columns:
                     db.execute('ALTER TABLE monitor_runs ADD COLUMN reason_streak INTEGER NOT NULL DEFAULT 0')
                 return
-            # Refuse accidental use of an existing policy/template database.
-            names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            if names - {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
-                         'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
-                         'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state'}:
-                raise ValueError('Monitoring requires its own database')
             statements = (
                 '''CREATE TABLE IF NOT EXISTS monitors (
                     id TEXT PRIMARY KEY, definition TEXT NOT NULL, enabled INTEGER NOT NULL,

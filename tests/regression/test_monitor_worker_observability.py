@@ -97,6 +97,66 @@ def test_second_worker_reports_busy_without_running_scheduler(worker_module, tmp
     assert path.with_suffix('.worker.lock').exists()
 
 
+def test_worker_reports_schema_ownership_after_lock_without_exposing_error(
+        worker_module, tmp_path, monkeypatch, capsys):
+    import sqlite3
+    from monitoring.repository import SQLiteMonitorRepository
+
+    path = tmp_path / 'monitor.sqlite3'
+    SQLiteMonitorRepository(path, compact_mode=True)
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE unrelated_application_table(id INTEGER)')
+    monkeypatch.setattr(worker_module, 'database_path', lambda: path)
+    assert worker_module.main(['--once']) == 1
+    logged = events(capsys)
+    assert [row['event'] for row in logged] == ['WORKER_START', 'WORKER_LOCK_ACQUIRED', 'STOPPED']
+    assert logged[-1] == {'event': 'STOPPED', 'category': 'MONITORING_SCHEMA',
+                          'safe_reason_code': 'OWNERSHIP_MISMATCH'}
+
+
+@pytest.mark.parametrize('error,category,reason', [
+    ('schema_version', 'MONITORING_SCHEMA', 'UNSUPPORTED_SCHEMA_VERSION'),
+    ('storage', 'MONITORING_STORAGE', 'STORAGE_UNAVAILABLE'),
+    ('unexpected_value', 'WORKER_STARTUP', 'INVALID_STARTUP_STATE'),
+])
+def test_worker_startup_failures_have_safe_distinct_categories(
+        worker_module, tmp_path, monkeypatch, capsys, error, category, reason):
+    import sqlite3
+    from monitoring.repository import MonitoringSchemaError
+
+    problems = {
+        'schema_version': MonitoringSchemaError('synthetic-secret', 'UNSUPPORTED_SCHEMA_VERSION'),
+        'storage': sqlite3.OperationalError('synthetic-secret'),
+        'unexpected_value': ValueError('synthetic-secret'),
+    }
+    monkeypatch.setattr(worker_module, 'database_path', lambda: tmp_path / 'monitor.sqlite3')
+    def fail_repository(path, **kwargs):
+        raise problems[error]
+    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', fail_repository)
+    assert worker_module.main(['--once']) == 1
+    logged = events(capsys)
+    assert [row['event'] for row in logged] == ['WORKER_START', 'WORKER_LOCK_ACQUIRED', 'STOPPED']
+    assert logged[-1] == {'event': 'STOPPED', 'category': category, 'safe_reason_code': reason}
+    assert 'synthetic-secret' not in str(logged)
+
+
+def test_worker_lock_io_failure_is_distinct_from_storage(worker_module, tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(worker_module, 'database_path', lambda: tmp_path / 'monitor.sqlite3')
+    @contextmanager
+    def fail_lock(path):
+        raise OSError('synthetic-secret')
+        yield
+    monkeypatch.setattr(worker_module, 'exclusive_worker', fail_lock)
+    assert worker_module.main(['--once']) == 1
+    logged = events(capsys)
+    assert [row['event'] for row in logged] == ['WORKER_START', 'STOPPED']
+    assert logged[-1] == {'event': 'STOPPED', 'category': 'WORKER_LOCK',
+                          'safe_reason_code': 'LOCK_IO_FAILURE'}
+    assert 'synthetic-secret' not in str(logged)
+
+
 def test_long_running_idle_heartbeat_is_bounded(worker_module, tmp_path, monkeypatch, capsys):
     from monitoring.repository import SQLiteMonitorRepository
 

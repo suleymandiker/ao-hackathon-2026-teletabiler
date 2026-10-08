@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src' / 'backend'))
 from application_environment import load_environment
 from data_paths import monitoring_data_dir
 from monitoring.execution import OpenSearchMonitorExecutor
-from monitoring.repository import SQLiteMonitorRepository
+from monitoring.repository import MonitoringSchemaError, SQLiteMonitorRepository
 from monitoring.runtime import WorkerLockBusy, database_path, exclusive_worker
 from monitoring.worker import MonitorWorker, structured_log, system_clock
 
@@ -51,16 +51,23 @@ def main(argv=None):
                 structured_log('WORKER_LOCK_BUSY', message='Another monitor worker already owns the scheduler lock.')
                 return 1
             except OSError:
-                structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
-                               summary='Check worker ownership and monitoring storage; only one worker is supported.')
+                structured_log('STOPPED', category='WORKER_LOCK', safe_reason_code='LOCK_IO_FAILURE')
                 return 1
             structured_log('WORKER_LOCK_ACQUIRED')
             try:
                 repository = SQLiteMonitorRepository(path, compact_mode=True)
                 repository.recover_running(system_clock())
-            except (OSError, sqlite3.Error, ValueError):
-                structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
-                               summary='Check worker ownership and monitoring storage; only one worker is supported.')
+            except MonitoringSchemaError as error:
+                structured_log('STOPPED', category='MONITORING_SCHEMA',
+                               safe_reason_code=error.reason_code)
+                return 1
+            except (OSError, sqlite3.Error):
+                structured_log('STOPPED', category='MONITORING_STORAGE',
+                               safe_reason_code='STORAGE_UNAVAILABLE')
+                return 1
+            except ValueError:
+                structured_log('STOPPED', category='WORKER_STARTUP',
+                               safe_reason_code='INVALID_STARTUP_STATE')
                 return 1
             worker = None
             last_idle_at = None
