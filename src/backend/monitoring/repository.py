@@ -7,8 +7,10 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 from typing import Protocol
 
@@ -71,6 +73,75 @@ def encode(value):
     return json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
 
+MAX_FINDINGS_PER_RUN = 10
+MAX_BASELINE_BYTES = 2_000_000
+METRIC_BASELINE_FIELDS = ('total_physical_logs', 'pods', 'containers',
+                          'pod_counts_exact', 'container_counts_exact', 'severity_counts')
+
+
+def _baseline_metric(value):
+    return {key: value[key] for key in METRIC_BASELINE_FIELDS if key in value}
+
+
+def _baseline_patterns(values):
+    from evidence_redaction import redact_text
+    return {str(row['template_id']): {'template_id': str(row['template_id']),
+            'count': int(row['count']),
+            'template': redact_text(str(row.get('template') or ''))[:128]}
+            for row in values}
+
+
+def _compact_findings(run, result, now):
+    from evidence_redaction import redact_text
+    candidates = []
+    for row in result.get('incidents', ()):
+        identifier = hashlib.sha256(str(row.get('incident_id') or '').encode()).hexdigest()[:32]
+        candidates.append(('incident', identifier, row, 0))
+    for row in result.get('signals', ()):
+        if row.get('qualified') is True and row.get('monitor_anomaly'):
+            identifier = hashlib.sha256(str(row.get('signal_id') or '').encode()).hexdigest()[:32]
+            candidates.append(('anomaly', identifier, row, 1))
+    candidates.sort(key=lambda item: (item[3], item[1]))
+    output = []
+    for kind, identifier, row, _ in candidates[:MAX_FINDINGS_PER_RUN]:
+        anomaly_kind = (row.get('monitor_anomaly') or {}).get('kind')
+        allowed_kinds = frozenset({'total_volume', 'log_rate', 'pod_volume', 'container_volume',
+                                   'pattern_frequency', 'new_pattern', 'pattern_disappearance',
+                                   'error_severity', 'pod_error_concentration',
+                                   'container_error_concentration'})
+        title = ('Incident' if kind == 'incident' else
+                 anomaly_kind if isinstance(anomaly_kind, str) and anomaly_kind in allowed_kinds else 'Anomaly')
+        safe_title = redact_text(title)[:160]
+        reason = ((row.get('monitor_anomaly') or {}).get('rule') if kind == 'anomaly' else None)
+        allowed_rules = frozenset({'median_mad_and_ratio',
+                                   'new_template_and_absent_from_recent_history',
+                                   'at_least_90_percent_of_parsed_errors'})
+        reason = reason if isinstance(reason, str) and reason in allowed_rules else None
+        evidence = row.get('representative_evidence') or ()
+        locators = []
+        for item in evidence[:3]:
+            if not isinstance(item, dict):
+                continue
+            index, document = item.get('index'), item.get('document_id')
+            if isinstance(index, str) and isinstance(document, str):
+                locators.append({'index': redact_text(index)[:160],
+                                 'document_id': redact_text(document)[:160]})
+        digest = hashlib.sha256(f'{run.id}:{kind}:{identifier}'.encode()).hexdigest()
+        output.append((digest, run.monitor_id, run.id, run.window.start.isoformat(),
+                       run.window.end.isoformat(), kind,
+                       row.get('severity') if row.get('severity') in
+                       ('CRITICAL', 'ERROR', 'WARNING', 'WARN', 'INFO', 'DEBUG') else 'UNKNOWN',
+                       safe_title, reason, int(row.get('count') or 1),
+                       str(row.get('first_seen_ms') or '') or None,
+                       str(row.get('last_seen_ms') or '') or None,
+                       hashlib.sha256(str(row.get('template_id') or '').encode()).hexdigest()[:32]
+                       if row.get('template_id') else None,
+                       identifier if kind == 'anomaly' else None,
+                       identifier if kind == 'incident' else None,
+                       encode(locators), now.isoformat()))
+    return output
+
+
 def definition_json(definition):
     value = asdict(definition)
     value['initial_start'] = definition.initial_start.isoformat()
@@ -88,18 +159,44 @@ def instant(value):
 
 
 class SQLiteMonitorRepository:
-    def __init__(self, path):
+    def __init__(self, path, *, initialize=True, compact_mode=False):
         self.path = Path(path).resolve()
+        self.compact_mode = compact_mode
+        if initialize:
+            self.initialize()
+        else:
+            with self._read_connection() as db:
+                version = db.execute('PRAGMA user_version').fetchone()[0]
+                if version not in (4, 5):
+                    raise ValueError('Unsupported monitoring schema version')
+
+    def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Journal mode is changed only by the explicit initializer, never by UI reads.
+        with sqlite3.connect(self.path, timeout=10) as setup:
+            setup.execute('PRAGMA busy_timeout=10000')
+            version = setup.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, 1, 2, 3, 4, 5):
+                raise ValueError('Unsupported monitoring schema version')
+            names = {row[0] for row in setup.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            allowed = {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
+                       'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
+                       'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state'}
+            if names - allowed:
+                raise ValueError('Monitoring requires its own database')
+            setup.execute('PRAGMA journal_mode=WAL')
+            setup.execute('PRAGMA synchronous=NORMAL')
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3, 4):
+            if version not in (0, 1, 2, 3, 4, 5):
                 raise ValueError('Unsupported monitoring schema version')
+            if version == 5:
+                return
             # Refuse accidental use of an existing policy/template database.
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if names - {'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
                          'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
-                         'monitor_run_dedupe'}:
+                         'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state'}:
                 raise ValueError('Monitoring requires its own database')
             statements = (
                 '''CREATE TABLE IF NOT EXISTS monitors (
@@ -151,7 +248,108 @@ class SQLiteMonitorRepository:
             run_columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
             if 'acquisition_diagnostics' not in run_columns:
                 db.execute('ALTER TABLE monitor_runs ADD COLUMN acquisition_diagnostics TEXT')
-            db.execute('PRAGMA user_version=4')
+            monitor_columns = {row['name'] for row in db.execute('PRAGMA table_info(monitors)')}
+            latest_fields = {
+                'latest_run_id': 'TEXT', 'latest_status': 'TEXT',
+                'latest_completed_at': 'TEXT', 'latest_physical_logs': 'INTEGER',
+                'latest_logical_events': 'INTEGER', 'latest_pattern_count': 'INTEGER',
+                'latest_signal_count': 'INTEGER', 'latest_qualified_signal_count': 'INTEGER',
+                'latest_incident_count': 'INTEGER', 'latest_finding_count': 'INTEGER',
+                'latest_duration_ms': 'INTEGER',
+            }
+            for name, kind in latest_fields.items():
+                if name not in monitor_columns:
+                    db.execute(f'ALTER TABLE monitors ADD COLUMN {name} {kind}')
+            run_columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
+            run_fields = {
+                'physical_logs': 'INTEGER', 'pattern_count': 'INTEGER',
+                'duration_ms': 'INTEGER', 'error_stage': 'TEXT',
+                'safe_reason_code': 'TEXT',
+            }
+            for name, kind in run_fields.items():
+                if name not in run_columns:
+                    db.execute(f'ALTER TABLE monitor_runs ADD COLUMN {name} {kind}')
+            db.execute('''CREATE TABLE IF NOT EXISTS monitor_findings (
+                id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL REFERENCES monitors(id),
+                run_id TEXT REFERENCES monitor_runs(id) ON DELETE SET NULL,
+                window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+                kind TEXT NOT NULL, severity TEXT NOT NULL, title TEXT NOT NULL,
+                reason_code TEXT, occurrence_count INTEGER NOT NULL,
+                first_seen TEXT, last_seen TEXT,
+                template_id TEXT, signal_id TEXT, incident_id TEXT,
+                source_locators TEXT NOT NULL, created_at TEXT NOT NULL)''')
+            db.execute('''CREATE TABLE IF NOT EXISTS monitor_baseline_state (
+                monitor_id TEXT PRIMARY KEY REFERENCES monitors(id),
+                version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+            db.execute('CREATE INDEX IF NOT EXISTS monitor_runs_recent ON monitor_runs(monitor_id,window_start DESC)')
+            db.execute('CREATE INDEX IF NOT EXISTS monitor_findings_recent ON monitor_findings(monitor_id,created_at DESC)')
+            if version > 0:
+                self._backfill_compact(db)
+            db.execute('PRAGMA user_version=5')
+
+    @staticmethod
+    def _backfill_compact(db):
+        for monitor_id, in db.execute('SELECT id FROM monitors').fetchall():
+            metrics = [dict(window_end=row['window_end'], payload=_baseline_metric(json.loads(row['payload'])))
+                       for row in db.execute('''SELECT r.window_end,m.payload FROM monitor_run_metrics m
+                           JOIN monitor_runs r ON r.id=m.run_id WHERE r.monitor_id=? AND r.status='SUCCESS'
+                           ORDER BY r.window_end DESC LIMIT 30''', (monitor_id,))]
+            pattern_rows = db.execute('''SELECT r.id,r.window_end FROM monitor_runs r
+                JOIN monitor_run_metrics m ON m.run_id=r.id WHERE r.monitor_id=? AND r.status='SUCCESS'
+                ORDER BY r.window_end DESC LIMIT 5''', (monitor_id,)).fetchall()
+            patterns = [dict(window_end=row['window_end'], payload=_baseline_patterns(
+                        [json.loads(item['payload']) for item in db.execute(
+                            'SELECT payload FROM monitor_pattern_metrics WHERE run_id=?', (row['id'],))]))
+                        for row in pattern_rows]
+            if metrics:
+                db.execute('INSERT OR IGNORE INTO monitor_baseline_state VALUES (?,?,?,?)',
+                           (monitor_id, 1, encode(dict(metrics=metrics, patterns=patterns)),
+                            metrics[0]['window_end']))
+            historical = db.execute('''SELECT id,counts,started_at,finished_at FROM monitor_runs
+                WHERE monitor_id=?''', (monitor_id,)).fetchall()
+            for run_row in historical:
+                counts = RunCounts(**json.loads(run_row['counts']))
+                duration = (max(0, int((instant(run_row['finished_at']) -
+                            instant(run_row['started_at'])).total_seconds() * 1000))
+                            if run_row['finished_at'] else None)
+                db.execute('''UPDATE monitor_runs SET physical_logs=?,duration_ms=? WHERE id=?''',
+                           (counts.events_retrieved, duration, run_row['id']))
+            latest = db.execute('''SELECT * FROM monitor_runs WHERE monitor_id=?
+                ORDER BY window_start DESC LIMIT 1''', (monitor_id,)).fetchone()
+            if latest:
+                counts = RunCounts(**json.loads(latest['counts']))
+                result_row = db.execute('SELECT payload FROM monitor_results WHERE run_id=?',
+                                        (latest['id'],)).fetchone()
+                latest_result = json.loads(result_row[0]) if result_row else None
+                pattern_count = ((latest_result.get('source_summary') or {}).get('pattern_count')
+                                 if latest_result else None)
+                if latest_result and latest['status'] == 'SUCCESS':
+                    findings = _compact_findings(SQLiteMonitorRepository._run(latest), latest_result,
+                                                 instant(latest['finished_at']))
+                    db.executemany('INSERT OR IGNORE INTO monitor_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                   findings)
+                else:
+                    findings = ()
+                db.execute('''UPDATE monitors SET latest_run_id=?,latest_status=?,latest_completed_at=?,
+                    latest_physical_logs=?,latest_logical_events=?,latest_signal_count=?,
+                    latest_qualified_signal_count=?,latest_incident_count=?,latest_pattern_count=?,
+                    latest_finding_count=?,latest_duration_ms=? WHERE id=?''',
+                    (latest['id'], latest['status'], latest['finished_at'], counts.events_retrieved,
+                     counts.logical_events, counts.signal_candidates, counts.qualified_signals,
+                     counts.incidents, pattern_count, len(findings), latest['duration_ms'], monitor_id))
+
+    @contextmanager
+    def _read_connection(self):
+        db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute('PRAGMA foreign_keys=ON')
+            db.execute('PRAGMA busy_timeout=10000')
+            db.execute('PRAGMA synchronous=NORMAL')
+            db.execute('PRAGMA query_only=ON')
+            yield db
+        finally:
+            db.close()
 
     @contextmanager
     def _transaction(self):
@@ -159,6 +357,8 @@ class SQLiteMonitorRepository:
         db.row_factory = sqlite3.Row
         try:
             db.execute('PRAGMA foreign_keys=ON')
+            db.execute('PRAGMA busy_timeout=10000')
+            db.execute('PRAGMA synchronous=NORMAL')
             db.execute('BEGIN IMMEDIATE')
             yield db
             db.commit()
@@ -195,14 +395,14 @@ class SQLiteMonitorRepository:
         return self.get(monitor_id)
 
     def get(self, monitor_id):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             row = db.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
             if row is None:
                 raise KeyError('Monitor not found')
             return self._monitor(row)
 
     def list(self, *, include_archived=False):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             return [self._monitor(row) for row in db.execute(
                 'SELECT * FROM monitors WHERE (? OR archived=0) ORDER BY created_at,id', (include_archived,))]
 
@@ -284,10 +484,7 @@ class SQLiteMonitorRepository:
     def schedule_summary(self, now):
         """Read scheduling state without claiming runs or changing persisted state."""
         now = utc(now)
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute('PRAGMA query_only=ON')
+        with self._read_connection() as db:
             enabled = db.execute('SELECT COUNT(*) FROM monitors WHERE enabled=1 AND archived=0').fetchone()[0]
             rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
@@ -307,8 +504,6 @@ class SQLiteMonitorRepository:
                 if next_due_at is None or ready_at < next_due_at:
                     next_due_at = ready_at
             return ScheduleSummary(enabled, due, next_due_at)
-        finally:
-            db.close()
 
     @staticmethod
     def _owned(db, run):
@@ -316,6 +511,9 @@ class SQLiteMonitorRepository:
                           (run.id, run.claim_token)).fetchone() is not None
 
     def succeed(self, run, result, counts, receipts, *, now, metrics=None, pattern_metrics=()):
+        if self.compact_mode and metrics is not None:
+            return self._succeed_compact(run, result, counts, receipts, now=now,
+                                         metrics=metrics, pattern_metrics=pattern_metrics)
         payload = encode(result)  # Fail before any writes if serialization fails.
         now = utc(now)
         with self._transaction() as db:
@@ -349,6 +547,63 @@ class SQLiteMonitorRepository:
             cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
             db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?', (run.monitor_id, cutoff.isoformat()))
 
+    def _succeed_compact(self, run, result, counts, receipts, *, now, metrics, pattern_metrics):
+        now = utc(now)
+        patterns = tuple(pattern_metrics)
+        findings = _compact_findings(run, result, now)
+        metric_payload = _baseline_metric(metrics)
+        pattern_payload = _baseline_patterns(patterns)
+        with self._transaction() as db:
+            if not self._owned(db, run):
+                raise ValueError('Run claim no longer owned')
+            monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?',
+                                               (run.monitor_id,)).fetchone())
+            if next_window(monitor) != run.window:
+                raise ValueError('Watermark does not match claimed window')
+            row = db.execute('SELECT payload FROM monitor_baseline_state WHERE monitor_id=?',
+                             (run.monitor_id,)).fetchone()
+            baseline = json.loads(row[0]) if row else {'metrics': [], 'patterns': []}
+            baseline['metrics'] = ([{'window_end': run.window.end.isoformat(), 'payload': metric_payload}]
+                                   + baseline['metrics'])[:30]
+            baseline['patterns'] = ([{'window_end': run.window.end.isoformat(), 'payload': pattern_payload}]
+                                    + baseline['patterns'])[:5]
+            baseline_json = encode(baseline)
+            if len(baseline_json.encode('utf-8')) > MAX_BASELINE_BYTES:
+                raise ValueError('Monitoring baseline state limit reached')
+            duration_ms = max(0, int((now - run.actual_started_at).total_seconds() * 1000))
+            db.execute('''UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,
+                physical_logs=?,pattern_count=?,duration_ms=?,result_reference=NULL,
+                error_category=NULL,error_summary=NULL,acquisition_diagnostics=NULL,
+                error_stage=NULL,safe_reason_code=NULL WHERE id=?''',
+                (now.isoformat(), encode(asdict(counts)), int(metrics['total_physical_logs']),
+                 len(patterns), duration_ms, run.id))
+            following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
+            due = now if safe_at(following, monitor.definition) <= now else max(
+                safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
+            db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
+                error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1,
+                latest_run_id=?,latest_status='SUCCESS',latest_completed_at=?,latest_physical_logs=?,
+                latest_logical_events=?,latest_pattern_count=?,latest_signal_count=?,
+                latest_qualified_signal_count=?,latest_incident_count=?,latest_finding_count=?,
+                latest_duration_ms=? WHERE id=?''',
+                (run.window.end.isoformat(), due.isoformat(),
+                 'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED',
+                 now.isoformat(), run.id, now.isoformat(), int(metrics['total_physical_logs']),
+                 counts.logical_events, len(patterns), counts.signal_candidates,
+                 counts.qualified_signals, counts.incidents, len(findings), duration_ms, run.monitor_id))
+            db.execute('''INSERT INTO monitor_baseline_state VALUES (?,?,?,?)
+                ON CONFLICT(monitor_id) DO UPDATE SET version=excluded.version,
+                payload=excluded.payload,updated_at=excluded.updated_at''',
+                (run.monitor_id, 1, baseline_json, now.isoformat()))
+            if findings:
+                db.executemany('''INSERT INTO monitor_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', findings)
+            if receipts:
+                db.executemany('INSERT OR IGNORE INTO monitor_receipts VALUES (?,?,?)',
+                               ((run.monitor_id, key, stamp) for key, stamp in receipts.items()))
+            cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
+            db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?',
+                       (run.monitor_id, cutoff.isoformat()))
+
     def fail(self, run, category, *, now, diagnostics=None):
         category = category if category in MESSAGES else 'UNKNOWN'
         payload = None
@@ -356,19 +611,36 @@ class SQLiteMonitorRepository:
             # Executor already removes runtime credentials. Reapply the existing
             # safe projection at the storage boundary for alternate callers.
             from opensearch_application import presentation_result
-            payload = encode(presentation_result({}, diagnostics, None)['source_summary'])
+            safe = {key: value for key, value in diagnostics.items()
+                    if key not in ('effective_query', 'query', 'request_body', 'response_body')}
+            payload = encode(presentation_result({}, safe, None)['source_summary'])
         now = utc(now)
+        from monitoring.errors import NON_RETRYABLE_ACQUISITION_REASONS
         with self._transaction() as db:
             if not self._owned(db, run):
                 return
-            db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
+            if not self.compact_mode:
+                db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
+            previous = db.execute('SELECT safe_reason_code,attempts FROM monitor_runs WHERE id=?',
+                                  (run.id,)).fetchone()
+            reason = diagnostics.get('reason_code') if isinstance(diagnostics, dict) else None
+            if reason not in NON_RETRYABLE_ACQUISITION_REASONS:
+                reason = None
+            blocked = bool(reason and previous['safe_reason_code'] == reason and previous['attempts'] >= 3)
             db.execute("""UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=?,
-                       acquisition_diagnostics=? WHERE id=?""",
-                       (now.isoformat(), category, MESSAGES[category], payload, run.id))
+                       acquisition_diagnostics=?,error_stage=?,safe_reason_code=? WHERE id=?""",
+                       (now.isoformat(), category, MESSAGES[category], payload,
+                        str(diagnostics.get('pipeline_stage') or '')[:80] if diagnostics else None,
+                        reason or (str(diagnostics.get('reason_code') or '')[:80] if diagnostics else None),
+                        run.id))
             db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
-                revision=revision+1 WHERE id=?''', ('ARCHIVED' if monitor.archived else 'ERROR' if monitor.enabled else 'PAUSED',
-                (now + timedelta(seconds=monitor.definition.interval_seconds)).isoformat(), category, MESSAGES[category], now.isoformat(), run.monitor_id))
+                revision=revision+1,latest_run_id=?,latest_status='FAILED',latest_completed_at=? WHERE id=?''',
+                ('ARCHIVED' if monitor.archived else 'BLOCKED' if blocked and monitor.enabled
+                 else 'ERROR' if monitor.enabled else 'PAUSED',
+                 (now + timedelta(seconds=max(3600, monitor.definition.interval_seconds)
+                                  if blocked else monitor.definition.interval_seconds)).isoformat(), category,
+                 MESSAGES[category], now.isoformat(), run.id, now.isoformat(), run.monitor_id))
 
     def recover_running(self, now):
         """Call ONLY after obtaining exclusive worker ownership, never from UI."""
@@ -382,25 +654,80 @@ class SQLiteMonitorRepository:
     def history(self, monitor_id, limit=100):
         if not 1 <= limit <= 1000:
             raise ValueError('History page must contain 1 to 1000 runs')
-        with self._transaction() as db:
+        with self._read_connection() as db:
             return [self._run(row) for row in db.execute('SELECT * FROM monitor_runs WHERE monitor_id=? ORDER BY window_start DESC LIMIT ?', (monitor_id, limit))]
 
+    @staticmethod
+    def _summary(row):
+        return dict(monitor=SQLiteMonitorRepository._monitor(row),
+                    latest_run_id=row['latest_run_id'], latest_status=row['latest_status'],
+                    latest_completed_at=instant(row['latest_completed_at']),
+                    physical_logs=row['latest_physical_logs'], logical_events=row['latest_logical_events'],
+                    patterns=row['latest_pattern_count'], signals=row['latest_signal_count'],
+                    qualified_signals=row['latest_qualified_signal_count'],
+                    incidents=row['latest_incident_count'], findings=row['latest_finding_count'],
+                    duration_ms=row['latest_duration_ms'],
+                    safe_reason_code=row['latest_reason_code'])
+
+    def list_monitor_summaries(self, *, include_archived=False):
+        with self._read_connection() as db:
+            return [self._summary(row) for row in db.execute(
+                '''SELECT monitors.*, (SELECT safe_reason_code FROM monitor_runs
+                    WHERE id=monitors.latest_run_id) AS latest_reason_code
+                    FROM monitors WHERE (? OR archived=0) ORDER BY created_at,id''',
+                (include_archived,))]
+
+    def get_monitor_summary(self, monitor_id):
+        with self._read_connection() as db:
+            row = db.execute('''SELECT monitors.*, (SELECT safe_reason_code FROM monitor_runs
+                WHERE id=monitors.latest_run_id) AS latest_reason_code
+                FROM monitors WHERE id=?''', (monitor_id,)).fetchone()
+            if row is None:
+                raise KeyError('Monitor not found')
+            return self._summary(row)
+
+    def recent_runs(self, monitor_id, *, limit=10, before=None):
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Recent run page must contain 1..100 rows')
+        with self._read_connection() as db:
+            if before is None:
+                rows = db.execute('''SELECT * FROM monitor_runs WHERE monitor_id=?
+                    ORDER BY window_start DESC,id DESC LIMIT ?''', (monitor_id, limit))
+            else:
+                rows = db.execute('''SELECT * FROM monitor_runs WHERE monitor_id=? AND
+                    (window_start,id)<(?,?) ORDER BY window_start DESC,id DESC LIMIT ?''',
+                    (monitor_id, before[0], before[1], limit))
+            return [self._run(row) for row in rows]
+
+    def latest_finding(self, monitor_id):
+        with self._read_connection() as db:
+            row = db.execute('''SELECT kind,severity,title,reason_code,occurrence_count,
+                window_start,window_end FROM monitor_findings WHERE monitor_id=?
+                ORDER BY created_at DESC, CASE kind WHEN 'incident' THEN 0 ELSE 1 END,
+                    severity DESC,id LIMIT 1''', (monitor_id,)).fetchone()
+            return dict(row) if row else None
+
     def result(self, run_id):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             row = db.execute('SELECT payload FROM monitor_results WHERE run_id=?', (run_id,)).fetchone()
             return json.loads(row[0]) if row else None
 
     def acquisition_diagnostics(self, run_id):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             row = db.execute('SELECT acquisition_diagnostics FROM monitor_runs WHERE id=?', (run_id,)).fetchone()
             return json.loads(row[0]) if row and row[0] else None
 
     def consumed(self, monitor_id, since):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             return {row[0] for row in db.execute('SELECT reference_hash FROM monitor_receipts WHERE monitor_id=? AND source_time>=?',
                                                (monitor_id, utc(since).isoformat()))}
 
     def acquisition_ledger(self, run, since):
+        if self.compact_mode:
+            from monitoring.run_ledger import IsolatedRunLedger
+            cutoff = run.window.end - timedelta(seconds=run.definition.overlap_seconds)
+            return IsolatedRunLedger(self.path, run.id, run.monitor_id, utc(since).isoformat(),
+                                     cutoff.isoformat())
         return RunDedupeLedger(self.path, run.id, run.monitor_id, utc(since).isoformat())
 
     def record_shard(self, run, shard, status, *, pages=0, records=0, unique=0, failure=None):
@@ -420,7 +747,7 @@ class SQLiteMonitorRepository:
                  failure))
 
     def acquisition_shards(self, run_id):
-        with self._transaction() as db:
+        with self._read_connection() as db:
             return [dict(row) for row in db.execute('''SELECT shard_id,start_at,end_at,depth,status,
                 pages_read,records_read,unique_records,completed_at,failure_category,attempt
                 FROM monitor_acquisition_shards WHERE run_id=? ORDER BY attempt,shard_id''', (run_id,))]
@@ -428,14 +755,24 @@ class SQLiteMonitorRepository:
     def successful_metrics(self, monitor_id, before, limit=30):
         if not 1 <= limit <= 100:
             raise ValueError('Metrics history limit must be 1..100')
-        with self._transaction() as db:
+        with self._read_connection() as db:
+            state = db.execute('SELECT payload FROM monitor_baseline_state WHERE monitor_id=?',
+                               (monitor_id,)).fetchone()
+            if state:
+                entries = json.loads(state[0])['metrics']
+                return [item['payload'] for item in entries if item['window_end'] <= utc(before).isoformat()][:limit]
             return [json.loads(row[0]) for row in db.execute('''SELECT m.payload FROM monitor_run_metrics m
                 JOIN monitor_runs r ON r.id=m.run_id WHERE r.monitor_id=? AND r.status='SUCCESS'
                 AND r.window_end<=? ORDER BY r.window_end DESC LIMIT ?''',
                 (monitor_id, utc(before).isoformat(), limit))]
 
     def successful_patterns(self, monitor_id, before, limit=5):
-        with self._transaction() as db:
+        with self._read_connection() as db:
+            state = db.execute('SELECT payload FROM monitor_baseline_state WHERE monitor_id=?',
+                               (monitor_id,)).fetchone()
+            if state:
+                entries = json.loads(state[0])['patterns']
+                return [item['payload'] for item in entries if item['window_end'] <= utc(before).isoformat()][:limit]
             run_ids = [row[0] for row in db.execute('''SELECT r.id FROM monitor_runs r
                 JOIN monitor_run_metrics m ON m.run_id=r.id WHERE r.monitor_id=? AND r.status='SUCCESS'
                 AND r.window_end<=? ORDER BY r.window_end DESC LIMIT ?''',
@@ -443,6 +780,82 @@ class SQLiteMonitorRepository:
             return [{row['template_id']: json.loads(row['payload']) for row in db.execute(
                      'SELECT template_id,payload FROM monitor_pattern_metrics WHERE run_id=?', (run_id,))}
                     for run_id in run_ids]
+
+    def maintenance(self, now, *, optimize=False, batch=100):
+        """Bounded terminal-history cleanup; never touches learning stores or active runs."""
+        if type(batch) is not int or not 1 <= batch <= 500:
+            raise ValueError('Maintenance batch must contain 1..500 rows')
+        now = utc(now)
+        run_cutoff = (now - timedelta(days=7)).isoformat()
+        finding_cutoff = (now - timedelta(days=30)).isoformat()
+        detail_cutoff = (now - timedelta(days=3)).isoformat()
+        with self._transaction() as db:
+            ids = [row[0] for row in db.execute('''SELECT id FROM monitor_runs
+                WHERE status!='RUNNING' AND finished_at<? ORDER BY finished_at LIMIT ?''',
+                (run_cutoff, batch))]
+            for run_id in ids:
+                db.execute('DELETE FROM monitor_results WHERE run_id=?', (run_id,))
+                db.execute('DELETE FROM monitor_pattern_metrics WHERE run_id=?', (run_id,))
+                db.execute('DELETE FROM monitor_run_metrics WHERE run_id=?', (run_id,))
+                db.execute('DELETE FROM monitor_acquisition_shards WHERE run_id=?', (run_id,))
+                db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run_id,))
+                db.execute('UPDATE monitor_findings SET run_id=NULL WHERE run_id=?', (run_id,))
+                db.execute('DELETE FROM monitor_runs WHERE id=?', (run_id,))
+            findings = [row[0] for row in db.execute('''SELECT id FROM monitor_findings
+                WHERE created_at<? ORDER BY created_at LIMIT ?''', (finding_cutoff, batch))]
+            db.executemany('DELETE FROM monitor_findings WHERE id=?', ((key,) for key in findings))
+            failures = [row[0] for row in db.execute('''SELECT id FROM monitor_runs
+                WHERE status='FAILED' AND finished_at<? AND acquisition_diagnostics IS NOT NULL
+                ORDER BY finished_at LIMIT ?''', (detail_cutoff, batch))]
+            db.executemany('UPDATE monitor_runs SET acquisition_diagnostics=NULL WHERE id=?',
+                           ((key,) for key in failures))
+            old_shards = [tuple(row) for row in db.execute('''SELECT s.run_id,s.attempt,s.shard_id
+                FROM monitor_acquisition_shards s JOIN monitor_runs r ON r.id=s.run_id
+                WHERE r.status!='RUNNING' AND r.finished_at<? LIMIT ?''', (detail_cutoff, batch))]
+            db.executemany('''DELETE FROM monitor_acquisition_shards
+                WHERE run_id=? AND attempt=? AND shard_id=?''', old_shards)
+            for row in db.execute('''SELECT id,last_successful_end,definition FROM monitors
+                                   WHERE last_successful_end IS NOT NULL LIMIT ?''', (batch,)):
+                definition = read_definition(row['definition'])
+                cutoff = (instant(row['last_successful_end']) -
+                          timedelta(seconds=definition.overlap_seconds)).isoformat()
+                stale = [entry[0] for entry in db.execute('''SELECT reference_hash FROM monitor_receipts
+                    WHERE monitor_id=? AND source_time<? LIMIT ?''', (row['id'], cutoff, batch))]
+                db.executemany('DELETE FROM monitor_receipts WHERE monitor_id=? AND reference_hash=?',
+                               ((row['id'], key) for key in stale))
+        if optimize:
+            with sqlite3.connect(self.path, timeout=10) as db:
+                db.execute('PRAGMA busy_timeout=10000')
+                db.execute('PRAGMA optimize')
+                db.execute('PRAGMA wal_checkpoint(PASSIVE)')
+                mode = db.execute('PRAGMA auto_vacuum').fetchone()[0]
+                free = db.execute('PRAGMA freelist_count').fetchone()[0]
+                if mode == 2 and free > 1000:
+                    db.execute('PRAGMA incremental_vacuum(100)')
+        self._cleanup_stale_ledger_directories(now)
+        return dict(runs_removed=len(ids), findings_removed=len(findings),
+                    failure_details_removed=len(failures), shards_removed=len(old_shards),
+                    database_bytes=self._database_bytes())
+
+    def _database_bytes(self):
+        return sum(path.stat().st_size for path in
+                   (self.path, Path(str(self.path) + '-wal'), Path(str(self.path) + '-shm'))
+                   if path.exists())
+
+    def _cleanup_stale_ledger_directories(self, now):
+        root = (self.path.parent / 'tmp').resolve()
+        if not root.is_dir():
+            return
+        with self._read_connection() as db:
+            active = {row[0] for row in db.execute("SELECT id FROM monitor_runs WHERE status='RUNNING'")}
+        for path in root.iterdir():
+            target = path.resolve()
+            if not path.name.startswith('run-') or not target.is_relative_to(root) or not path.is_dir():
+                continue
+            if any(path.name.startswith(f'run-{run_id}-') for run_id in active):
+                continue
+            if now.timestamp() - path.stat().st_mtime > 86_400:
+                shutil.rmtree(target)
 
 
 class RunDedupeLedger:

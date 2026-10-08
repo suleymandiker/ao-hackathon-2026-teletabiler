@@ -4,7 +4,7 @@ import json
 import time
 from typing import Callable
 
-from monitoring.errors import MonitoringError, safe_pipeline_details
+from monitoring.errors import MonitoringError, safe_pipeline_details, ACQUISITION_REASONS
 from monitoring.repository import MonitorRepository
 
 
@@ -37,6 +37,7 @@ class MonitorWorker:
                      window_start=run.window.start.isoformat(), window_end=run.window.end.isoformat())
             started = time.monotonic()
             category = 'PERSISTENCE'
+            result = None
             try:
                 since = run.window.start - timedelta(seconds=run.definition.overlap_seconds)
                 consumed = (set() if getattr(self.executor, 'repository', None) is self.repository
@@ -90,5 +91,15 @@ class MonitorWorker:
                 except Exception:
                     category = 'PERSISTENCE'
                 details = safe_pipeline_details(diagnostics) if category == 'PIPELINE' else {}
+                if category.startswith('OPENSEARCH') and isinstance(diagnostics, dict):
+                    reason = diagnostics.get('reason_code')
+                    if reason in ACQUISITION_REASONS:
+                        details['reason_code'] = reason
                 self.log('FAILED', run_id=run.id, category=category, **details)
+            finally:
+                receipt_state = getattr(result, 'receipts', None)
+                cleanup = getattr(receipt_state, 'cleanup', None)
+                if callable(cleanup):
+                    cleanup()
+                result = None
         return completed

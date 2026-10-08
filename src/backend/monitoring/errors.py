@@ -32,6 +32,15 @@ LIMIT_REASONS = frozenset({
     'STREAM_CARDINALITY_LIMIT', 'PATTERN_CARDINALITY_LIMIT',
     'TEMPLATE_LENGTH_LIMIT', 'SIGNAL_CARDINALITY_LIMIT',
 })
+ACQUISITION_REASONS = frozenset({
+    'CONNECTION_TIMEOUT', 'SEARCH_TIMEOUT', 'HTTP_429', 'HTTP_5XX', 'SHARD_FAILURE',
+    'INVALID_CURSOR', 'INVALID_RESPONSE', 'MISSING_REQUIRED_FIELD',
+    'INVALID_TIMESTAMP', 'INVALID_SEQUENCE', 'MAPPING_INCOMPATIBLE',
+    'AUTH_FAILURE', 'QUERY_FAILURE_UNKNOWN',
+})
+NON_RETRYABLE_ACQUISITION_REASONS = ACQUISITION_REASONS - frozenset({
+    'CONNECTION_TIMEOUT', 'SEARCH_TIMEOUT', 'HTTP_429', 'HTTP_5XX', 'SHARD_FAILURE',
+})
 
 
 def safe_pipeline_stage(stage):
@@ -120,6 +129,7 @@ def safe_pipeline_details(diagnostics):
 
 
 class MonitoringError(Exception):
-    def __init__(self, category):
+    def __init__(self, category, *, reason_code=None):
         self.category = category if category in MESSAGES else 'UNKNOWN'
+        self.reason_code = reason_code if reason_code in ACQUISITION_REASONS else None
         super().__init__(MESSAGES[self.category])

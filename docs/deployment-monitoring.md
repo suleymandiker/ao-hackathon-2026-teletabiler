@@ -789,6 +789,74 @@ must see the same monitoring database. Validate filesystem locking semantics fir
 do not scale SQLite/advisory-lock workers across pods and call it HA. PostgreSQL
 repository/leases are the intended migration path.
 
+## Compact monitoring product
+
+The normal application opens at **Deployment Monitors**. Its list uses one compact
+monitor-summary SELECT and holds the result in the Streamlit session until an
+explicit Refresh or monitor edit. Opening a monitor loads its latest ten compact
+runs and, when present, one latest finding. Older runs load only on request.
+The ordinary detail view does not load Investigation or Pipeline Trace JSON.
+
+The monitoring database schema is version 5. Normal worker execution stores a
+durable claim before acquisition. After successful processing, one short
+transaction publishes compact run counters, the monitor's latest projection and
+watermark, a bounded baseline ring, up to ten actionable findings, and only the
+source-reference receipts still relevant to retrieval overlap. The baseline
+ring preserves the last 30 successful metric windows and five pattern windows;
+failed windows do not enter it. New compact runs do not write full result JSON,
+per-window metric/pattern rows, or successful shard records. Existing version 4
+result and trace rows remain readable until retention removes them.
+
+Reference deduplication within a run is exact. It starts in memory with a
+100,000-reference ceiling and spills to a temporary run-local SQLite file under
+`<AIOPS_DATA_DIR>/monitoring/tmp` if needed. The shared `monitors.sqlite3` does
+not receive per-record run-dedupe writes. Terminal runs remove the temporary
+file; the worker removes stale crash leftovers during maintenance. Recent
+overlap receipts remain in the shared database and publish atomically with the
+successful watermark. Failed windows replay from their beginning.
+
+**Debug Pipeline** is an explicit action within a monitor. Representative Debug
+reads at most two pages of up to 200 source records each and displays at most ten
+deterministic same-stream cases with up to 20 neighboring records in each
+direction. Exact Window Replay processes the selected logical window using the
+normal retrieval overlap and exact-window metrics. Both use a disposable
+read-only learning snapshot, make no monitoring repository writes, and retain
+their trace only in the Streamlit session. Source retention or changed learning
+state can make replay differ from an old production result.
+
+The worker runs bounded terminal-history cleanup about hourly between ticks and
+low-frequency `PRAGMA optimize` and WAL `PASSIVE` checkpoint about daily. Default
+retention is seven days for compact run rows, 30 days for findings, and three
+days for detailed failure/shard diagnostics. Definitions, watermarks, baseline
+state, and receipts still needed by overlap are protected. No full automatic
+`VACUUM` is run. Database size reporting includes the database, WAL, and SHM
+files, excluding separate policy and template learning stores.
+
+SQLite uses a single worker and short writer transactions. UI reads use
+`query_only` connections without `BEGIN IMMEDIATE`; normal UI repository
+construction performs no DDL. WAL should live on a validated local or RWO
+filesystem available to one worker and the UI, preferably in one pod. A shared
+RWX/NFS SQLite file with multiple writer pods is unsupported; independent pods
+or horizontal writers require a transactional shared database such as PostgreSQL.
+
+At a five-minute interval, one monitor creates 288 compact run rows per day,
+bounded to roughly 2,016 rows by seven-day retention, plus zero to ten finding
+rows per run and a single updated baseline row. Normal success has three fixed
+state writes (run, monitor, baseline), optional bounded finding/receipt inserts,
+and an overlap-receipt prune. A synthetic no-finding/no-receipt success is
+measured at four SQLite write statements and one final transaction. A separate durable claim transaction remains
+necessary for restart recovery and owner fencing.
+
+Transient OpenSearch page/count failures use at most three attempts with short
+bounded backoff. Repeated search timeout, shard failure, HTTP 429, and HTTP 5xx
+pressure can split a shard into exact half-open children. Invalid cursors,
+malformed responses, incompatible mappings, bad timestamps/sequence values,
+and authentication failures fail immediately with safe reason codes. Three
+repeated non-retryable failures of the same window/reason mark the monitor
+**BLOCKED** and delay its next attempt by at least one hour. The same window
+remains pending and its watermark does not advance. The UI displays only the
+stable reason, attempts, and blocked window. A successful retry clears BLOCKED.
+
 ## Validation and next phase
 
 Boundary-completeness validation: five regression cases first failed for missing

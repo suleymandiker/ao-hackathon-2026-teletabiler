@@ -18,6 +18,7 @@ class MonitorStatus(str, Enum):
     PAUSED = 'PAUSED'
     RUNNING = 'RUNNING'
     ERROR = 'ERROR'
+    BLOCKED = 'BLOCKED'
     ARCHIVED = 'ARCHIVED'
 
 

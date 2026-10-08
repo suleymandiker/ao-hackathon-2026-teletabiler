@@ -40,6 +40,25 @@ class TemplatePipeline:
         )
         self.last_decision = None
 
+    @classmethod
+    def read_only_snapshot(cls, state_path, candidate_state_path):
+        """Load learning into a disposable instance whose persistence is memory-only."""
+        from drain3 import TemplateMiner
+        from drain3.memory_buffer_persistence import MemoryBufferPersistence
+
+        instance = cls(state_path=None, candidate_state_path=None)
+        state = Path(state_path)
+        candidate = Path(candidate_state_path)
+        if state.is_file():
+            loaded = ValidatedTemplateRegistry(state, instance.registry.max_templates)
+            instance.registry._templates = dict(loaded._templates)
+        if candidate.is_file():
+            memory = MemoryBufferPersistence()
+            memory.state = candidate.read_bytes()
+            instance.engine._miner = TemplateMiner(
+                persistence_handler=memory, config=instance.engine._miner.config)
+        return instance
+
     @property
     def cluster_count(self):
         return self.engine.cluster_count

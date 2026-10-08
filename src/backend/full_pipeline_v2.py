@@ -120,6 +120,7 @@ class FullAIOpsPipelineV2:
         observer: PipelineObserver | None = None,
         monitoring_accumulator=None,
         stage_callback=None,
+        persist_learning=True,
     ) -> Dict[str, Any]:
         """Analyze one caller-bounded, finite sequence of already acquired pages.
 
@@ -218,7 +219,8 @@ class FullAIOpsPipelineV2:
             result = self._process_logical_events(events, event_provenance=event_provenance,
                                                   timestamp_policy=timestamp_policy, observer=observer,
                                                   monitoring_accumulator=monitoring_accumulator,
-                                                  stage_callback=stage_callback)
+                                                  stage_callback=stage_callback,
+                                                  persist_learning=persist_learning)
         finally:
             events.close()
             if not session.closed:
@@ -258,6 +260,7 @@ class FullAIOpsPipelineV2:
         observer: PipelineObserver | None = None,
         monitoring_accumulator=None,
         stage_callback=None,
+        persist_learning=True,
     ) -> Dict[str, Any]:
         """Shared existing parser/template/downstream flow; no policy preparation."""
         def mark_stage(name):
@@ -390,4 +393,6 @@ class FullAIOpsPipelineV2:
         ds=downstream['stats']
         print(f"[PIPELINE] Sinyal adayı={ds.get('signal_candidates',0)} | Nitelikli={ds.get('qualified_signals',0)} | Korelasyon={ds.get('correlations',0)} | Olay={ds.get('incidents',0)} | RCA={ds.get('rca',0)}")
         mark_stage('template_processing')
-        self.templater.save_state(); return downstream
+        if persist_learning:
+            self.templater.save_state()
+        return downstream

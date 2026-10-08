@@ -12,11 +12,11 @@ from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourc
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
-from monitoring.errors import MonitoringError, safe_failure_details
+from monitoring.errors import MonitoringError, safe_failure_details, ACQUISITION_REASONS
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
-from monitoring.sharded_acquisition import StreamingAcquisition, plan_shards
+from monitoring.sharded_acquisition import StreamingAcquisition, plan_shards, retry_read
 from monitoring.window_accumulator import WindowAccumulator
 from monitoring.worker import structured_log
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
@@ -54,7 +54,7 @@ class WindowOwnership:
                                if evidence.included)
         first_time = source_time(first)
         if first_time is None:
-            raise MonitoringError('OPENSEARCH_QUERY')
+            raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP')
         keys = {reference_key(record) for record in event.records}
         if self.ledger is not None:
             duplicates = {key for key in keys if self.ledger.consumed(key) or self.ledger.owned(key)}
@@ -100,6 +100,16 @@ class _DiscardOutput:
         pass
 
 
+class _NoTrace:
+    """Normal compact monitoring does not retain diagnostic stage items."""
+
+    def acquisition(self, *args, **kwargs):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        pass
+
+
 @contextmanager
 def quiet_pipeline():
     # This executor is single-owner/single-threaded. Preconfigured logging
@@ -127,7 +137,7 @@ class OpenSearchMonitorExecutor:
     def __init__(self, pipeline_factory, *, connection_loader=application.load_connection,
                  client_factory=OpenSearchClient, source_factory=OpenSearchSource,
                  policy_loader=application.list_verified_policies, trace_limits=None,
-                 repository=None, log=structured_log):
+                 repository=None, log=structured_log, read_only=False):
         self.pipeline_factory = pipeline_factory
         self.connection_loader = connection_loader
         self.client_factory = client_factory
@@ -136,6 +146,7 @@ class OpenSearchMonitorExecutor:
         self.trace_limits = trace_limits
         self.repository = repository
         self.log = log
+        self.read_only = read_only
 
     def _execute_streaming(self, run):
         definition = run.definition
@@ -147,9 +158,10 @@ class OpenSearchMonitorExecutor:
             raise MonitoringError('OPENSEARCH_CONFIG')
         overlap = timedelta(seconds=definition.overlap_seconds)
         start, end = run.window.start - overlap, run.window.end + overlap
-        trace = TraceCollector(run.id, limits=self.trace_limits,
-                               secrets=(config.password, config.username, *config.hosts,
-                                        os.environ.get('SAKA_API_KEY')))
+        trace = (_NoTrace() if getattr(self.repository, 'compact_mode', False) and not self.read_only
+                 else TraceCollector(run.id, limits=self.trace_limits,
+                    secrets=(config.password, config.username, *config.hosts,
+                             os.environ.get('SAKA_API_KEY'))))
         summary = dict(start=run.window.start.isoformat(), end=run.window.end.isoformat(),
                        retrieval_start=start.isoformat(), retrieval_end=end.isoformat(),
                        resolved_index=resolve_index_expression(config.index_expression, start, end,
@@ -174,7 +186,7 @@ class OpenSearchMonitorExecutor:
             nonlocal pipeline_stage
             pipeline_stage = stage
 
-        def failure(category, *, error=None):
+        def failure(category, *, error=None, reason_code=None):
             if acquisition is not None:
                 summary.update(pages_read=acquisition.pages_read,
                                records_read=acquisition.records_read,
@@ -187,9 +199,17 @@ class OpenSearchMonitorExecutor:
                 summary['stop_reason'] = 'acquisition_failed'
             if category == 'PIPELINE' and error is not None:
                 summary.update(safe_failure_details(pipeline_stage, error))
-            error = MonitoringError(category)
+            if reason_code is None and acquisition is not None and acquisition.last_state is not None:
+                reason_code = acquisition.last_state.get('failure_category')
+            if reason_code in ACQUISITION_REASONS:
+                summary['reason_code'] = reason_code
+            else:
+                reason_code = None
+            error = MonitoringError(category, reason_code=reason_code)
+            safe_summary = {key: value for key, value in summary.items()
+                            if key not in ('effective_query', 'query', 'request_body', 'response_body')}
             error.acquisition_diagnostics = redact_ai_secret(
-                application.presentation_result({}, summary, config)['source_summary'])
+                application.presentation_result({}, safe_summary, config)['source_summary'])
             return error
 
         try:
@@ -216,7 +236,7 @@ class OpenSearchMonitorExecutor:
                 metrics_source = OpenSearchMetricsSource(client)
                 summary['query_executed'] = True
                 mark_pipeline_stage('metrics_acquisition')
-                metrics = metrics_source.window(run)
+                metrics = retry_read(lambda: metrics_source.window(run))
                 self.log('METRICS_ACQUIRED', run_id=run.id, physical_logs=metrics.total,
                          time_buckets=len(metrics.buckets))
                 try:
@@ -233,7 +253,7 @@ class OpenSearchMonitorExecutor:
                     except Exception:
                         raise MonitoringError('PERSISTENCE') from None
                 acquisition = StreamingAcquisition(source, metrics_source, definition, log=self.log,
-                    shard_sink=save_shard)
+                    shard_sink=None if getattr(self.repository, 'compact_mode', False) else save_shard)
                 mark_pipeline_stage('content_acquisition')
                 with ledger_context as ledger:
                     ownership = WindowOwnership(run, ledger=ledger)
@@ -249,7 +269,9 @@ class OpenSearchMonitorExecutor:
                                 for record in page.records:
                                     stamp = source_time(record)
                                     identity = record.stream_identity
-                                    if (stamp is None or not start <= stamp < end or identity is None or
+                                    if stamp is None:
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP')
+                                    if (not start <= stamp < end or identity is None or
                                             record.source_reference.source_scope != config.source_scope or
                                             identity.namespace != definition.namespace or
                                             identity.workload != definition.workload or
@@ -316,12 +338,14 @@ class OpenSearchMonitorExecutor:
                         accumulator.configure_anomalies(run, metrics, history, pattern_history)
                         mark_pipeline_stage('pipeline_construction')
                         with quiet_pipeline():
-                            result = self.pipeline_factory().process_ingested_pages(
-                                selected_pages(), policy_provider=lambda key, record: snapshot,
+                            arguments = dict(policy_provider=lambda key, record: snapshot,
                                 source_timezone=definition.source_timezone,
                                 assembled_event_filter=ownership, observer=trace,
                                 monitoring_accumulator=accumulator,
                                 stage_callback=mark_pipeline_stage)
+                            if self.read_only:
+                                arguments['persist_learning'] = False
+                            result = self.pipeline_factory().process_ingested_pages(selected_pages(), **arguments)
                     mark_pipeline_stage('result_building')
                     if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                         reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
@@ -347,7 +371,8 @@ class OpenSearchMonitorExecutor:
                         *(stats.get(key, 0) for key in ('signal_candidates', 'qualified_signals',
                                                        'correlations', 'incidents', 'rca')))
                     presentation = redact_ai_secret(application.presentation_result(result, summary, config))
-                    presentation['detailed_pipeline_trace'] = trace.finish(result)
+                    if self.read_only or not getattr(self.repository, 'compact_mode', False):
+                        presentation['detailed_pipeline_trace'] = trace.finish(result)
                     compact = metrics.to_dict()
                     compact.update(parsed_events=accumulator.parsed_events,
                                    logical_events=stats.get('segmented', 0),
@@ -368,20 +393,20 @@ class OpenSearchMonitorExecutor:
                         if isinstance(value, (list, tuple)):
                             return [sanitize(item) for item in value]
                         return application.safe_text(value, config) if isinstance(value, str) else value
-                    return ExecutionResult(presentation, counts, {}, sanitize(compact),
+                    return ExecutionResult(presentation, counts,
+                                           ledger if getattr(self.repository, 'compact_mode', False) else {},
+                                           sanitize(compact),
                                            tuple(sanitize(item) for item in accumulator.pattern_metrics()))
         except MonitoringError as error:
-            raise failure(error.category) from None
+            raise failure(error.category, reason_code=error.reason_code) from None
         except OpenSearchClientError as error:
-            message = str(error)
-            category = ('OPENSEARCH_AUTH' if message in ('OpenSearch HTTP failure (401)',
-                                                       'OpenSearch HTTP failure (403)')
-                        else 'OPENSEARCH_TIMEOUT' if message == 'OpenSearch connection or timeout failure'
+            category = ('OPENSEARCH_AUTH' if error.reason_code == 'AUTH_FAILURE'
+                        else 'OPENSEARCH_TIMEOUT' if error.reason_code == 'CONNECTION_TIMEOUT'
                         else 'OPENSEARCH_QUERY')
-            raise failure(category) from None
+            raise failure(category, reason_code=error.reason_code) from None
         except OpenSearchSourceError as error:
-            category = 'OPENSEARCH_TIMEOUT' if 'timed out' in str(error).lower() else 'OPENSEARCH_QUERY'
-            raise failure(category) from None
+            category = 'OPENSEARCH_TIMEOUT' if error.reason_code == 'SEARCH_TIMEOUT' else 'OPENSEARCH_QUERY'
+            raise failure(category, reason_code=error.reason_code) from None
         except Exception as error:
             raise failure('PIPELINE', error=error) from None
 

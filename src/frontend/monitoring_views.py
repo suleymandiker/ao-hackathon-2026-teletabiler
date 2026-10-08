@@ -14,7 +14,18 @@ from trace_views import load_trace
 
 
 def repository():
-    return SQLiteMonitorRepository(database_path())
+    path = database_path()
+    cached = st.session_state.get('monitor_repository')
+    if cached is None or cached.path != path:
+        cached = SQLiteMonitorRepository(path, initialize=False)
+        st.session_state['monitor_repository'] = cached
+    return cached
+
+
+def invalidate_snapshot():
+    for key in ('monitor_list_snapshot', 'monitor_detail_snapshot', 'monitor_runs_snapshot',
+                'monitor_finding_snapshot'):
+        st.session_state.pop(key, None)
 
 
 def now():
@@ -220,12 +231,13 @@ def monitor_form(repo, connection, redact, monitor=None):
                 st.session_state['expanded_monitor_id'] = created.id
                 st.session_state['create_form_open'] = False
                 st.session_state['monitor_clone_definition'] = None
+            invalidate_snapshot()
             st.success('Monitor saved. Execution belongs to the separate worker.')
             st.rerun()
         except (ValueError, TypeError):
             st.error('Check the target and historical start time. Refresh if this monitor was changed elsewhere.')
         except Exception:
-            st.error('Monitoring storage is unavailable. Check database permissions and configuration.')
+            st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
 
 
 def monitoring_start(field, old):
@@ -257,63 +269,140 @@ def filter_monitors(monitors, query='', status='All'):
 
 
 def render(connection, redact):
-    import monitoring_style as style
-    st.markdown(style.CSS, unsafe_allow_html=True)
-    for key, default in dict(expanded_monitor_id=None, selected_run_id=None, monitor_edit_mode=None,
-                             create_form_open=False, show_archived=False,
-                             delete_confirmation_monitor_id=None).items():
-        st.session_state.setdefault(key, default)
-    # Preserve the ID even when a search temporarily hides its widget.
-    st.session_state['selected_run_id'] = st.session_state['selected_run_id']
+    st.session_state.setdefault('expanded_monitor_id', None)
+    st.session_state.setdefault('create_form_open', False)
+    st.session_state.setdefault('show_archived', False)
     title, refresh, create = st.columns([5, 1.3, 1.8], vertical_alignment='center')
     with title:
         st.title('Deployment Monitors')
     with refresh:
-        st.button('Refresh', key='refresh_monitors', width='stretch')
+        if st.button('Refresh', key='refresh_monitors', width='stretch'):
+            invalidate_snapshot()
     with create:
-        st.button('+ New Monitor', key='new_monitor', type='primary', on_click=toggle_create, width='stretch')
-    search, status, archived = st.columns([3, 1.2, 1.6], vertical_alignment='bottom')
-    with search:
-        query = st.text_input('Search monitors', key='monitor_search', placeholder='Search name, namespace or workload…')
-    with status:
-        selected_status = st.selectbox('Status', ['All', 'Active', 'Paused', 'Archived'], key='monitor_status_filter')
-    with archived:
-        st.checkbox('Show archived', key='show_archived',
-                    help='Archived status also includes archived monitors automatically.')
-    if connection is None:
-        st.warning('Source unavailable: OpenSearch configuration is missing or invalid. Persisted monitors and history remain available. Configure OPENSEARCH_* in the application environment or repository .env, then restart the UI and worker.')
+        if st.button('+ New Monitor', key='new_monitor', type='primary', width='stretch'):
+            st.session_state['create_form_open'] = not st.session_state['create_form_open']
+    query = st.text_input('Search monitors', key='monitor_search', placeholder='Search workload or namespace')
+    selected_status = st.selectbox('Status', ['All', 'Active', 'Paused', 'Archived'], key='monitor_status_filter')
+    st.checkbox('Show archived', key='show_archived')
     try:
         repo = repository()
-        monitors = repo.list(include_archived=st.session_state['show_archived'] or selected_status == 'Archived')
+        snapshot_key = bool(st.session_state['show_archived'] or selected_status == 'Archived')
+        snapshot = st.session_state.get('monitor_list_snapshot')
+        if snapshot is None or snapshot[0] != snapshot_key:
+            snapshot = (snapshot_key, repo.list_monitor_summaries(include_archived=snapshot_key))
+            st.session_state['monitor_list_snapshot'] = snapshot
+        monitors = snapshot[1]
     except Exception:
-        st.error('Monitoring storage is unavailable. Check AIOPS_MONITOR_DB and directory permissions.')
+        st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
         return
-    if st.session_state['expanded_monitor_id'] not in {monitor.id for monitor in monitors}:
-        clear_monitor_selection()
     if st.session_state['create_form_open']:
         with st.container(border=True):
-            st.subheader('Create Deployment Monitor')
-            st.caption('Choose what to monitor. The platform handles acquisition and analysis.')
+            st.subheader('New Monitor')
             monitor_form(repo, connection, redact)
-    if not monitors:
-        st.info('No monitors to show. Create a monitor with New Monitor, or show archived monitors.')
-        return
-    visible = filter_monitors(monitors, query, selected_status)
-    st.caption(f'{len(visible)} of {len(monitors)} monitors · Persisted status · Schedule times in UTC')
+    search = query.casefold().strip()
+    visible = [item for item in monitors if
+               (not search or search in item['monitor'].definition.name.casefold() or
+                search in item['monitor'].definition.workload.casefold() or
+                search in item['monitor'].definition.namespace.casefold()) and
+               (selected_status == 'All' or
+                ('Archived' if item['monitor'].archived else
+                 'Active' if item['monitor'].enabled else 'Paused') == selected_status)]
     if not visible:
-        st.info('No monitors match these filters. Clear search or change Status.')
-    for monitor in visible:
-        latest = repo.history(monitor.id, limit=1)
-        run = latest[0] if latest else None
-        expanded = st.session_state['expanded_monitor_id'] == monitor.id
-        with st.container(border=True, key='monitor_card_' + monitor.id):
-            with st.container(key='monitor_header_' + monitor.id):
-                st.markdown(style.monitor_row(monitor, run, expanded, redact), unsafe_allow_html=True)
-                st.button(('Collapse ' if expanded else 'Expand ') + redact(monitor.definition.name),
-                          key='monitor_row_' + monitor.id, on_click=toggle_details,
-                          args=(monitor.id,), width='stretch')
-            if expanded:
-                monitor_details(repo, connection, redact, monitor, run)
+        st.info('No monitors to show.')
+    for item in visible:
+        monitor = item['monitor']
+        health = ('PAUSED' if not monitor.enabled else 'ATTENTION' if item['latest_status'] == 'FAILED'
+                  else 'HEALTHY')
+        with st.container(border=True):
+            st.subheader(f"{health}  {redact(monitor.definition.workload)}")
+            st.caption(redact(monitor.definition.namespace))
+            left, middle, right, due = st.columns(4)
+            left.metric('Last run', item['latest_status'] or 'None')
+            middle.metric('Logs', item['physical_logs'] if item['physical_logs'] is not None else '—')
+            right.metric('Findings', item['findings'] if item['findings'] is not None else '—')
+            remaining = max(0, int((monitor.next_run_at - now()).total_seconds()))
+            due.metric('Next run', ('Due now' if remaining == 0 else
+                                   f'{(remaining + 59) // 60} min') if monitor.enabled else 'Paused')
+            if st.button('Open ' + redact(monitor.definition.name), key='monitor_row_' + monitor.id):
+                st.session_state['expanded_monitor_id'] = monitor.id
+                st.session_state.pop('monitor_runs_snapshot', None)
+                st.session_state.pop('monitor_finding_snapshot', None)
+        if st.session_state['expanded_monitor_id'] == monitor.id:
+            _render_compact_detail(repo, item, connection, redact)
+
+
+def _render_compact_detail(repo, summary, connection, redact):
+    monitor = summary['monitor']
+    monitor_id = monitor.id
+    st.caption(redact(monitor.definition.namespace + ' / ' + monitor.definition.workload))
+    st.write('Lifecycle:', 'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED')
+    st.write('Execution:', summary['latest_status'] or 'None')
+    if monitor.status.value == 'BLOCKED':
+        from monitoring.errors import ACQUISITION_REASONS
+        reason = summary.get('safe_reason_code')
+        st.warning('ATTENTION / BLOCKED. The failed window remains pending. '
+                   + ('Reason: ' + reason if reason in ACQUISITION_REASONS else 'Review the failed run.'))
+    a, b, c, d = st.columns(4)
+    a.metric('Logs', summary['physical_logs'] if summary['physical_logs'] is not None else '—')
+    b.metric('Logical Events', summary['logical_events'] if summary['logical_events'] is not None else '—')
+    c.metric('Signals', summary['qualified_signals'] if summary['qualified_signals'] is not None else '—')
+    d.metric('Incidents', summary['incidents'] if summary['incidents'] is not None else '—')
+    try:
+        if st.session_state.get('monitor_runs_snapshot', (None,))[0] != monitor_id:
+            st.session_state['monitor_runs_snapshot'] = (monitor_id, repo.recent_runs(monitor_id, limit=10))
+        runs = st.session_state['monitor_runs_snapshot'][1]
+        if summary['findings'] and st.session_state.get('monitor_finding_snapshot', (None,))[0] != monitor_id:
+            st.session_state['monitor_finding_snapshot'] = (monitor_id, repo.latest_finding(monitor_id))
+    except Exception:
+        st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
+        return
+    finding = st.session_state.get('monitor_finding_snapshot', (None, None))[1]
+    if finding:
+        st.subheader('Latest Finding')
+        st.write(redact(finding['title']))
+    st.subheader('Recent Runs')
+    for run in runs:
+        st.write(run.window.start.isoformat(), run.status.value,
+                 f'{run.counts.events_retrieved} logs', f'{run.counts.incidents} incidents')
+    if monitor.status.value == 'BLOCKED' and runs:
+        st.caption('Blocked window: ' + runs[0].window.start.isoformat() + ' to '
+                   + runs[0].window.end.isoformat() + '; attempts: ' + str(runs[0].attempts))
+    if runs and len(runs) >= 10 and st.button('Load older', key='older_' + monitor_id):
+        tail = runs[-1]
+        try:
+            older = repo.recent_runs(monitor_id, limit=10,
+                                     before=(tail.window.start.isoformat(), tail.id))
+            st.session_state['monitor_runs_snapshot'] = (monitor_id, runs + older)
+            st.rerun()
+        except Exception:
+            st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
+    if not monitor.archived:
+        if st.button('Pause' if monitor.enabled else 'Resume', key='toggle_monitor_' + monitor_id):
+            try:
+                repo.set_enabled(monitor_id, not monitor.enabled, now=now())
+                invalidate_snapshot()
+                st.rerun()
+            except Exception:
+                st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
+        if st.button('Settings', key='settings_' + monitor_id):
+            st.session_state['monitor_edit_mode'] = monitor_id
+        if st.session_state.get('monitor_edit_mode') == monitor_id:
+            monitor_form(repo, connection, redact, monitor)
+        if st.button('Archive', key='archive_' + monitor_id):
+            st.session_state['delete_confirmation_monitor_id'] = monitor_id
+        if st.session_state.get('delete_confirmation_monitor_id') == monitor_id:
+            if st.button('Confirm archive', key='confirm_archive_' + monitor_id):
+                try:
+                    repo.archive(monitor_id, now=now())
+                    invalidate_snapshot()
+                    st.rerun()
+                except Exception:
+                    st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
+    if st.button('Debug Pipeline', key='debug_' + monitor_id):
+        st.session_state['monitor_debug_id'] = monitor_id
+    if st.session_state.get('monitor_debug_id') == monitor_id:
+        from monitoring_debug_views import render_debug
+        render_debug(repo, monitor, runs, redact)
 
 
 def monitor_actions(repo, redact, monitor):

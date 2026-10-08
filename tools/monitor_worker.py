@@ -56,7 +56,7 @@ def main(argv=None):
                 return 1
             structured_log('WORKER_LOCK_ACQUIRED')
             try:
-                repository = SQLiteMonitorRepository(path)
+                repository = SQLiteMonitorRepository(path, compact_mode=True)
                 repository.recover_running(system_clock())
             except (OSError, sqlite3.Error, ValueError):
                 structured_log('STOPPED', category='WORKER_LOCK_OR_STORAGE',
@@ -65,10 +65,14 @@ def main(argv=None):
             worker = None
             last_idle_at = None
             last_due_at = None
+            last_maintenance_at = None
+            last_optimize_at = None
             while True:
                 now = system_clock()
                 summary = repository.schedule_summary(now)
                 elapsed = monotonic_clock()
+                if last_maintenance_at is None:
+                    last_maintenance_at = last_optimize_at = elapsed
                 if summary.due_monitors and (last_due_at is None or elapsed - last_due_at >= args.heartbeat_seconds):
                     structured_log('WORKER_DUE', due_monitors=summary.due_monitors)
                     last_due_at = elapsed
@@ -89,6 +93,16 @@ def main(argv=None):
                     last_idle_at = elapsed
                 if args.once:
                     return 0
+                if elapsed - last_maintenance_at >= 3600:
+                    optimize = elapsed - last_optimize_at >= 86_400
+                    try:
+                        details = repository.maintenance(now, optimize=optimize)
+                        structured_log('WORKER_MAINTENANCE', **details)
+                    except Exception:
+                        structured_log('WORKER_MAINTENANCE_FAILED', category='PERSISTENCE')
+                    last_maintenance_at = elapsed
+                    if optimize:
+                        last_optimize_at = elapsed
                 time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
         structured_log('WORKER_STOP', reason='interrupt')

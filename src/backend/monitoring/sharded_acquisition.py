@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import time
 
 from ingestion_layer.opensearch_source import OpenSearchSourceError
+from ingestion_layer.opensearch_client import OpenSearchClientError
 from monitoring.errors import MonitoringError
 from monitoring.identity import reference_key
 
@@ -16,6 +17,20 @@ MAX_REQUEST_PAGES_PER_RUN = 100_000
 MAX_BUFFERED_RECORDS = 10_000
 MAX_BUFFERED_CHARS = 8_000_000
 MIN_SHARD_DURATION = timedelta(microseconds=2)
+MAX_TRANSIENT_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (0.1, 0.2)
+SPLITTABLE_PRESSURE_REASONS = frozenset({'SEARCH_TIMEOUT', 'SHARD_FAILURE', 'HTTP_429', 'HTTP_5XX'})
+
+
+def retry_read(operation, *, sleep=time.sleep):
+    """Retry only explicitly transient read failures; never retry malformed evidence."""
+    for attempt in range(MAX_TRANSIENT_ATTEMPTS):
+        try:
+            return operation()
+        except (OpenSearchClientError, OpenSearchSourceError) as error:
+            if not error.retryable or attempt == MAX_TRANSIENT_ATTEMPTS - 1:
+                raise
+            sleep(RETRY_BACKOFF_SECONDS[attempt])
 
 
 @dataclass(frozen=True)
@@ -65,12 +80,13 @@ def plan_shards(start, end, metrics, page_size, max_pages):
 class StreamingAcquisition:
     """Validate a whole small shard before releasing its pages to the processor."""
 
-    def __init__(self, source, metrics_source, definition, *, log, shard_sink=None):
+    def __init__(self, source, metrics_source, definition, *, log, shard_sink=None, sleep=time.sleep):
         self.source = source
         self.metrics_source = metrics_source
         self.definition = definition
         self.log = log
         self.shard_sink = shard_sink
+        self.sleep = sleep
         self.pages_read = 0
         self.records_read = 0
         self.shards_completed = 0
@@ -94,6 +110,9 @@ class StreamingAcquisition:
         for shard in shards:
             yield from self._acquire(shard)
 
+    def _request(self, operation):
+        return retry_read(operation, sleep=self.sleep)
+
     def _acquire(self, shard):
         self.shards_seen += 1
         if self.shards_seen > MAX_SHARDS_PER_RUN:
@@ -104,9 +123,9 @@ class StreamingAcquisition:
         self._state(shard, 'RUNNING')
         counted_at = time.monotonic()
         try:
-            expected = self.metrics_source.count(shard.start, shard.end, self.definition)
-        except Exception:
-            self._state(shard, 'FAILED', failure='OPENSEARCH_QUERY')
+            expected = self._request(lambda: self.metrics_source.count(shard.start, shard.end, self.definition))
+        except Exception as error:
+            self._state(shard, 'FAILED', failure=getattr(error, 'reason_code', 'QUERY_FAILURE_UNKNOWN'))
             raise
         finally:
             self.acquisition_duration_seconds += time.monotonic() - counted_at
@@ -127,17 +146,27 @@ class StreamingAcquisition:
                             unique=len(unique), failure='ACQUISITION_LIMIT')
                 raise MonitoringError('ACQUISITION_LIMIT')
             requested_at = time.monotonic()
+            split_for_pressure = False
             try:
-                page = self.source.read_page(start=shard.start, end=shard.end,
+                page = self._request(lambda: self.source.read_page(start=shard.start, end=shard.end,
                     namespace=self.definition.namespace, workload=self.definition.workload,
                     container=self.definition.container, cluster_id=self.definition.document_cluster_id,
-                    page_size=self.definition.page_size, cursor=cursor)
-            except Exception:
-                self._state(shard, 'FAILED', pages=page_number - 1, records=records,
-                            unique=len(unique), failure='OPENSEARCH_QUERY')
-                raise
+                    page_size=self.definition.page_size, cursor=cursor))
+            except Exception as error:
+                reason = getattr(error, 'reason_code', 'QUERY_FAILURE_UNKNOWN')
+                if reason in SPLITTABLE_PRESSURE_REASONS and self._can_split(shard):
+                    split_for_pressure = True
+                else:
+                    self._state(shard, 'FAILED', pages=page_number - 1, records=records,
+                                unique=len(unique), failure=reason)
+                    raise
             finally:
                 self.acquisition_duration_seconds += time.monotonic() - requested_at
+            if split_for_pressure:
+                buffered.clear()
+                yield from self._split(shard, pages=page_number - 1, records=records,
+                                       unique=len(unique))
+                return
             self.pages_read += 1
             self.records_read += len(page.records)
             records += len(page.records)

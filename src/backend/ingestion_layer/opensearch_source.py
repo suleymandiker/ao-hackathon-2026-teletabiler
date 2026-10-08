@@ -26,6 +26,29 @@ from ingestion_layer.opensearch_indices import resolve_index_expression
 class OpenSearchSourceError(ValueError):
     """Invalid read, cursor or page; diagnostics contain no source values."""
 
+    def __init__(self, message):
+        self.reason_code = self._reason(message)
+        self.retryable = self.reason_code in {'SEARCH_TIMEOUT', 'SHARD_FAILURE'}
+        super().__init__(message)
+
+    @staticmethod
+    def _reason(message):
+        if 'timed out' in message:
+            return 'SEARCH_TIMEOUT'
+        if 'shard failure' in message:
+            return 'SHARD_FAILURE'
+        if 'cursor' in message or 'continuation' in message:
+            return 'INVALID_CURSOR'
+        if 'mapping' in message or 'unmapped' in message:
+            return 'MAPPING_INCOMPATIBLE'
+        if 'timestamp' in message:
+            return 'INVALID_TIMESTAMP'
+        if 'sequence' in message:
+            return 'INVALID_SEQUENCE'
+        if 'Missing or invalid' in message or 'Missing or non-string' in message:
+            return 'MISSING_REQUIRED_FIELD'
+        return 'INVALID_RESPONSE'
+
 
 MAX_MONITOR_MESSAGE_CHARS = 65_536
 
@@ -209,11 +232,16 @@ class OpenSearchSource:
 
         index = quote(index_expression, safe="*,.-_")
         payload = self._client.post_json(f"/{index}/_search", query)
-        if type(payload) is not dict or payload.get("timed_out") is not False:
+        if type(payload) is not dict:
+            raise OpenSearchSourceError("Search response must be an object")
+        if payload.get("timed_out") is True:
             raise OpenSearchSourceError("Search timed out or lacks completion evidence")
+        if payload.get("timed_out") is not False:
+            raise OpenSearchSourceError("Search response lacks completion evidence")
         shards = payload.get("_shards")
-        if (type(shards) is not dict or type(shards.get("failed")) is not int
-                or shards["failed"] != 0):
+        if type(shards) is not dict or type(shards.get("failed")) is not int:
+            raise OpenSearchSourceError("Search response missing shard status")
+        if shards["failed"] != 0:
             raise OpenSearchSourceError("Search shard failure or missing shard status")
         hits = payload.get("hits")
         if type(hits) is not dict or type(hits.get("hits")) is not list:

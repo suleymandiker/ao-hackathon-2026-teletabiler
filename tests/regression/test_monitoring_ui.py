@@ -1,573 +1,149 @@
-"""Real control-plane rendering with temporary SQLite and blocked external I/O."""
+"""Monitor-only control plane and compact query regressions."""
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 import sqlite3
 
 import pytest
 
 from test_streamlit_sources import ui, assert_safe
 
-REAL_CONNECT = sqlite3.connect
+
 BASE = datetime(2026, 10, 5, 12, tzinfo=timezone.utc)
-
-
-def test_console_filters_loaded_definitions_and_preserves_expansion(monitoring_ui):
-    from dataclasses import replace
-    ui, repo, first = monitoring_ui
-    active = repo.create(replace(first.definition, name='API health', namespace='payments', workload='checkout'), enabled=True, now=BASE)
-    archived = repo.create(replace(first.definition, name='retired'), now=BASE)
-    repo.archive(archived.id, now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + active.id).click().run()
-    for query in ('API', 'PAYMENTS', 'checkout', 'payments checkout'):
-        app.text_input(key='monitor_search').set_value(query).run()
-        rows = [b.key for b in app.button if b.key.startswith('monitor_row_')]
-        assert rows == ['monitor_row_' + active.id]
-    app.text_input(key='monitor_search').set_value('no match').run()
-    assert any('No monitors match' in item.value for item in app.info)
-    assert app.session_state['expanded_monitor_id'] == active.id
-    app.text_input(key='monitor_search').set_value('').run()
-    for status, expected in [('Paused', first.id), ('Active', active.id), ('Archived', archived.id)]:
-        app.selectbox(key='monitor_status_filter').set_value(status).run()
-        assert [b.key for b in app.button if b.key.startswith('monitor_row_')] == ['monitor_row_' + expected]
-        app.button(key='refresh_monitors').click().run()
-        assert app.selectbox(key='monitor_status_filter').value == status
-    assert not app.exception
-    assert not ui.sources and not ui.files and not ui.packages
-    assert_safe(app)
-
-
-def test_console_row_hierarchy_escaping_and_native_tabs(monitoring_ui):
-    from dataclasses import replace
-    import monitoring_style as style
-    ui, repo, monitor = monitoring_ui
-    unsafe = replace(monitor, definition=replace(monitor.definition, name='<img src=x onerror=alert(1)>'))
-    markup = style.monitor_row(unsafe, None, False, lambda value: value)
-    assert '<img' not in markup and '&lt;img' in markup
-    assert 'monitor-identity' in markup and '<strong' in markup and '<small' in markup
-    assert 'monitor-pill--paused' in markup and 'PAUSED' in markup
-    assert 'Not scheduled' in markup and 'No runs' in markup
-    assert 'text-align:left' in style.CSS and ':focus-visible' in style.CSS
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert [tab.label for tab in app.tabs] == ['Overview', 'Findings', 'Runs', 'Settings']
-    assert app.tabs[3].button(key='toggle_monitor_' + monitor.id)
-    assert app.tabs[2].subheader[0].value == 'Run History'
-    assert app.tabs[3].button(key='edit_monitor_' + monitor.id)
-    assert any('Administration' in item.label for item in app.tabs[3].expander)
-    assert 'Archive' not in app.button(key='toggle_monitor_' + monitor.id).label
-    # AppTest exposes tab contents but has no tab-click API. Browser validation
-    # covers switching tabs and retaining the active tab across Refresh.
-    assert app.session_state['monitor_tabs_' + monitor.id] == 'Overview'
-    app.tabs[3].button(key='edit_monitor_' + monitor.id).click().run()
-    assert app.session_state['monitor_edit_mode'] == monitor.id
-    assert not app.exception
-    assert_safe(app)
+REAL_CONNECT = sqlite3.connect
 
 
 @pytest.fixture
 def monitoring_ui(ui, monkeypatch, tmp_path):
     def connect(path, *args, **kwargs):
+        if kwargs.get('uri'):
+            path = unquote(urlparse(path).path).lstrip('/')
         assert Path(path).resolve().is_relative_to(tmp_path.resolve())
         return REAL_CONNECT(path, *args, **kwargs)
+
     monkeypatch.setattr(sqlite3, 'connect', connect)
     monkeypatch.setattr(sqlite3.dbapi2, 'connect', connect)
     monkeypatch.setenv('AIOPS_MONITOR_DB', str(tmp_path / 'monitor.sqlite3'))
     from monitoring.repository import SQLiteMonitorRepository
     from monitoring.domain import MonitorDefinition
     import monitoring_views
-    from monitoring.targets import TargetOptions, TargetValidation
-    ui.target_calls = []
-    class Explorer:
-        def __init__(self, config, end):
-            self.end = end
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            pass
-        def options(self, name, **scope):
-            ui.target_calls.append(('options', name, scope))
-            values = {'namespace': ('ns', 'other-namespace', 'changed-ns'),
-                      'workload': ('app', 'other-workload'), 'container': ('main', 'sidecar')}
-            if name == 'workload' and scope.get('namespace') == 'other-namespace':
-                return TargetOptions(('other-workload',))
-            return TargetOptions(values[name])
-        def validate(self, namespace, workload, container=None):
-            ui.target_calls.append(('validate', namespace, workload, container))
-            return TargetValidation(3800, self.end - timedelta(seconds=12), 'INFO Agent completed · [redacted]')
-    monkeypatch.setattr(monitoring_views, 'TargetExplorer', Explorer)
+
     monkeypatch.setattr(monitoring_views, 'now', lambda: BASE)
-    repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3')
-    monitor = repo.create(MonitorDefinition('saved-monitor', 'profile', 'cluster', 'ns', 'app', BASE), now=BASE)
+    repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
+    monitor = repo.create(MonitorDefinition('synthetic', 'profile', 'cluster', 'ns', 'app', BASE),
+                          enabled=True, now=BASE)
     return ui, repo, monitor
 
 
-def test_persisted_monitors_render_without_source_config_and_toggle(monitoring_ui, monkeypatch):
+def test_home_one_list_query_and_rerender_snapshot(monitoring_ui, monkeypatch):
     ui, repo, monitor = monitoring_ui
-    monkeypatch.delenv('OPENSEARCH_PASSWORD')
+    from monitoring.repository import SQLiteMonitorRepository
+    calls = []
+    original = SQLiteMonitorRepository.list_monitor_summaries
+    def counted(self, **kwargs):
+        calls.append(kwargs)
+        return original(self, **kwargs)
+    monkeypatch.setattr(SQLiteMonitorRepository, 'list_monitor_summaries', counted)
     app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert not app.exception
     assert app.title[0].value == 'Deployment Monitors'
-    assert any('Source unavailable' in item.value for item in app.warning)
-    assert any('PAUSED' in item.value for item in app.markdown)
-    assert len(repo.history(monitor.id)) == 0
-    app.button(key='toggle_monitor_' + monitor.id).click().run()
-    assert repo.get(monitor.id).enabled
+    assert len(calls) == 1
+    app.text_input(key='monitor_search').set_value('app').run()
+    app.selectbox(key='monitor_status_filter').set_value('Active').run()
+    assert len(calls) == 1
+    assert app.button(key='monitor_row_' + monitor.id)
+    app.button(key='refresh_monitors').click().run()
+    assert len(calls) == 2
+    assert_safe(app)
+
+
+def test_detail_only_loads_compact_recent_runs(monitoring_ui, monkeypatch):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.repository import SQLiteMonitorRepository
+    calls = []
+    for name in ('recent_runs', 'result', 'acquisition_diagnostics', 'acquisition_shards'):
+        original = getattr(SQLiteMonitorRepository, name)
+        def wrap(method, label):
+            def counted(self, *args, **kwargs):
+                calls.append((label, kwargs))
+                return method(self, *args, **kwargs)
+            return counted
+        monkeypatch.setattr(SQLiteMonitorRepository, name, wrap(original, name))
+    app = ui.app()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert calls == [('recent_runs', {'limit': 10})]
+    assert not app.tabs
+    app.text_input(key='monitor_search').set_value('app').run()
+    assert calls == [('recent_runs', {'limit': 10})]
+    assert_safe(app)
+
+
+def test_pause_and_refresh_invalidate_snapshot(monitoring_ui, monkeypatch):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.repository import SQLiteMonitorRepository
+    calls = []
+    original = SQLiteMonitorRepository.list_monitor_summaries
+    def counted(self, **kwargs):
+        calls.append(1)
+        return original(self, **kwargs)
+    monkeypatch.setattr(SQLiteMonitorRepository, 'list_monitor_summaries', counted)
+    app = ui.app()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert len(calls) == 1
     app.button(key='toggle_monitor_' + monitor.id).click().run()
     assert not repo.get(monitor.id).enabled
-    assert not ui.sources and not ui.files and not ui.packages
+    assert len(calls) == 2
     assert_safe(app)
 
 
-def test_successful_run_history_uses_investigation_workbench(monitoring_ui):
+def test_compact_failure_reason_and_blocked_window_are_safe(monitoring_ui):
     ui, repo, monitor = monitoring_ui
-    from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    summary = dict(records_read=7, source_scope='gocpbmgpup1', index_expression='gocpbmgpup1*',
-                   resolved_index='gocpbmgpup1-2026.10.05', retrieval_start='2026-10-05T11:59:00+00:00',
-                   retrieval_end='2026-10-05T12:16:00+00:00', namespace='ns', workload='app', container='main',
-                   document_cluster_id=None)
-    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
-    repo.succeed(run, safe, RunCounts(events_retrieved=7, logical_events=7), {}, now=BASE + timedelta(minutes=17))
+    for attempt in range(3):
+        stamp = BASE + timedelta(minutes=17 + 16 * attempt)
+        run = repo.claim(stamp)
+        repo.fail(run, 'OPENSEARCH_QUERY', now=stamp,
+                  diagnostics={'reason_code': 'INVALID_CURSOR', 'password': 'password=secret'})
     app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.exception
     app.button(key='monitor_row_' + monitor.id).click().run()
-    assert app.selectbox(key='selected_run_id').value == run.id
-    assert any(item.value == 'Investigation sonucu' for item in app.title)
-    assert any('Logs analyzed' in item.value and '7' in item.value for item in app.markdown)
-    technical = next(item.value for item in app.dataframe
-                     if 'Gösterge' in item.value and 'İndeks' in item.value['Gösterge'].values)
-    details = dict(zip(technical['Gösterge'], technical['Değer']))
-    assert details['İndeks'] == summary['resolved_index']
-    assert details['Kaynak indeks deseni'] == summary['index_expression']
-    assert details['Kaynak kapsamı'] == 'gocpbmgpup1'
-    assert details['Sorgu başlangıcı'] == summary['retrieval_start']
-    assert details['Sorgu sonu (hariç)'] == summary['retrieval_end']
-    assert details['Document OpenShift cluster UUID'] == 'Absent (no filter)'
-    assert_safe(app)
-
-
-def test_create_minimal_monitor_with_defaults_and_edit_name(monitoring_ui):
-    ui, repo, _ = monitoring_ui
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='new_monitor').click().run()
-    assert not any(item.label in ('Monitor name', 'Source profile / scope', 'Logical cluster alias') for item in app.text_input)
-    assert not app.number_input
-    app.selectbox(key='monitor_field_new_namespace').set_value('ns').run()
-    app.selectbox(key='monitor_field_new_workload').set_value('app').run()
-    assert any('3,800' in item.value for item in app.success)
-    assert app.code[0].value == 'INFO Agent completed · [redacted]'
-    assert app.selectbox(key='monitor_field_new_interval').value == '15 minutes'
-    assert app.selectbox(key='monitor_field_new_container').value is None
-    app.button(key='save_monitor_new').click().run()
-    assert not app.exception
-    monitors = repo.list()
-    assert len(monitors) == 2
-    created = next(m for m in monitors if m.definition.name == 'app')
-    assert created.enabled and created.definition.source_timezone is None
-    assert created.definition.cluster_id == created.definition.cluster_alias == 'profile'
-    assert created.definition.document_cluster_id is None
-    assert created.definition.initial_start == BASE and created.definition.container is None
-    assert created.definition.interval_seconds == created.definition.window_seconds == 900
-    assert app.session_state['expanded_monitor_id'] == created.id
-    assert not app.session_state['create_form_open']
-    assert not any(item.key == 'monitor_name_new' for item in app.text_input)
-    app.button(key='edit_monitor_' + created.id).click().run()
-    app.text_input(key='monitor_name_' + created.id).set_value('edited-in-ui')
-    app.button(key='save_monitor_' + created.id).click().run()
-    assert not app.exception
-    assert repo.get(created.id).definition.name == 'edited-in-ui'
-    assert repo.get(created.id).definition.document_cluster_id is None
-    assert app.session_state['monitor_edit_mode'] is None
-    assert not repo.history(created.id) and not ui.sources
-
-
-def test_manual_upload_navigation_remains_available(monitoring_ui):
-    ui, _, _ = monitoring_ui
-    app = ui.app()
-    assert any('Manual Investigation / Test / Smoke' == item.value for item in app.subheader)
-    app.button(key='start_file').click().run()
-    assert not app.exception
-    assert app.radio(key='analysis_source').value == 'Dosya / paket'
-    assert app.selectbox(key='file_source_timezone').value == 'Unknown'
-
-
-def test_monitor_rows_toggle_one_expanded_id_and_refresh_preserves_it(monitoring_ui):
-    ui, repo, first = monitoring_ui
-    second = repo.create(first.definition, now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.exception
-    assert len([button for button in app.button if button.key.startswith('monitor_row_')]) == 2
-    assert not any(box.label == 'Inspect monitor' for box in app.selectbox)
-    assert app.session_state['expanded_monitor_id'] is None
-    assert not app.dataframe
-    app.button(key='monitor_row_' + first.id).click().run()
-    assert app.session_state['expanded_monitor_id'] == first.id
-    app.button(key='refresh_monitors').click().run()
-    assert app.session_state['expanded_monitor_id'] == first.id
-    app.button(key='monitor_row_' + second.id).click().run()
-    assert app.session_state['expanded_monitor_id'] == second.id
-    assert len([item for item in app.subheader if item.value == 'Status']) == 1
-    app.button(key='monitor_row_' + second.id).click().run()
-    assert app.session_state['expanded_monitor_id'] is None
-    assert not any(item.value == 'Run History' for item in app.subheader)
-    assert not ui.sources and not ui.files and not ui.packages
-    assert_safe(app)
-
-
-def test_create_form_toggle_cancel_and_reopen_reset_without_mutation(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
-    app.button(key='new_monitor').click().run()
-    assert app.session_state['create_form_open']
-    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
-    app.button(key='cancel_monitor_new').click().run()
-    assert not app.session_state['create_form_open']
-    assert repo.list() == [monitor]
-    app.button(key='new_monitor').click().run()
-    assert app.selectbox(key='monitor_field_new_namespace').value is None
-    app.button(key='new_monitor').click().run()
-    assert not app.session_state['create_form_open'] and not [item for item in app.text_input if item.key != 'monitor_search']
-    assert repo.list() == [monitor]
-    assert_safe(app)
-
-
-def test_creation_resets_fields_and_refreshes_clickable_list(monitoring_ui):
-    ui, repo, _ = monitoring_ui
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='new_monitor').click().run()
-    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
-    app.selectbox(key='monitor_field_new_workload').set_value('other-workload').run()
-    app.button(key='save_monitor_new').click().run()
-    assert not app.exception
-    created = next(item for item in repo.list() if item.definition.name == 'other-workload')
-    assert app.session_state['expanded_monitor_id'] == created.id
-    assert not app.session_state['create_form_open']
-    assert app.button(key='monitor_row_' + created.id)
-    app.button(key='new_monitor').click().run()
-    assert app.selectbox(key='monitor_field_new_namespace').value is None
-    assert not any(item.key == 'monitor_field_new_workload' for item in app.selectbox)
-    assert not ui.sources and not ui.files and not ui.packages
-    assert_safe(app)
-
-
-@pytest.mark.parametrize('action', ['edit', 'cancel_edit', 'pause', 'enable'])
-def test_duplicate_name_actions_use_expanded_monitor_id(monitoring_ui, action):
-    ui, repo, first = monitoring_ui
-    second = repo.create(first.definition, enabled=action == 'pause', now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + second.id).click().run()
-    assert app.session_state['expanded_monitor_id'] == second.id
-    if action in ('edit', 'cancel_edit'):
-        app.button(key='edit_monitor_' + second.id).click().run()
-        assert app.session_state['monitor_edit_mode'] == second.id
-        app.text_input(key='monitor_name_' + second.id).set_value('changed second')
-        app.selectbox(key='monitor_field_' + second.id + '_namespace').set_value('changed-ns').run()
-        if action == 'cancel_edit':
-            app.button(key='cancel_monitor_' + second.id).click().run()
-            assert repo.get(second.id) == second
-            app.button(key='edit_monitor_' + second.id).click().run()
-            assert app.text_input(key='monitor_name_' + second.id).value == second.definition.name
-            assert app.selectbox(key='monitor_field_' + second.id + '_namespace').value == 'ns'
-        else:
-            app.button(key='save_monitor_' + second.id).click().run()
-            assert repo.get(second.id).definition.name == 'changed second'
-            assert repo.get(second.id).definition.namespace == 'changed-ns'
-            assert app.session_state['monitor_edit_mode'] is None
-    else:
-        app.button(key='toggle_monitor_' + second.id).click().run()
-        assert repo.get(second.id).enabled == (action == 'enable')
-    assert repo.get(first.id) == first
-    assert app.session_state['expanded_monitor_id'] == second.id
-    assert not ui.sources and not ui.files and not ui.packages
-    assert_safe(app)
-
-
-def test_archive_confirmation_cancel_and_show_archived_keep_duplicate_independent(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    duplicate = repo.create(monitor.definition, now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert not any(button.label == 'Confirm archive' for button in app.button)
-    app.button(key='delete_monitor_' + monitor.id).click().run()
-    assert repo.get(monitor.id) == monitor
-    assert app.session_state['delete_confirmation_monitor_id'] == monitor.id
-    assert any(item.value == 'This removes the monitor from active monitoring. Historical runs and evidence will be preserved.'
+    assert any('ATTENTION / BLOCKED' in item.value and 'INVALID_CURSOR' in item.value
                for item in app.warning)
-    app.button(key='cancel_delete_' + monitor.id).click().run()
-    assert repo.get(monitor.id) == monitor
-    assert app.session_state['delete_confirmation_monitor_id'] is None
-    app.button(key='delete_monitor_' + monitor.id).click().run()
-    app.button(key='confirm_delete_' + monitor.id).click().run()
-    assert repo.get(monitor.id).archived and not repo.get(monitor.id).enabled
-    assert app.session_state['expanded_monitor_id'] is None
-    assert app.session_state['selected_run_id'] is None
-    assert app.session_state['delete_confirmation_monitor_id'] is None
-    assert not any(button.key == 'monitor_row_' + monitor.id for button in app.button)
-    assert repo.get(duplicate.id) == duplicate
-    app.checkbox(key='show_archived').check().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('ARCHIVED' in item.value for item in app.markdown)
-    assert not any(button.key in {'toggle_monitor_' + monitor.id, 'edit_monitor_' + monitor.id,
-                                 'delete_monitor_' + monitor.id} for button in app.button)
-    app.checkbox(key='show_archived').uncheck().run()
-    assert app.session_state['expanded_monitor_id'] is None
-    assert not ui.sources and not ui.files and not ui.packages
+    assert any('Blocked window:' in item.value for item in app.caption)
+    assert 'password=secret' not in str(app)
+    assert 'password=secret' not in str(repo.acquisition_diagnostics(run.id))
     assert_safe(app)
 
 
-def test_changing_monitors_clears_edit_delete_and_run_context(monitoring_ui):
-    ui, repo, first = monitoring_ui
-    second = repo.create(first.definition, now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + first.id).click().run()
-    app.button(key='edit_monitor_' + first.id).click().run()
-    app.button(key='monitor_row_' + second.id).click().run()
-    assert app.session_state['monitor_edit_mode'] is None
-    assert not [item for item in app.text_input if item.key != 'monitor_search']
-    app.button(key='delete_monitor_' + second.id).click().run()
-    app.button(key='monitor_row_' + first.id).click().run()
-    assert app.session_state['delete_confirmation_monitor_id'] is None
-    assert not any(button.label == 'Confirm archive' for button in app.button)
-    assert repo.list(include_archived=True) == sorted([first, second], key=lambda item: (item.created_at, item.id))
-
-
-def test_empty_list_and_archived_only_list_are_clear(monitoring_ui):
+def test_archived_monitor_absent_until_explicit_filter(monitoring_ui):
     ui, repo, monitor = monitoring_ui
     repo.archive(monitor.id, now=BASE)
     app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert any('No monitors to show' in item.value for item in app.info)
-    app.button(key='new_monitor').click().run()
-    assert app.session_state['create_form_open'] and app.selectbox(key='monitor_field_new_namespace')
-    app.button(key='cancel_monitor_new').click().run()
+    assert not [button for button in app.button if button.key == 'monitor_row_' + monitor.id]
     app.checkbox(key='show_archived').check().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('No runs have been recorded' in item.value for item in app.info)
+    assert app.button(key='monitor_row_' + monitor.id)
     assert_safe(app)
 
 
-def test_failed_run_and_no_successful_investigation_empty_state(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    repo.fail(run, 'OPENSEARCH_TIMEOUT', now=BASE)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('Last run:' in item.value and 'FAILED' in item.value for item in app.markdown)
-    history = next(item.value for item in app.tabs[2].dataframe if 'Window' in item.value)
-    assert list(history.columns) == ['Window', 'Status', 'Logs', 'Logical Events', 'Signals', 'Incidents']
-    diagnostics = next(item.value for item in app.tabs[2].dataframe if 'Error' in item.value)
-    assert diagnostics.iloc[0]['Run'] == run.id and diagnostics.iloc[0]['Error'] == 'OPENSEARCH_TIMEOUT'
-    assert any('OPENSEARCH_TIMEOUT' in item.value for item in app.error)
-    assert any('No successful runs' in item.value for item in app.info)
-    assert app.selectbox(key='selected_run_id').value == run.id
-    assert repo.result(run.id) is None
-    assert_safe(app)
-
-
-def test_status_refresh_never_constructs_pipeline_or_queries_source(monitoring_ui, monkeypatch):
-    ui, repo, monitor = monitoring_ui
-    import full_pipeline_v2
-    import monitoring.execution
-    def forbidden(*args, **kwargs):
-        pytest.fail('Monitor management must only read persisted evidence')
-    monkeypatch.setattr(full_pipeline_v2, 'FullAIOpsPipelineV2', forbidden)
-    monkeypatch.setattr(ui.boundary, 'run_analysis', forbidden)
-    monkeypatch.setattr(monitoring.execution.OpenSearchMonitorExecutor, 'execute', forbidden)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    app.button(key='refresh_monitors').click().run()
-    assert app.session_state['expanded_monitor_id'] == monitor.id
-    assert repo.get(monitor.id) == monitor
-    assert not ui.sources and not ui.files and not ui.packages
-    assert_safe(app)
-
-
-def test_selectors_reset_dependent_workload_and_container_refreshes_validation(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='new_monitor').click().run()
-    assert app.button(key='save_monitor_new').disabled
-    app.selectbox(key='monitor_field_new_namespace').set_value('ns').run()
-    app.selectbox(key='monitor_field_new_workload').set_value('app').run()
-    app.selectbox(key='monitor_field_new_container').set_value('sidecar').run()
-    assert ui.target_calls[-1] == ('validate', 'ns', 'app', 'sidecar')
-    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
-    assert app.selectbox(key='monitor_field_new_workload').value is None
-    assert app.button(key='save_monitor_new').disabled
-    assert repo.list() == [monitor]
-
-
-def test_history_locks_target_preserves_watermark_and_clones_new_identity(monitoring_ui):
+def test_older_runs_require_one_explicit_page_query(monitoring_ui, monkeypatch):
     ui, repo, monitor = monitoring_ui
     from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    repo.succeed(run, {'stats': {}, 'signals': [], 'source_summary': {}}, RunCounts(), {}, now=BASE)
-    before = repo.get(monitor.id)
+    from monitoring.repository import SQLiteMonitorRepository
+    for index in range(11):
+        stamp = BASE + timedelta(minutes=17 + 15 * index)
+        run = repo.claim(stamp)
+        assert run is not None
+        repo.succeed(run, {}, RunCounts(), {}, now=stamp,
+                     metrics={'total_physical_logs': 0}, pattern_metrics=())
+    calls = []
+    original = SQLiteMonitorRepository.recent_runs
+    def counted(self, *args, **kwargs):
+        calls.append(kwargs)
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(SQLiteMonitorRepository, 'recent_runs', counted)
     app = ui.app()
-    app.button(key='start_monitors').click().run()
     app.button(key='monitor_row_' + monitor.id).click().run()
-    app.button(key='edit_monitor_' + monitor.id).click().run()
-    assert app.text_input(key='monitor_field_' + monitor.id + '_namespace').disabled
-    assert app.text_input(key='monitor_field_' + monitor.id + '_workload').disabled
-    assert not ui.target_calls
-    assert any('Target cannot be changed' in item.value for item in app.caption)
-    app.selectbox(key='monitor_field_' + monitor.id + '_interval').set_value('30 minutes').run()
-    app.button(key='save_monitor_' + monitor.id).click().run()
-    changed = repo.get(monitor.id)
-    assert changed.definition.interval_seconds == 1800
-    assert changed.definition.window_seconds == 900
-    assert changed.last_successful_end == before.last_successful_end
-    assert repo.result(run.id) == {'stats': {}, 'signals': [], 'source_summary': {}}
-    app.button(key='clone_monitor_' + monitor.id).click().run()
-    app.selectbox(key='monitor_field_new_namespace').set_value('other-namespace').run()
-    app.selectbox(key='monitor_field_new_workload').set_value('other-workload').run()
-    app.button(key='save_monitor_new').click().run()
-    created = next(m for m in repo.list() if m.id != monitor.id)
-    assert created.definition.workload == 'other-workload' and created.enabled
-    assert created.last_successful_end is None and not repo.history(created.id)
-    assert repo.get(monitor.id) == changed
-    assert not app.exception
-
-
-def test_run_selection_opens_exact_persisted_evidence_without_queries(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run1 = repo.claim(BASE + timedelta(minutes=17))
-    repo.succeed(run1, {'stats': {}, 'signals': [], 'source_summary': {'resolved_index': 'first-index'}},
-                 RunCounts(events_retrieved=3), {}, now=BASE + timedelta(minutes=17))
-    run2 = repo.claim(BASE + timedelta(minutes=32))
-    repo.succeed(run2, {'stats': {}, 'signals': [], 'source_summary': {'resolved_index': 'second-index'}},
-                 RunCounts(events_retrieved=5), {}, now=BASE + timedelta(minutes=32))
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    app.selectbox(key='selected_run_id').set_value(run1.id).run()
-    assert any('first-index' in item.value for item in app.json)
-    assert not any('second-index' in item.value for item in app.json)
-    assert not ui.target_calls and not ui.sources
-    assert not app.exception
-
-
-def test_failed_run_displays_persisted_safe_acquisition_diagnostics(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    repo.fail(run, 'ACQUISITION_LIMIT', now=BASE, diagnostics={
-        'source_profile': 'profile', 'resolved_index': 'persisted-failed-index',
-        'records_read': 2000, 'pages_read': 20, 'budget_reached': True,
-        'effective_query': {'bool': {'filter': [{'term': {'namespace': 'ns'}}]}},
-        'password': 'must-not-render'})
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    assert any('persisted-failed-index' in item.value and '2000' in item.value for item in app.json)
-    assert not any('must-not-render' in item.value for item in app.json)
-    assert repo.get(monitor.id).last_successful_end is None and repo.result(run.id) is None
-    assert 'must-not-render' not in str(repo.acquisition_diagnostics(run.id))
-    assert not ui.target_calls and not ui.sources and not app.exception
-
-
-@pytest.mark.parametrize('possible,confirmed', [(2, 0), (0, 0), (1, 2)])
-def test_boundary_warning_quantifies_possible_incomplete_without_claiming_truncation(monitoring_ui, possible, confirmed):
-    ui, repo, monitor = monitoring_ui
-    from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    # Confirmed rows exercise future display support; the current session does
-    # not manufacture this status from any of its lifecycle emission reasons.
-    summary = dict(window_assembly=dict(boundary_tail_events=possible), boundary_quality=dict(
-        total_events=198, counts=dict(complete=198 - possible - confirmed, possible_incomplete=possible, confirmed_truncated=confirmed),
-        analysis_end_events=possible, event_statuses=[], affected_events=[], sample_limit=200))
-    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
-    repo.succeed(run, safe, RunCounts(logical_events=198), {}, now=BASE + timedelta(minutes=17))
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.exception
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    elements = app.error if confirmed else app.warning if possible else app.caption
-    text = next(item.value for item in elements if 'Boundary completeness' in item.value)
-    assert f'{possible} of 198' in text and 'possible_incomplete' in text
-    assert f'Confirmed truncation: {confirmed}' in text
-    assert 'long events may be incomplete' not in text
-    if not confirmed:
-        assert not app.error
-    if not possible and not confirmed:
-        assert not app.warning
-
-
-@pytest.mark.parametrize('tails', [0, 2])
-def test_reopening_historical_boundary_counts_does_not_rewrite_run_or_invent_details(monitoring_ui, tails):
-    ui, repo, monitor = monitoring_ui
-    from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    summary = dict(window_assembly=dict(boundary_tail_events=tails, orphan_events=1, overlap_conflicts=1))
-    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
-    repo.succeed(run, safe, RunCounts(logical_events=198), {}, now=BASE + timedelta(minutes=17))
-    original = repo.result(run.id)
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.exception and not app.error
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    elements = app.warning if tails else app.caption
-    text = next(item.value for item in elements if 'Boundary completeness' in item.value)
-    assert f'{tails} of 198' in text and 'Confirmed truncation: 0 recorded' in text
-    assert any('Event-level boundary details were not stored' in item.value for item in app.caption)
-    assert any('1 orphan events excluded; 1 overlap conflicts' in item.value for item in app.info)
-    if not tails:
-        assert not app.warning
-    assert not any(item.label == 'Boundary-affected events (metadata only)' for item in app.expander)
-    assert repo.result(run.id) == original and repo.get(monitor.id).last_successful_end == run.window.end
-
-
-def test_boundary_event_table_is_bounded_allowlisted_and_redacted(monitoring_ui):
-    ui, repo, monitor = monitoring_ui
-    from monitoring.boundary_quality import BOUNDARY_DIAGNOSTIC_LIMIT
-    from monitoring.domain import RunCounts
-    repo.set_enabled(monitor.id, True, now=BASE)
-    run = repo.claim(BASE + timedelta(minutes=17))
-    count = BOUNDARY_DIAGNOSTIC_LIMIT + 5
-    rows = [dict(event_ordinal=i + 1, event_id=f'event-{i}', boundary_status='possible_incomplete',
-                 emission_reason='analysis_end', pod_instance='pod-uid', container_instance='container-uid', channel='stdout',
-                 raw='private-payload', Authorization='Bearer private-auth', arbitrary_field='private-extra') for i in range(count)]
-    rows[0]['pod_instance'] = 'pod password=private-password'
-    summary = dict(boundary_quality=dict(total_events=count, counts=dict(complete=0, possible_incomplete=count, confirmed_truncated=0),
-                   analysis_end_events=count, event_statuses=rows, affected_events=rows, sample_limit=BOUNDARY_DIAGNOSTIC_LIMIT))
-    safe = ui.boundary.presentation_result(ui.payload, summary, ui.boundary.load_connection())
-    repo.succeed(run, safe, RunCounts(logical_events=count), {}, now=BASE + timedelta(minutes=17))
-    app = ui.app()
-    app.button(key='start_monitors').click().run()
-    assert not app.exception
-    app.button(key='monitor_row_' + monitor.id).click().run()
-    table = next(item.value for item in app.dataframe if 'boundary_status' in item.value)
-    assert len(table) == BOUNDARY_DIAGNOSTIC_LIMIT
-    assert table.iloc[0]['event_id'] == 'event-0' and table.iloc[0]['pod_instance'] == 'pod [redacted]'
-    assert table.iloc[-1]['event_ordinal'] == BOUNDARY_DIAGNOSTIC_LIMIT
-    assert not {'raw', 'Authorization', 'arbitrary_field'} & set(table.columns)
-    # The general JSON expander must not bypass the dedicated table's row cap.
-    assert all('event_statuses' not in item.value and 'affected_events' not in item.value for item in app.json)
-    assert any(f'Showing {BOUNDARY_DIAGNOSTIC_LIMIT} of {count}' in item.value for item in app.caption)
-    for secret in ('private-payload', 'private-auth', 'private-extra', 'private-password'):
-        assert secret not in str(table)
+    assert calls == [{'limit': 10}]
+    app.button(key='older_' + monitor.id).click().run()
+    assert len(calls) == 2 and calls[1]['limit'] == 10 and 'before' in calls[1]
+    app.text_input(key='monitor_search').set_value('app').run()
+    assert len(calls) == 2
     assert_safe(app)

@@ -69,7 +69,7 @@ def test_once_idle_reports_start_lock_and_next_due_without_early_run(worker_modu
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3')
     monitor = repo.create(definition(), enabled=True, now=NOW)
     monkeypatch.setattr(worker_module, 'database_path', lambda: repo.path)
-    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path: repo)
+    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path, **kwargs: repo)
     assert worker_module.main(['--once', '--max-runs', '1']) == 0
     logged = events(capsys)
     assert [row['event'] for row in logged] == ['WORKER_START', 'WORKER_LOCK_ACQUIRED', 'WORKER_IDLE']
@@ -88,7 +88,7 @@ def test_second_worker_reports_busy_without_running_scheduler(worker_module, tmp
     path = tmp_path / 'monitor.sqlite3'
     monkeypatch.setattr(worker_module, 'database_path', lambda: path)
     monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository',
-                        lambda path: pytest.fail('Busy worker must not open repository'))
+                        lambda path, **kwargs: pytest.fail('Busy worker must not open repository'))
     with exclusive_worker(path.with_suffix('.worker.lock')):
         assert worker_module.main(['--once']) == 1
     logged = events(capsys)
@@ -103,7 +103,7 @@ def test_long_running_idle_heartbeat_is_bounded(worker_module, tmp_path, monkeyp
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3')
     repo.create(definition(), enabled=True, now=NOW)
     monkeypatch.setattr(worker_module, 'database_path', lambda: repo.path)
-    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path: repo)
+    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path, **kwargs: repo)
     elapsed = iter((0, 30, 60))
     monkeypatch.setattr(worker_module, 'monotonic_clock', lambda: next(elapsed))
     sleeps = []
@@ -135,7 +135,7 @@ def test_due_once_retains_execution_logs_and_watermark(worker_module, tmp_path, 
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3')
     monitor = repo.create(definition(NOW - timedelta(minutes=17)), enabled=True, now=NOW)
     monkeypatch.setattr(worker_module, 'database_path', lambda: repo.path)
-    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path: repo)
+    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path, **kwargs: repo)
 
     class Executor:
         def execute(self, run, consumed):

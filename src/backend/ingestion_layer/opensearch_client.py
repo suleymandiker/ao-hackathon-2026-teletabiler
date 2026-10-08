@@ -8,6 +8,11 @@ from ingestion_layer.opensearch_config import OpenSearchConfig, _host_url
 class OpenSearchClientError(RuntimeError):
     """Sanitized transport/response failure; never contains document bodies."""
 
+    def __init__(self, message, reason_code='QUERY_FAILURE_UNKNOWN', retryable=False):
+        self.reason_code = reason_code
+        self.retryable = retryable
+        super().__init__(message)
+
 
 class OpenSearchClient:
     """Transport only: two bounded passes across hosts, no query or hit logic.
@@ -49,6 +54,8 @@ class OpenSearchClient:
         if type(body) is not dict:
             raise OpenSearchClientError("JSON request must be an object")
         error = "OpenSearch request failed"
+        reason = 'QUERY_FAILURE_UNKNOWN'
+        retryable_error = False
         for attempt in range(2 * len(self._hosts)):
             response = None
             retry = False
@@ -64,32 +71,38 @@ class OpenSearchClient:
                 )
             except requests.exceptions.SSLError:
                 error = "OpenSearch TLS failure"
+                reason, retryable_error = 'QUERY_FAILURE_UNKNOWN', False
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
                 error = "OpenSearch connection or timeout failure"
+                reason, retryable_error = 'CONNECTION_TIMEOUT', True
                 retry = True
             except (requests.exceptions.RequestException, ValueError, OSError):
                 error = "OpenSearch request/configuration failure"
+                reason, retryable_error = 'QUERY_FAILURE_UNKNOWN', False
 
             if response is None:
                 if retry:
                     continue
-                raise OpenSearchClientError(error)
+                raise OpenSearchClientError(error, reason, retryable_error)
 
             try:
                 status = response.status_code
                 if status in self._RETRY_STATUSES:
                     error = f"OpenSearch transient HTTP failure ({status})"
+                    reason = 'HTTP_429' if status == 429 else 'HTTP_5XX'
+                    retryable_error = True
                     continue
                 if not 200 <= status < 300:
-                    raise OpenSearchClientError(f"OpenSearch HTTP failure ({status})")
+                    code = 'AUTH_FAILURE' if status in (401, 403) else 'QUERY_FAILURE_UNKNOWN'
+                    raise OpenSearchClientError(f"OpenSearch HTTP failure ({status})", code)
                 payload = None
                 try:
                     payload = response.json()
                 except ValueError:
                     pass
                 if type(payload) is not dict:
-                    raise OpenSearchClientError("OpenSearch response must be a JSON object")
+                    raise OpenSearchClientError("OpenSearch response must be a JSON object", 'INVALID_RESPONSE')
                 return payload
             finally:
                 response.close()
-        raise OpenSearchClientError(error)
+        raise OpenSearchClientError(error, reason, retryable_error)
