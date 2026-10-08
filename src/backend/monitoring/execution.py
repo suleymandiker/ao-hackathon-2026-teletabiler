@@ -12,7 +12,7 @@ from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourc
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
-from monitoring.errors import MonitoringError
+from monitoring.errors import MonitoringError, safe_exception_type, safe_pipeline_stage
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
@@ -168,8 +168,13 @@ class OpenSearchMonitorExecutor:
         metrics_source = None
         unique = 0
         duplicates = 0
+        pipeline_stage = 'source_setup'
 
-        def failure(category):
+        def mark_pipeline_stage(stage):
+            nonlocal pipeline_stage
+            pipeline_stage = stage
+
+        def failure(category, *, error=None):
             if acquisition is not None:
                 summary.update(pages_read=acquisition.pages_read,
                                records_read=acquisition.records_read,
@@ -180,6 +185,9 @@ class OpenSearchMonitorExecutor:
                 summary.update(budget_reached=True, stop_reason='acquisition_limit')
             elif category.startswith('OPENSEARCH'):
                 summary['stop_reason'] = 'acquisition_failed'
+            if category == 'PIPELINE' and error is not None:
+                summary.update(pipeline_stage=safe_pipeline_stage(pipeline_stage),
+                               exception_type=safe_exception_type(error))
             error = MonitoringError(category)
             error.acquisition_diagnostics = redact_ai_secret(
                 application.presentation_result({}, summary, config)['source_summary'])
@@ -208,6 +216,7 @@ class OpenSearchMonitorExecutor:
                           if self.source_factory is OpenSearchSource else self.source_factory(client))
                 metrics_source = OpenSearchMetricsSource(client)
                 summary['query_executed'] = True
+                mark_pipeline_stage('metrics_acquisition')
                 metrics = metrics_source.window(run)
                 self.log('METRICS_ACQUIRED', run_id=run.id, physical_logs=metrics.total,
                          time_buckets=len(metrics.buckets))
@@ -217,6 +226,7 @@ class OpenSearchMonitorExecutor:
                     ledger_context = self.repository.acquisition_ledger(run, start)
                 except Exception:
                     raise MonitoringError('PERSISTENCE') from None
+                mark_pipeline_stage('shard_planning')
                 shards = plan_shards(start, end, metrics, definition.page_size, definition.max_pages)
                 def save_shard(shard, status, **values):
                     try:
@@ -225,6 +235,7 @@ class OpenSearchMonitorExecutor:
                         raise MonitoringError('PERSISTENCE') from None
                 acquisition = StreamingAcquisition(source, metrics_source, definition, log=self.log,
                     shard_sink=save_shard)
+                mark_pipeline_stage('content_acquisition')
                 with ledger_context as ledger:
                     ownership = WindowOwnership(run, ledger=ledger)
                     unique_inside_window = 0
@@ -286,6 +297,7 @@ class OpenSearchMonitorExecutor:
                                 raise MonitoringError('OPENSEARCH_QUERY')
                             buffered_pages = [first_empty]
                         if sample and metrics.total:
+                            mark_pipeline_stage('policy_resolution')
                             try:
                                 resolution = VerifiedPolicyResolver().resolve(
                                     sample, self.policy_loader())
@@ -300,14 +312,18 @@ class OpenSearchMonitorExecutor:
                             yield from buffered_pages
                             yield from stream
 
+                        mark_pipeline_stage('accumulator')
                         accumulator = WindowAccumulator(window_seconds=definition.window_seconds)
                         accumulator.configure_anomalies(run, metrics, history, pattern_history)
+                        mark_pipeline_stage('pipeline_construction')
                         with quiet_pipeline():
                             result = self.pipeline_factory().process_ingested_pages(
                                 selected_pages(), policy_provider=lambda key, record: snapshot,
                                 source_timezone=definition.source_timezone,
                                 assembled_event_filter=ownership, observer=trace,
-                                monitoring_accumulator=accumulator)
+                                monitoring_accumulator=accumulator,
+                                stage_callback=mark_pipeline_stage)
+                    mark_pipeline_stage('result_building')
                     if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                         reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
                         allowed_reasons = {'blank_context'} if metrics.total else {'blank_context', 'no_policy'}
@@ -365,8 +381,8 @@ class OpenSearchMonitorExecutor:
         except OpenSearchSourceError as error:
             category = 'OPENSEARCH_TIMEOUT' if 'timed out' in str(error).lower() else 'OPENSEARCH_QUERY'
             raise failure(category) from None
-        except Exception:
-            raise failure('PIPELINE') from None
+        except Exception as error:
+            raise failure('PIPELINE', error=error) from None
 
     def execute(self, run: MonitorRun, consumed: set[str]) -> ExecutionResult:
         if self.repository is not None:
@@ -410,12 +426,19 @@ class OpenSearchMonitorExecutor:
         query_diagnostics(config.field_mapping)
         summary['mapping_verified'] = False
         summary['query_executed'] = False
-        def failure(category):
+        pipeline_stage = 'policy_resolution'
+        def mark_pipeline_stage(stage):
+            nonlocal pipeline_stage
+            pipeline_stage = stage
+        def failure(category, *, error=None):
             summary['unique_records'] = len(seen)
             if category == 'ACQUISITION_LIMIT':
                 summary.update(budget_reached=True, stop_reason='acquisition_limit')
             elif category.startswith('OPENSEARCH'):
                 summary['stop_reason'] = 'acquisition_failed'
+            if category == 'PIPELINE' and error is not None:
+                summary.update(pipeline_stage=safe_pipeline_stage(pipeline_stage),
+                               exception_type=safe_exception_type(error))
             error = MonitoringError(category)
             error.acquisition_diagnostics = redact_ai_secret(application.presentation_result({}, summary, config)['source_summary'])
             return error
@@ -503,10 +526,13 @@ class OpenSearchMonitorExecutor:
         else:
             snapshot = None
         try:
+            mark_pipeline_stage('pipeline_construction')
             with quiet_pipeline():
                 result = self.pipeline_factory().process_ingested_pages(
                     pages, policy_provider=lambda key, record: snapshot,
-                    source_timezone=definition.source_timezone, assembled_event_filter=ownership, observer=trace)
+                    source_timezone=definition.source_timezone, assembled_event_filter=ownership, observer=trace,
+                    stage_callback=mark_pipeline_stage)
+            mark_pipeline_stage('result_building')
             if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                 reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
                 if any(count for reason, count in reasons.items() if reason != 'blank_context'):
@@ -527,5 +553,5 @@ class OpenSearchMonitorExecutor:
             return ExecutionResult(presentation, counts, ownership.receipts)
         except MonitoringError as error:
             raise failure(error.category) from None
-        except Exception:
-            raise failure('PIPELINE') from None
+        except Exception as error:
+            raise failure('PIPELINE', error=error) from None

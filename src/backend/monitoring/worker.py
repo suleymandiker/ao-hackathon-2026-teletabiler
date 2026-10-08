@@ -4,7 +4,7 @@ import json
 import time
 from typing import Callable
 
-from monitoring.errors import MonitoringError
+from monitoring.errors import MonitoringError, safe_pipeline_details
 from monitoring.repository import MonitorRepository
 
 
@@ -89,5 +89,6 @@ class MonitorWorker:
                         self.repository.fail(run, category, now=self.clock(), diagnostics=diagnostics)
                 except Exception:
                     category = 'PERSISTENCE'
-                self.log('FAILED', run_id=run.id, category=category)
+                details = safe_pipeline_details(diagnostics) if category == 'PIPELINE' else {}
+                self.log('FAILED', run_id=run.id, category=category, **details)
         return completed

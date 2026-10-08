@@ -480,6 +480,92 @@ def executor_for(pipeline, records_or_source, *, config=None):
     return executor, queries
 
 
+@pytest.mark.parametrize('boundary,error_type,expected_stage', [
+    ('session', RuntimeError, 'segmentation_session'),
+    ('parser', ValueError, 'parsing'),
+    ('template', TypeError, 'template_processing'),
+])
+def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
+        repo, pipeline, monkeypatch, boundary, error_type, expected_stage):
+    import full_pipeline_v2
+    import monitoring.execution as execution
+    from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
+    from monitoring.metrics_source import WindowMetrics
+    from monitoring.worker import MonitorWorker
+    from segmentation_layer.contracts import SegmentationPolicy
+
+    secret = 'Bearer fake-secret-password'
+    def explode(*args, **kwargs):
+        raise error_type(secret)
+    if boundary == 'session':
+        monkeypatch.setattr(full_pipeline_v2, 'SegmentationSession', explode)
+    elif boundary == 'parser':
+        monkeypatch.setattr(pipeline.parser, 'process_with_outcome', explode)
+    else:
+        monkeypatch.setattr(pipeline.templater, 'process', explode)
+
+    records = (record('a', 3, 'ERROR: first failure'),
+               record('b', 4, 'ERROR: second failure'))
+    class Client:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+    class MetricsSource:
+        requests = 1
+        def __init__(self, client):
+            pass
+        def window(self, run):
+            return WindowMetrics(2, (), {}, {}, 0, 0, True, True, {})
+    class Acquisition:
+        pages_read = 1
+        records_read = 2
+        shards_completed = 1
+        completed_unique_records = 2
+        last_state = {'status': 'COMPLETE'}
+        acquisition_duration_seconds = 0.01
+        def __init__(self, source, metrics_source, definition, **kwargs):
+            pass
+        def pages(self, shards):
+            yield page(records)
+    class Resolver:
+        def resolve(self, sample, policies):
+            return SimpleNamespace(snapshot=SegmentationPolicy('id', r'^ERROR:', 'fixture'),
+                                   diagnostics=lambda: {'sampled_records': len(sample)})
+
+    monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
+    monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
+    monkeypatch.setattr(execution, 'VerifiedPolicyResolver', Resolver)
+    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password', True, True,
+                              'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
+    executor = execution.OpenSearchMonitorExecutor(
+        lambda: pipeline, connection_loader=lambda size: config,
+        client_factory=lambda cfg: Client(), source_factory=lambda client: object(),
+        policy_loader=lambda: (), repository=repo, log=lambda *a, **k: None)
+    monitor = repo.create(definition(), enabled=True, now=BASE)
+    logs = []
+    scheduler = MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17),
+                              log=lambda event, **values: logs.append((event, values)))
+
+    assert scheduler.tick() == 0
+    run = repo.history(monitor.id)[0]
+    diagnostics = repo.acquisition_diagnostics(run.id)
+    assert run.status.value == 'FAILED' and run.error_category == 'PIPELINE'
+    assert diagnostics['pipeline_stage'] == expected_stage
+    assert diagnostics['exception_type'] == error_type.__name__
+    assert diagnostics['policy_selection']['sampled_records'] == 2
+    assert diagnostics['pages_read'] == 1 and diagnostics['records_read'] == 2
+    assert repo.result(run.id) is None
+    assert repo.get(monitor.id).last_successful_end is None
+    failed = next(values for event, values in logs if event == 'FAILED')
+    assert failed['pipeline_stage'] == expected_stage
+    assert failed['exception_type'] == error_type.__name__
+    assert secret not in str(diagnostics) + str(logs) + str(repo.history(monitor.id))
+    retry = repo.claim(BASE + timedelta(minutes=33))
+    assert retry.id == run.id and retry.window == run.window
+
+
 def test_monitor_pipeline_timestamp_fallback_is_per_event_and_timezone_propagates(repo, pipeline):
     records = [record('a', 3, 'ERROR: database failure'), record('b', 4, '    at trace'),
                record('c', 7, 'ERROR: connection timeout')]
