@@ -1,7 +1,7 @@
 """Bounded acquisition and window ownership around the authoritative pipeline."""
 from contextlib import contextmanager, closing, redirect_stdout, redirect_stderr
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 import os
 
@@ -17,7 +17,7 @@ from monitoring.errors import (MonitoringError, safe_failure_details, ACQUISITIO
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
-from monitoring.sharded_acquisition import StreamingAcquisition, plan_shards, retry_read
+from monitoring.sharded_acquisition import AcquisitionShard, StreamingAcquisition, plan_shards, retry_read
 from monitoring.window_accumulator import WindowAccumulator
 from monitoring.worker import structured_log
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
@@ -26,6 +26,25 @@ from verified_policy_resolver import (VerifiedPolicyResolver, PolicyResolutionEr
 
 
 MAX_POLICY_BUFFER_PAGES = 20
+_OWNED_WINDOW_METADATA = '__aiops_monitor_owned_window__'
+
+
+@dataclass(frozen=True)
+class AcquisitionLane:
+    start: datetime
+    end: datetime
+    owned: bool
+    name: str
+
+
+def acquisition_lanes(retrieval_start, window, retrieval_end):
+    """Exact half-open content ranges in one chronological assembly stream."""
+    candidates = (
+        AcquisitionLane(retrieval_start, window.start, False, 'PRE_OVERLAP'),
+        AcquisitionLane(window.start, window.end, True, 'OWNED_WINDOW'),
+        AcquisitionLane(window.end, retrieval_end, False, 'POST_OVERLAP'),
+    )
+    return tuple(lane for lane in candidates if lane.start < lane.end)
 
 
 def source_time(record):
@@ -38,7 +57,8 @@ def source_time(record):
 class WindowOwnership:
     """Keep context for assembly; select each event before parser/learning.
 
-    First included source-record time assigns ownership, never message time.
+    Monitoring acquisition lanes assign ownership; the legacy path uses the
+    first included source-record time, never message time.
     Orphans at the left retrieval cut are reported and excluded. Finite tails
     retain the existing analysis_end semantics and are explicitly counted.
     """
@@ -69,7 +89,11 @@ class WindowOwnership:
         if not evidence.decision.start_new_event:
             self.diagnostics['orphan_events'] += 1
             return False
-        if not self.run.window.start <= first_time < self.run.window.end:
+        lane_owned = next((value for key, value in reversed(first.metadata)
+                           if key == _OWNED_WINDOW_METADATA), None)
+        if lane_owned is None:
+            lane_owned = self.run.window.start <= first_time < self.run.window.end
+        if not lane_owned:
             self.diagnostics['context_events'] += 1
             return False
         if event.emission_reason == 'analysis_end':
@@ -263,7 +287,7 @@ class OpenSearchMonitorExecutor:
                 except Exception:
                     raise MonitoringError('PERSISTENCE') from None
                 mark_pipeline_stage('shard_planning')
-                shards = plan_shards(start, end, metrics, definition.page_size, definition.max_pages)
+                lanes = acquisition_lanes(start, run.window, end)
                 def save_shard(shard, status, **values):
                     try:
                         self.repository.record_shard(run, shard, status, **values)
@@ -278,65 +302,76 @@ class OpenSearchMonitorExecutor:
                     stream_exhausted = False
 
                     def pages():
-                        nonlocal unique, unique_inside_window, duplicates, stream_exhausted
-                        for page in acquisition.pages(shards):
-                            if len(page.records) > definition.page_size:
-                                raise MonitoringError('ACQUISITION_LIMIT')
-                            with ledger.page():
-                                selected = []
-                                for record in page.records:
-                                    stamp = source_time(record)
-                                    identity = record.stream_identity
-                                    if stamp is None:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
-                                                              stage='content_acquisition',
-                                                              validation_site='TIMESTAMP',
-                                                              validation_reason='INVALID_FORMAT')
-                                    if not start <= stamp < end:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
-                                                              stage='content_acquisition',
-                                                              validation_site='TIMESTAMP',
-                                                              validation_reason='OUTSIDE_RETRIEVAL')
-                                    if identity is None:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='MISSING_REQUIRED_FIELD',
+                        nonlocal stream_exhausted
+                        for lane in lanes:
+                            planned = plan_shards(lane.start, lane.end, metrics,
+                                                  definition.page_size, definition.max_pages)
+                            shards = tuple(replace(shard, shard_id=f'{lane.name}:{shard.shard_id}')
+                                           if isinstance(shard, AcquisitionShard) else shard
+                                           for shard in planned)
+                            for page in acquisition.pages(shards):
+                                yield from selected_page(page, lane.owned)
+                        stream_exhausted = True
+
+                    def selected_page(page, lane_owned):
+                        nonlocal unique, unique_inside_window, duplicates
+                        if len(page.records) > definition.page_size:
+                            raise MonitoringError('ACQUISITION_LIMIT')
+                        with ledger.page():
+                            selected = []
+                            for record in page.records:
+                                stamp = source_time(record)
+                                identity = record.stream_identity
+                                if stamp is None:
+                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
+                                                          stage='content_acquisition',
+                                                          validation_site='TIMESTAMP',
+                                                          validation_reason='INVALID_FORMAT')
+                                if not start <= stamp < end:
+                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
+                                                          stage='content_acquisition',
+                                                          validation_site='TIMESTAMP',
+                                                          validation_reason='OUTSIDE_RETRIEVAL')
+                                if identity is None:
+                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='MISSING_REQUIRED_FIELD',
+                                                          stage='content_acquisition',
+                                                          validation_site='STREAM_IDENTITY',
+                                                          validation_reason='REQUIRED_COMPONENT_MISSING')
+                                if record.source_reference.source_scope != config.source_scope:
+                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                          stage='content_acquisition',
+                                                          validation_site='SOURCE_SCOPE',
+                                                          validation_reason='SOURCE_PROFILE_MISMATCH')
+                                for field, reason in (('namespace', 'NAMESPACE_MISMATCH'),
+                                                      ('workload', 'WORKLOAD_MISMATCH'),
+                                                      ('container', 'CONTAINER_MISMATCH')):
+                                    expected = getattr(definition, field)
+                                    if expected is not None and getattr(identity, field) != expected:
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
                                                               stage='content_acquisition',
                                                               validation_site='STREAM_IDENTITY',
-                                                              validation_reason='REQUIRED_COMPONENT_MISSING')
-                                    if record.source_reference.source_scope != config.source_scope:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                              stage='content_acquisition',
-                                                              validation_site='SOURCE_SCOPE',
-                                                              validation_reason='SOURCE_PROFILE_MISMATCH')
-                                    for field, reason in (('namespace', 'NAMESPACE_MISMATCH'),
-                                                          ('workload', 'WORKLOAD_MISMATCH'),
-                                                          ('container', 'CONTAINER_MISMATCH')):
-                                        expected = getattr(definition, field)
-                                        if expected is not None and getattr(identity, field) != expected:
-                                            raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                                  stage='content_acquisition',
-                                                                  validation_site='STREAM_IDENTITY',
-                                                                  validation_reason=reason)
-                                    if (definition.document_cluster_id is not None and
-                                            identity.source_scope != definition.document_cluster_id):
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                              stage='content_acquisition',
-                                                              validation_site='SOURCE_SCOPE',
-                                                              validation_reason='DOCUMENT_CLUSTER_MISMATCH')
-                                    key = reference_key(record)
-                                    repeated = ledger.seen(key, stamp.isoformat())
-                                    trace.acquisition(record, timestamp=stamp,
-                                        inside_window=run.window.start <= stamp < run.window.end,
-                                        overlap=not run.window.start <= stamp < run.window.end,
-                                        duplicate=repeated)
-                                    if repeated:
-                                        duplicates += 1
-                                        continue
-                                    unique += 1
-                                    if run.window.start <= stamp < run.window.end:
-                                        unique_inside_window += 1
-                                    selected.append(record)
-                                yield replace(page, records=tuple(selected))
-                        stream_exhausted = True
+                                                              validation_reason=reason)
+                                if (definition.document_cluster_id is not None and
+                                        identity.source_scope != definition.document_cluster_id):
+                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                          stage='content_acquisition',
+                                                          validation_site='SOURCE_SCOPE',
+                                                          validation_reason='DOCUMENT_CLUSTER_MISMATCH')
+                                key = reference_key(record)
+                                repeated = ledger.seen(key, stamp.isoformat())
+                                trace.acquisition(record, timestamp=stamp,
+                                    inside_window=lane_owned,
+                                    overlap=not lane_owned,
+                                    duplicate=repeated)
+                                if repeated:
+                                    duplicates += 1
+                                    continue
+                                unique += 1
+                                if lane_owned:
+                                    unique_inside_window += 1
+                                selected.append(replace(record, metadata=record.metadata +
+                                    ((_OWNED_WINDOW_METADATA, lane_owned),)))
+                            yield replace(page, records=tuple(selected))
 
                     with closing(pages()) as stream:
                         buffered_pages = []

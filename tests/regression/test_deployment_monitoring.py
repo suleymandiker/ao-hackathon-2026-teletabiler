@@ -565,7 +565,8 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
         def __init__(self, source, metrics_source, definition, **kwargs):
             pass
         def pages(self, shards):
-            yield page(records)
+            if shards[0].start == BASE:
+                yield page(records)
     class Resolver:
         def resolve(self, sample, policies):
             return SimpleNamespace(snapshot=SegmentationPolicy('id', r'^ERROR:', 'fixture'),
@@ -574,7 +575,8 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
     monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
     monkeypatch.setattr(execution, 'VerifiedPolicyResolver', Resolver)
-    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    monkeypatch.setattr(execution, 'plan_shards',
+                        lambda start, end, *args: (SimpleNamespace(start=start, end=end),))
     config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password', True, True,
                               'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
     executor = execution.OpenSearchMonitorExecutor(
@@ -685,12 +687,15 @@ def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(
         def __init__(self, source, metrics_source, definition, **kwargs):
             pass
         def pages(self, shards):
+            if shards[0].start != BASE:
+                return
             events.append('ACQUISITION_SHARD_COMPLETE')
             yield page((bad,))
             events.append('ACQUISITION_SHARD_START_0R')
     monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
     monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
-    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    monkeypatch.setattr(execution, 'plan_shards',
+                        lambda start, end, *args: (SimpleNamespace(start=start, end=end),))
     config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password',
                               True, True, 'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
     logs = []
@@ -876,7 +881,8 @@ def test_streaming_window_succeeds_with_oversized_template_and_advances_watermar
         def __init__(self, source, metrics_source, definition, **kwargs):
             pass
         def pages(self, shards):
-            yield page(records)
+            if shards[0].start == BASE:
+                yield page(records)
     class Resolver:
         def resolve(self, sample, policies):
             return SimpleNamespace(snapshot=SegmentationPolicy('id', r'^ERROR:', 'fixture'),
@@ -884,7 +890,8 @@ def test_streaming_window_succeeds_with_oversized_template_and_advances_watermar
     monkeypatch.setattr(execution, 'OpenSearchMetricsSource', MetricsSource)
     monkeypatch.setattr(execution, 'StreamingAcquisition', Acquisition)
     monkeypatch.setattr(execution, 'VerifiedPolicyResolver', Resolver)
-    monkeypatch.setattr(execution, 'plan_shards', lambda *args: (object(),))
+    monkeypatch.setattr(execution, 'plan_shards',
+                        lambda start, end, *args: (SimpleNamespace(start=start, end=end),))
     config = OpenSearchConfig(('https://synthetic.invalid',), 'test-user', 'test-password', True, True,
                               'logs-*', 1, 1, 'test-profile', OpenSearchFieldMapping(), 100)
     logs = []
