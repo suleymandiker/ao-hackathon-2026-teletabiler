@@ -21,9 +21,11 @@ from monitoring.worker import MonitorWorker
 BASE = datetime(2026, 10, 9, 4, 17, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize('consume_all', [True, False])
+@pytest.mark.parametrize('consume_all,duplicate_cross_shard',
+                         [(True, False), (False, False), (True, True)])
 def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, monkeypatch,
-                                                                      consume_all):
+                                                                      consume_all,
+                                                                      duplicate_cross_shard):
     import monitoring.execution as execution
 
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
@@ -63,9 +65,11 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
             limit = min(offset + 100, count)
             shard_id = int((start - retrieval_start).total_seconds() // 30)
             rows = tuple(IngestedLogRecord(
-                raw_text='synthetic',
+                raw_text='synthetic-private-log-body',
                 source_reference=SourceReference('profile', 'synthetic-index',
-                                                 f'{shard_id}-{number}'),
+                                                 ('2-0' if duplicate_cross_shard and
+                                                  shard_id == 3 and number == 0 else
+                                                  f'{shard_id}-{number}')),
                 source_timestamp_raw=(start + timedelta(microseconds=number)).isoformat(),
                 stream_identity=StreamIdentity('document-cluster', namespace='ns', workload='app',
                                                pod='pod', pod_instance='pod-id', container='main',
@@ -86,7 +90,7 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
         def process_ingested_pages(self, pages, **kwargs):
             if consume_all:
                 consumed = sum(len(page.records) for page in pages)
-                assert consumed == 36_000
+                assert consumed == 36_000 - int(duplicate_cross_shard)
             else:
                 next(pages)
             return {'stats': {'segmented': 0, 'parsed': 0, 'templated': 0}}
@@ -104,12 +108,12 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
     worker = MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17),
                            log=lambda event, **values: events.append((event, values)))
 
-    assert worker.tick() == int(consume_all), [
+    assert worker.tick() == int(consume_all and not duplicate_cross_shard), [
         (values.get('category'), values.get('pipeline_stage'),
          values.get('exception_type'), values.get('exception_file'), values.get('exception_line'))
         for event, values in events if event == 'FAILED']
     run = repo.history(monitor.id)[0]
-    if consume_all:
+    if consume_all and not duplicate_cross_shard:
         assert run.status.value == 'SUCCESS'
         assert (run.counts.events_retrieved, run.counts.unique_records) == (36_000, 36_000)
         assert repo.get(monitor.id).last_successful_end == run_end
@@ -117,8 +121,33 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
         assert not any(event == 'FAILED' for event, _ in events)
     else:
         assert run.status.value == 'FAILED' and repo.get(monitor.id).last_successful_end is None
-        assert repo.acquisition_diagnostics(run.id)['validation_site'] == 'PAGE_HANDOFF'
+        assert repo.acquisition_diagnostics(run.id).get('validation_site') == 'PAGE_HANDOFF', (
+            run.error_category, repo.acquisition_diagnostics(run.id).get('reason_code'),
+            repo.acquisition_diagnostics(run.id).get('error_stage'))
         assert repo.acquisition_diagnostics(run.id)['validation_reason'] == 'COUNT_MISMATCH'
+        count = repo.acquisition_diagnostics(run.id)['count_mismatch']
+        assert set(count) == {'metrics_total', 'unique_inside_window', 'unique_total',
+                              'duplicate_records', 'acquisition', 'stream_exhausted',
+                              'last_shard'}
+        assert set(count['acquisition']) == {'pages_read', 'records_read', 'shards_seen',
+                                             'shards_completed', 'completed_unique_records'}
+        assert set(count['last_shard']) == {'shard_id', 'status'}
+        assert set(repo.acquisition_diagnostics(run.id)['last_shard']) == {'shard_id', 'status'}
+        assert count['metrics_total'] == 36_000
+        assert count['stream_exhausted'] is consume_all
+        assert count['duplicate_records'] == int(duplicate_cross_shard)
+        assert count['unique_total'] == count['unique_inside_window']
+        if duplicate_cross_shard:
+            assert count['unique_inside_window'] == 35_999
+            assert count['acquisition']['completed_unique_records'] == 36_000
+        else:
+            assert count['unique_inside_window'] < 36_000
+        assert all(type(value) is int for value in (
+            count['metrics_total'], count['unique_inside_window'], count['unique_total'],
+            count['duplicate_records'], *count['acquisition'].values()))
+        assert 'synthetic-private-log-body' not in str(repo.acquisition_diagnostics(run.id))
+        assert 'synthetic-private-log-body' not in str(events)
+        assert 'next_cursor' not in str(repo.acquisition_diagnostics(run.id))
         assert any(event == 'FAILED' and values.get('validation_reason') == 'COUNT_MISMATCH'
                    for event, values in events)
         assert repo.result(run.id) is None

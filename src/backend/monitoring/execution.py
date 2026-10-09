@@ -190,10 +190,13 @@ class OpenSearchMonitorExecutor:
         def failure(category, *, error=None, reason_code=None, stage=None,
                     validation_site=None, validation_reason=None):
             if acquisition is not None:
+                last_shard = acquisition.last_state
+                if 'count_mismatch' in summary and last_shard is not None:
+                    last_shard = {key: last_shard.get(key) for key in ('shard_id', 'status')}
                 summary.update(pages_read=acquisition.pages_read,
                                records_read=acquisition.records_read,
                                acquisition_shards=acquisition.shards_completed,
-                               last_shard=acquisition.last_state)
+                               last_shard=last_shard)
             summary.update(unique_records=unique, duplicate_records=duplicates)
             if category == 'ACQUISITION_LIMIT':
                 summary.update(budget_reached=True, stop_reason='acquisition_limit')
@@ -272,9 +275,10 @@ class OpenSearchMonitorExecutor:
                 with ledger_context as ledger:
                     ownership = WindowOwnership(run, ledger=ledger)
                     unique_inside_window = 0
+                    stream_exhausted = False
 
                     def pages():
-                        nonlocal unique, unique_inside_window, duplicates
+                        nonlocal unique, unique_inside_window, duplicates, stream_exhausted
                         for page in acquisition.pages(shards):
                             if len(page.records) > definition.page_size:
                                 raise MonitoringError('ACQUISITION_LIMIT')
@@ -332,6 +336,7 @@ class OpenSearchMonitorExecutor:
                                         unique_inside_window += 1
                                     selected.append(record)
                                 yield replace(page, records=tuple(selected))
+                        stream_exhausted = True
 
                     with closing(pages()) as stream:
                         buffered_pages = []
@@ -395,6 +400,24 @@ class OpenSearchMonitorExecutor:
                         if any(count for reason, count in reasons.items() if reason not in allowed_reasons):
                             raise MonitoringError('POLICY')
                     if unique_inside_window != metrics.total:
+                        last_shard = acquisition.last_state
+                        summary['count_mismatch'] = {
+                            'metrics_total': metrics.total,
+                            'unique_inside_window': unique_inside_window,
+                            'unique_total': unique,
+                            'duplicate_records': duplicates,
+                            'acquisition': {
+                                'pages_read': acquisition.pages_read,
+                                'records_read': acquisition.records_read,
+                                'shards_seen': acquisition.shards_seen,
+                                'shards_completed': acquisition.shards_completed,
+                                'completed_unique_records': acquisition.completed_unique_records,
+                            },
+                            'stream_exhausted': stream_exhausted,
+                            'last_shard': ({key: last_shard.get(key)
+                                            for key in ('shard_id', 'status')}
+                                           if last_shard is not None else None),
+                        }
                         raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
                                               stage='content_acquisition',
                                               validation_site='PAGE_HANDOFF',
