@@ -34,6 +34,7 @@ _MONITORING_TABLES = frozenset({
     'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
     'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
     'monitor_run_dedupe', 'monitor_findings', 'monitor_baseline_state',
+    'monitor_gaps',
 })
 
 
@@ -56,6 +57,8 @@ class MonitorRepository(Protocol):
     def set_enabled(self, monitor_id: str, enabled: bool, *, now: datetime) -> DeploymentMonitor: ...
     def request_run_now(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def resume_now(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
+    def request_retry_window(self, monitor_id: str, window: Window, *, now: datetime) -> DeploymentMonitor: ...
+    def open_gaps(self, monitor_id: str) -> list[dict]: ...
     def archive(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def claim(self, now: datetime) -> MonitorRun | None: ...
     def schedule_summary(self, now: datetime) -> 'ScheduleSummary': ...
@@ -118,6 +121,18 @@ def _baseline_patterns(values):
             'count': int(row['count']),
             'template': redact_text(str(row.get('template') or ''))[:128]}
             for row in values}
+
+
+def _merge_baseline_ring(existing_items, new_item, max_items):
+    seen_ends = {new_item['window_end']}
+    merged = [new_item]
+    for item in existing_items:
+        end = item.get('window_end')
+        if end and end not in seen_ends:
+            seen_ends.add(end)
+            merged.append(item)
+    merged.sort(key=lambda it: it['window_end'], reverse=True)
+    return merged[:max_items]
 
 
 def _compact_findings(run, result, now):
@@ -196,7 +211,7 @@ class SQLiteMonitorRepository:
         else:
             with self._read_connection() as db:
                 version = db.execute('PRAGMA user_version').fetchone()[0]
-                if version not in (4, 5, 6):
+                if version not in (4, 5, 6, 7):
                     raise MonitoringSchemaError('Unsupported monitoring schema version',
                                                 'UNSUPPORTED_SCHEMA_VERSION')
 
@@ -206,7 +221,7 @@ class SQLiteMonitorRepository:
         with sqlite3.connect(self.path, timeout=10) as setup:
             setup.execute('PRAGMA busy_timeout=10000')
             version = setup.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6):
+            if version not in (0, 1, 2, 3, 4, 5, 6, 7):
                 raise MonitoringSchemaError('Unsupported monitoring schema version',
                                             'UNSUPPORTED_SCHEMA_VERSION')
             _validate_monitoring_ownership(setup)
@@ -214,15 +229,16 @@ class SQLiteMonitorRepository:
             setup.execute('PRAGMA synchronous=NORMAL')
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, 5, 6):
+            if version not in (0, 1, 2, 3, 4, 5, 6, 7):
                 raise MonitoringSchemaError('Unsupported monitoring schema version',
                                             'UNSUPPORTED_SCHEMA_VERSION')
             _validate_monitoring_ownership(db)
-            if version in (5, 6):
+            if version in (5, 6, 7):
                 columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
                 if 'reason_streak' not in columns:
                     db.execute('ALTER TABLE monitor_runs ADD COLUMN reason_streak INTEGER NOT NULL DEFAULT 0')
                 self._migrate_operator_controls(db)
+                self._migrate_v7(db)
                 return
             statements = (
                 '''CREATE TABLE IF NOT EXISTS monitors (
@@ -313,6 +329,7 @@ class SQLiteMonitorRepository:
             if version > 0:
                 self._backfill_compact(db)
             self._migrate_operator_controls(db)
+            self._migrate_v7(db)
 
     @staticmethod
     def _migrate_operator_controls(db):
@@ -332,6 +349,41 @@ class SQLiteMonitorRepository:
                  ORDER BY r.window_start DESC LIMIT 1)
                 WHERE pending_window_start IS NULL''')
             db.execute('PRAGMA user_version=6')
+
+    @staticmethod
+    def _migrate_v7(db):
+        """v7: processing cursor, failure classification, and durable gap ledger."""
+        monitor_cols = {row['name'] for row in db.execute('PRAGMA table_info(monitors)')}
+        for name in ('processing_cursor', 'target_retry_window_start', 'target_retry_window_end'):
+            if name not in monitor_cols:
+                db.execute(f'ALTER TABLE monitors ADD COLUMN {name} TEXT')
+
+        run_cols = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
+        if 'window_local_failures' not in run_cols:
+            db.execute('ALTER TABLE monitor_runs ADD COLUMN window_local_failures INTEGER NOT NULL DEFAULT 0')
+        if 'failure_classification' not in run_cols:
+            db.execute('ALTER TABLE monitor_runs ADD COLUMN failure_classification TEXT')
+        if 'last_failure_signature' not in run_cols:
+            db.execute('ALTER TABLE monitor_runs ADD COLUMN last_failure_signature TEXT')
+
+        db.execute('''CREATE TABLE IF NOT EXISTS monitor_gaps (
+            id TEXT PRIMARY KEY, monitor_id TEXT NOT NULL REFERENCES monitors(id),
+            window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+            run_id TEXT NOT NULL REFERENCES monitor_runs(id),
+            status TEXT NOT NULL, attempt_count INTEGER NOT NULL,
+            failure_classification TEXT NOT NULL, safe_reason_code TEXT,
+            error_stage TEXT, validation_site TEXT, validation_reason TEXT,
+            quarantined_at TEXT NOT NULL, resolved_at TEXT, resolved_run_id TEXT,
+            UNIQUE(monitor_id, window_start, window_end))''')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_monitor_gaps_open ON monitor_gaps(monitor_id, status, window_start)')
+
+        if db.execute('PRAGMA user_version').fetchone()[0] < 7:
+            db.execute('''UPDATE monitors SET processing_cursor = COALESCE(
+                pending_window_start,
+                last_successful_end,
+                json_extract(definition, '$.initial_start')
+            ) WHERE processing_cursor IS NULL''')
+            db.execute('PRAGMA user_version=7')
 
     @staticmethod
     def _backfill_compact(db):
@@ -416,31 +468,42 @@ class SQLiteMonitorRepository:
 
     @staticmethod
     def _monitor(row):
+        keys = row.keys()
         return DeploymentMonitor(
             row['id'], read_definition(row['definition']), bool(row['enabled']), MonitorStatus(row['status']),
             instant(row['last_successful_end']), instant(row['next_run_at']), instant(row['created_at']),
             instant(row['updated_at']), row['revision'], row['error_category'], row['error_summary'], bool(row['archived']),
-            instant(row['manual_requested_at']) if 'manual_requested_at' in row.keys() else None,
+            instant(row['manual_requested_at']) if 'manual_requested_at' in keys else None,
             Window(instant(row['pending_window_start']), instant(row['pending_window_end']))
-            if 'pending_window_start' in row.keys() and row['pending_window_start'] else None)
+            if 'pending_window_start' in keys and row['pending_window_start'] else None,
+            processing_cursor=instant(row['processing_cursor']) if 'processing_cursor' in keys and row['processing_cursor'] else None,
+            target_retry_window=Window(instant(row['target_retry_window_start']), instant(row['target_retry_window_end']))
+            if 'target_retry_window_start' in keys and row['target_retry_window_start'] else None)
 
     @staticmethod
     def _run(row):
+        keys = row.keys()
         return MonitorRun(
             row['id'], row['monitor_id'], Window(instant(row['window_start']), instant(row['window_end'])),
             read_definition(row['definition']), instant(row['started_at']), instant(row['finished_at']),
             instant(row['created_at']), RunStatus(row['status']), row['claim_token'], row['attempts'],
-            RunCounts(**json.loads(row['counts'])), row['result_reference'], row['error_category'], row['error_summary'])
+            RunCounts(**json.loads(row['counts'])), row['result_reference'], row['error_category'], row['error_summary'],
+            window_local_failures=row['window_local_failures'] if 'window_local_failures' in keys else 0,
+            failure_classification=row['failure_classification'] if 'failure_classification' in keys else None,
+            error_stage=row['error_stage'] if 'error_stage' in keys else None,
+            safe_reason_code=row['safe_reason_code'] if 'safe_reason_code' in keys else None,
+            reason_streak=row['reason_streak'] if 'reason_streak' in keys else 0,
+            last_failure_signature=row['last_failure_signature'] if 'last_failure_signature' in keys else None)
 
     def create(self, definition, *, enabled=False, now):
         now = utc(now).isoformat()
         monitor_id = new_id()
         with self._transaction() as db:
             db.execute('''INSERT INTO monitors
-                (id,definition,enabled,status,last_successful_end,next_run_at,created_at,updated_at,revision,error_category,error_summary)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (
+                (id,definition,enabled,status,last_successful_end,next_run_at,created_at,updated_at,revision,error_category,error_summary,processing_cursor)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (
                 monitor_id, definition_json(definition), int(enabled), 'ACTIVE' if enabled else 'PAUSED',
-                None, now, now, now, 0, None, None))
+                None, now, now, now, 0, None, None, definition.initial_start.isoformat()))
         return self.get(monitor_id)
 
     def get(self, monitor_id):
@@ -523,15 +586,35 @@ class SQLiteMonitorRepository:
         """
         with self._transaction() as db:
             db.execute("""UPDATE monitors SET archived=1,enabled=0,status='ARCHIVED',
-                manual_requested_at=NULL,updated_at=?,revision=revision+1 WHERE id=? AND archived=0""",
+                manual_requested_at=NULL,target_retry_window_start=NULL,target_retry_window_end=NULL,
+                updated_at=?,revision=revision+1 WHERE id=? AND archived=0""",
                 (utc(now).isoformat(), monitor_id))
         return self.get(monitor_id)
+
+    def request_retry_window(self, monitor_id, window, *, now):
+        stamp = utc(now).isoformat()
+        with self._transaction() as db:
+            row = db.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+            if row is None:
+                raise KeyError('Monitor not found')
+            if row['archived']:
+                raise ValueError('Cannot retry on an archived monitor')
+            db.execute('''UPDATE monitors SET target_retry_window_start=?, target_retry_window_end=?,
+                updated_at=?, revision=revision+1 WHERE id=?''',
+                (window.start.isoformat(), window.end.isoformat(), stamp, monitor_id))
+        return self.get(monitor_id)
+
+    def open_gaps(self, monitor_id):
+        with self._read_connection() as db:
+            rows = db.execute('''SELECT * FROM monitor_gaps WHERE monitor_id=? AND status='OPEN'
+                ORDER BY window_start ASC''', (monitor_id,)).fetchall()
+            return [dict(row) for row in rows]
 
     def claim(self, now):
         now = utc(now)
         with self._transaction() as db:
             rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0
-                AND (next_run_at<=? OR manual_requested_at IS NOT NULL)
+                AND (next_run_at<=? OR manual_requested_at IS NOT NULL OR target_retry_window_start IS NOT NULL)
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
                 ORDER BY updated_at,next_run_at,id''', (now.isoformat(),)).fetchall()
             for row in rows:
@@ -554,11 +637,12 @@ class SQLiteMonitorRepository:
                 else:
                     run_id = new_id()
                     db.execute('''INSERT INTO monitor_runs (id,monitor_id,window_start,window_end,definition,
-                        started_at,finished_at,created_at,status,claim_token,attempts,counts,result_reference,error_category,error_summary)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
+                        started_at,finished_at,created_at,status,claim_token,attempts,window_local_failures,counts,result_reference,error_category,error_summary)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,1,0,?,?,?,?)''', (
                         run_id, monitor.id, window.start.isoformat(), window.end.isoformat(), definition_json(monitor.definition),
-                        now.isoformat(), None, now.isoformat(), 'RUNNING', token, 1, encode(asdict(RunCounts())), None, None, None))
+                        now.isoformat(), None, now.isoformat(), 'RUNNING', token, encode(asdict(RunCounts())), None, None, None))
                 db.execute("""UPDATE monitors SET status='RUNNING',manual_requested_at=NULL,
+                    target_retry_window_start=NULL,target_retry_window_end=NULL,
                     pending_window_start=?,pending_window_end=?,updated_at=?,revision=revision+1 WHERE id=?""",
                     (window.start.isoformat(), window.end.isoformat(), now.isoformat(), monitor.id))
                 return self._run(db.execute('SELECT * FROM monitor_runs WHERE id=?', (run_id,)).fetchone())
@@ -593,6 +677,28 @@ class SQLiteMonitorRepository:
         return db.execute("SELECT 1 FROM monitor_runs WHERE id=? AND status='RUNNING' AND claim_token=?",
                           (run.id, run.claim_token)).fetchone() is not None
 
+    @staticmethod
+    def _recompute_contiguous_watermark(db, monitor_id, current_watermark, initial_start, window_seconds):
+        step = timedelta(seconds=window_seconds)
+        cursor = current_watermark or initial_start
+        rows = db.execute('''SELECT window_start, window_end, status FROM monitor_runs
+            WHERE monitor_id=? AND window_start>=?
+            ORDER BY window_start ASC''', (monitor_id, cursor.isoformat())).fetchall()
+        runs_by_start = {datetime.fromisoformat(row['window_start']): (datetime.fromisoformat(row['window_end']), row['status'])
+                         for row in rows}
+        open_gap_starts = {datetime.fromisoformat(row[0]) for row in db.execute(
+            "SELECT window_start FROM monitor_gaps WHERE monitor_id=? AND status='OPEN'", (monitor_id,)).fetchall()}
+
+        watermark = current_watermark
+        candidate = cursor
+        while candidate in runs_by_start:
+            w_end, status = runs_by_start[candidate]
+            if status != 'SUCCESS' or candidate in open_gap_starts or w_end != candidate + step:
+                break
+            watermark = w_end
+            candidate = w_end
+        return watermark
+
     def succeed(self, run, result, counts, receipts, *, now, metrics=None, pattern_metrics=()):
         if self.compact_mode and metrics is not None:
             return self._succeed_compact(run, result, counts, receipts, now=now,
@@ -603,33 +709,50 @@ class SQLiteMonitorRepository:
             if not self._owned(db, run):
                 raise ValueError('Run claim no longer owned')
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
-            if next_window(monitor) != run.window:
+            if run.window != monitor.pending_window and next_window(monitor) != run.window:
                 raise ValueError('Watermark does not match claimed window')
+            open_gap = db.execute('''SELECT id FROM monitor_gaps
+                WHERE monitor_id=? AND window_start=? AND window_end=? AND status='OPEN' ''',
+                (run.monitor_id, run.window.start.isoformat(), run.window.end.isoformat())).fetchone()
+            is_historical_repair = (open_gap is not None)
             db.execute('INSERT INTO monitor_results VALUES (?,?)', (run.id, payload))
-            db.executemany('INSERT INTO monitor_receipts VALUES (?,?,?)',
-                           [(run.monitor_id, key, value) for key, value in receipts.items()])
-            db.execute('''INSERT OR IGNORE INTO monitor_receipts(monitor_id,reference_hash,source_time)
-                SELECT ?,reference_hash,source_time FROM monitor_run_dedupe
-                WHERE run_id=? AND owned=1''', (run.monitor_id, run.id))
+            if not is_historical_repair:
+                db.executemany('INSERT INTO monitor_receipts VALUES (?,?,?)',
+                               [(run.monitor_id, key, value) for key, value in receipts.items()])
+                db.execute('''INSERT OR IGNORE INTO monitor_receipts(monitor_id,reference_hash,source_time)
+                    SELECT ?,reference_hash,source_time FROM monitor_run_dedupe
+                    WHERE run_id=? AND owned=1''', (run.monitor_id, run.id))
             db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
             if metrics is not None:
                 db.execute('INSERT OR REPLACE INTO monitor_run_metrics VALUES (?,?)', (run.id, encode(metrics)))
                 db.executemany('INSERT OR REPLACE INTO monitor_pattern_metrics VALUES (?,?,?)',
                                [(run.id, item['template_id'], encode(item)) for item in pattern_metrics])
-            db.execute("""UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,result_reference=? WHERE id=?""",
-                       (now.isoformat(), encode(asdict(counts)), run.id, run.id))
-            following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
-            # Catch up promptly, but only one bounded window per claim.
+            db.execute("""UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,result_reference=?,
+                error_category=NULL,error_summary=NULL,error_stage=NULL,safe_reason_code=NULL,
+                failure_classification=NULL,reason_streak=0,last_failure_signature=NULL WHERE id=?""",
+                (now.isoformat(), encode(asdict(counts)), run.id, run.id))
+            if is_historical_repair:
+                db.execute('''UPDATE monitor_gaps SET status='RESOLVED', resolved_at=?, resolved_run_id=?
+                    WHERE monitor_id=? AND window_start=? AND window_end=?''',
+                    (now.isoformat(), run.id, run.monitor_id, run.window.start.isoformat(), run.window.end.isoformat()))
+            new_watermark = self._recompute_contiguous_watermark(
+                db, monitor.id, monitor.last_successful_end,
+                monitor.definition.initial_start, monitor.definition.window_seconds)
+            if is_historical_repair:
+                new_cursor = monitor.processing_cursor or run.window.end
+            else:
+                new_cursor = max(monitor.processing_cursor or run.window.end, run.window.end)
+            following = Window(new_cursor, new_cursor + timedelta(seconds=monitor.definition.window_seconds))
             due = now if safe_at(following, monitor.definition) <= now else max(
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
-            db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
-                pending_window_start=NULL,pending_window_end=NULL,
+            db.execute('''UPDATE monitors SET last_successful_end=?,processing_cursor=?,next_run_at=?,status=?,
+                pending_window_start=NULL,pending_window_end=NULL,target_retry_window_start=NULL,target_retry_window_end=NULL,
                 error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1 WHERE id=?''',
-                (run.window.end.isoformat(), due.isoformat(),
+                (new_watermark.isoformat() if new_watermark else None, new_cursor.isoformat(), due.isoformat(),
                  'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED', now.isoformat(), run.monitor_id))
-            # Only overlap receipts can be needed again; history/results are durable.
-            cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
-            db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?', (run.monitor_id, cutoff.isoformat()))
+            if not is_historical_repair:
+                cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
+                db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?', (run.monitor_id, cutoff.isoformat()))
 
     def _succeed_compact(self, run, result, counts, receipts, *, now, metrics, pattern_metrics):
         now = utc(now)
@@ -652,15 +775,20 @@ class SQLiteMonitorRepository:
                 raise ValueError('Run claim no longer owned')
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?',
                                                (run.monitor_id,)).fetchone())
-            if next_window(monitor) != run.window:
+            if run.window != monitor.pending_window and next_window(monitor) != run.window:
                 raise ValueError('Watermark does not match claimed window')
+            open_gap = db.execute('''SELECT id FROM monitor_gaps
+                WHERE monitor_id=? AND window_start=? AND window_end=? AND status='OPEN' ''',
+                (run.monitor_id, run.window.start.isoformat(), run.window.end.isoformat())).fetchone()
+            is_historical_repair = (open_gap is not None)
+
             row = db.execute('SELECT payload FROM monitor_baseline_state WHERE monitor_id=?',
                              (run.monitor_id,)).fetchone()
             baseline = json.loads(row[0]) if row else {'metrics': [], 'patterns': []}
-            baseline['metrics'] = ([{'window_end': run.window.end.isoformat(), 'payload': metric_payload}]
-                                   + baseline['metrics'])[:30]
-            baseline['patterns'] = ([{'window_end': run.window.end.isoformat(), 'payload': pattern_payload}]
-                                    + baseline['patterns'])[:5]
+            metric_item = {'window_end': run.window.end.isoformat(), 'payload': metric_payload}
+            pattern_item = {'window_end': run.window.end.isoformat(), 'payload': pattern_payload}
+            baseline['metrics'] = _merge_baseline_ring(baseline.get('metrics', []), metric_item, 30)
+            baseline['patterns'] = _merge_baseline_ring(baseline.get('patterns', []), pattern_item, 5)
             baseline_json = encode(baseline)
             if len(baseline_json.encode('utf-8')) > MAX_BASELINE_BYTES:
                 raise ValueError('Monitoring baseline state limit reached')
@@ -668,20 +796,32 @@ class SQLiteMonitorRepository:
             db.execute('''UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,
                 physical_logs=?,pattern_count=?,duration_ms=?,result_reference=NULL,
                 error_category=NULL,error_summary=NULL,acquisition_diagnostics=?,
-                error_stage=NULL,safe_reason_code=NULL,reason_streak=0 WHERE id=?''',
+                error_stage=NULL,safe_reason_code=NULL,failure_classification=NULL,
+                reason_streak=0,last_failure_signature=NULL WHERE id=?''',
                 (now.isoformat(), encode(asdict(counts)), int(metrics['total_physical_logs']),
                  len(patterns), duration_ms, encode(recount) if recount is not None else None, run.id))
-            following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
+            if is_historical_repair:
+                db.execute('''UPDATE monitor_gaps SET status='RESOLVED', resolved_at=?, resolved_run_id=?
+                    WHERE monitor_id=? AND window_start=? AND window_end=?''',
+                    (now.isoformat(), run.id, run.monitor_id, run.window.start.isoformat(), run.window.end.isoformat()))
+            new_watermark = self._recompute_contiguous_watermark(
+                db, monitor.id, monitor.last_successful_end,
+                monitor.definition.initial_start, monitor.definition.window_seconds)
+            if is_historical_repair:
+                new_cursor = monitor.processing_cursor or run.window.end
+            else:
+                new_cursor = max(monitor.processing_cursor or run.window.end, run.window.end)
+            following = Window(new_cursor, new_cursor + timedelta(seconds=monitor.definition.window_seconds))
             due = now if safe_at(following, monitor.definition) <= now else max(
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
-            db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
-                pending_window_start=NULL,pending_window_end=NULL,
+            db.execute('''UPDATE monitors SET last_successful_end=?,processing_cursor=?,next_run_at=?,status=?,
+                pending_window_start=NULL,pending_window_end=NULL,target_retry_window_start=NULL,target_retry_window_end=NULL,
                 error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1,
                 latest_run_id=?,latest_status='SUCCESS',latest_completed_at=?,latest_physical_logs=?,
                 latest_logical_events=?,latest_pattern_count=?,latest_signal_count=?,
                 latest_qualified_signal_count=?,latest_incident_count=?,latest_finding_count=?,
                 latest_duration_ms=? WHERE id=?''',
-                (run.window.end.isoformat(), due.isoformat(),
+                (new_watermark.isoformat() if new_watermark else None, new_cursor.isoformat(), due.isoformat(),
                  'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED',
                  now.isoformat(), run.id, now.isoformat(), int(metrics['total_physical_logs']),
                  counts.logical_events, len(patterns), counts.signal_candidates,
@@ -692,12 +832,13 @@ class SQLiteMonitorRepository:
                 (run.monitor_id, 1, baseline_json, now.isoformat()))
             if findings:
                 db.executemany('''INSERT INTO monitor_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', findings)
-            if receipts:
-                db.executemany('INSERT OR IGNORE INTO monitor_receipts VALUES (?,?,?)',
-                               ((run.monitor_id, key, stamp) for key, stamp in receipts.items()))
-            cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
-            db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?',
-                       (run.monitor_id, cutoff.isoformat()))
+            if not is_historical_repair:
+                if receipts:
+                    db.executemany('INSERT OR IGNORE INTO monitor_receipts VALUES (?,?,?)',
+                                   ((run.monitor_id, key, stamp) for key, stamp in receipts.items()))
+                cutoff = run.window.end - timedelta(seconds=monitor.definition.overlap_seconds)
+                db.execute('DELETE FROM monitor_receipts WHERE monitor_id=? AND source_time<?',
+                           (run.monitor_id, cutoff.isoformat()))
 
     def fail(self, run, category, *, now, diagnostics=None):
         category = category if category in MESSAGES else 'UNKNOWN'
@@ -716,38 +857,105 @@ class SQLiteMonitorRepository:
                                                     diagnostics.get('validation_reason')))
             payload = encode(presentation_result({}, safe, None)['source_summary'])
         now = utc(now)
-        from monitoring.errors import (ACQUISITION_REASONS, NON_RETRYABLE_ACQUISITION_REASONS,
-                                       PIPELINE_STAGES)
+        from monitoring.errors import (
+            extract_safe_diagnostics, classify_failure
+        )
+        safe_diag = extract_safe_diagnostics(category, diagnostics)
+        reason = safe_diag['safe_reason_code']
+        stage = safe_diag['error_stage']
+        v_site = safe_diag['validation_site']
+        v_reason = safe_diag['validation_reason']
+        current_sig = safe_diag['signature']
+        classification = classify_failure(category, safe_reason_code=reason, error_stage=stage,
+                                          validation_site=v_site, validation_reason=v_reason)
+
         with self._transaction() as db:
             if not self._owned(db, run):
                 return
             if not self.compact_mode:
                 db.execute('DELETE FROM monitor_run_dedupe WHERE run_id=?', (run.id,))
             monitor = self._monitor(db.execute('SELECT * FROM monitors WHERE id=?', (run.monitor_id,)).fetchone())
-            previous = db.execute('SELECT safe_reason_code,reason_streak FROM monitor_runs WHERE id=?',
+            previous = db.execute('''SELECT safe_reason_code, reason_streak, window_local_failures,
+                                            last_failure_signature FROM monitor_runs WHERE id=?''',
                                   (run.id,)).fetchone()
-            reason = diagnostics.get('reason_code') if isinstance(diagnostics, dict) else None
-            if category.startswith('OPENSEARCH') and reason not in ACQUISITION_REASONS:
-                reason = 'QUERY_FAILURE_UNKNOWN'
-            elif reason not in ACQUISITION_REASONS:
-                reason = None
-            stage = (diagnostics.get('error_stage') or diagnostics.get('pipeline_stage')) if diagnostics else None
-            stage = stage if stage in PIPELINE_STAGES else None
-            streak = ((previous['reason_streak'] + 1 if previous['safe_reason_code'] == reason else 1)
-                      if reason in NON_RETRYABLE_ACQUISITION_REASONS else 0)
-            blocked = streak >= 3
-            db.execute("""UPDATE monitor_runs SET status='FAILED',finished_at=?,error_category=?,error_summary=?,
-                       acquisition_diagnostics=?,error_stage=?,safe_reason_code=?,reason_streak=? WHERE id=?""",
-                       (now.isoformat(), category, MESSAGES[category], payload,
-                        stage, reason, streak,
+            prev_sig = previous['last_failure_signature'] if previous and 'last_failure_signature' in previous.keys() else None
+            prev_streak = previous['reason_streak'] if previous and 'reason_streak' in previous.keys() else 0
+            if prev_sig == current_sig and prev_sig is not None:
+                streak = prev_streak + 1
+            else:
+                streak = 1
+
+            local_failures = previous['window_local_failures'] if previous and 'window_local_failures' in previous.keys() else 0
+
+            # UNKNOWN escalation rule: exactly identical safe signature for 3 consecutive attempts -> ESCALATED_SYSTEMIC
+            if classification == 'UNKNOWN' and streak >= 3:
+                classification = 'ESCALATED_SYSTEMIC'
+
+            quarantined = False
+            blocked = False
+
+            if classification in ('SYSTEMIC', 'ESCALATED_SYSTEMIC'):
+                blocked = True
+                run_status = 'FAILED'
+            elif classification == 'WINDOW_LOCAL':
+                local_failures += 1
+                if local_failures >= 3:
+                    quarantined = True
+                    run_status = 'QUARANTINED'
+                else:
+                    run_status = 'FAILED'
+            else:
+                run_status = 'FAILED'
+
+            db.execute("""UPDATE monitor_runs SET status=?,finished_at=?,error_category=?,error_summary=?,
+                       acquisition_diagnostics=?,error_stage=?,safe_reason_code=?,reason_streak=?,
+                       window_local_failures=?,failure_classification=?,last_failure_signature=? WHERE id=?""",
+                       (run_status, now.isoformat(), category, MESSAGES[category], payload,
+                        stage, reason, streak, local_failures, classification, current_sig,
                         run.id))
-            db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
-                revision=revision+1,latest_run_id=?,latest_status='FAILED',latest_completed_at=? WHERE id=?''',
-                ('ARCHIVED' if monitor.archived else 'BLOCKED' if blocked and monitor.enabled
-                 else 'ERROR' if monitor.enabled else 'PAUSED',
-                 (now + timedelta(seconds=max(3600, monitor.definition.interval_seconds)
-                                  if blocked else monitor.definition.interval_seconds)).isoformat(), category,
-                 MESSAGES[category], now.isoformat(), run.id, now.isoformat(), run.monitor_id))
+
+            if quarantined:
+                gap_id = new_id()
+                db.execute('''INSERT INTO monitor_gaps (id, monitor_id, window_start, window_end, run_id,
+                    status, attempt_count, failure_classification, safe_reason_code, error_stage,
+                    validation_site, validation_reason, quarantined_at, resolved_at, resolved_run_id)
+                    VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                    ON CONFLICT(monitor_id, window_start, window_end) DO UPDATE SET
+                    run_id=excluded.run_id,
+                    status='OPEN',
+                    attempt_count=excluded.attempt_count,
+                    failure_classification=excluded.failure_classification,
+                    safe_reason_code=excluded.safe_reason_code,
+                    error_stage=excluded.error_stage,
+                    validation_site=excluded.validation_site,
+                    validation_reason=excluded.validation_reason,
+                    quarantined_at=excluded.quarantined_at,
+                    resolved_at=NULL,
+                    resolved_run_id=NULL''',
+                    (gap_id, run.monitor_id, run.window.start.isoformat(), run.window.end.isoformat(),
+                     run.id, run.attempts, classification, reason, stage, v_site, v_reason, now.isoformat()))
+                new_cursor = run.window.end
+                if monitor.processing_cursor is not None and monitor.processing_cursor > run.window.end:
+                    new_cursor = monitor.processing_cursor
+                following = Window(new_cursor, new_cursor + timedelta(seconds=monitor.definition.window_seconds))
+                due = now if safe_at(following, monitor.definition) <= now else max(
+                    safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
+                db.execute('''UPDATE monitors SET status=?, next_run_at=?, error_category=?, error_summary=?,
+                    pending_window_start=NULL, pending_window_end=NULL, target_retry_window_start=NULL, target_retry_window_end=NULL,
+                    processing_cursor=?, updated_at=?, revision=revision+1,
+                    latest_run_id=?, latest_status='QUARANTINED', latest_completed_at=? WHERE id=?''',
+                    ('ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED',
+                     due.isoformat(), category, MESSAGES[category], new_cursor.isoformat(), now.isoformat(),
+                     run.id, now.isoformat(), run.monitor_id))
+            else:
+                next_due = (now + timedelta(seconds=max(3600, monitor.definition.interval_seconds))
+                            if blocked else now + timedelta(seconds=monitor.definition.interval_seconds))
+                db.execute('''UPDATE monitors SET status=?,next_run_at=?,error_category=?,error_summary=?,updated_at=?,
+                    revision=revision+1,latest_run_id=?,latest_status='FAILED',latest_completed_at=? WHERE id=?''',
+                    ('ARCHIVED' if monitor.archived else 'BLOCKED' if blocked and monitor.enabled
+                     else 'ERROR' if monitor.enabled else 'PAUSED',
+                     next_due.isoformat(), category,
+                     MESSAGES[category], now.isoformat(), run.id, now.isoformat(), run.monitor_id))
 
     def recover_running(self, now):
         """Call ONLY after obtaining exclusive worker ownership, never from UI."""

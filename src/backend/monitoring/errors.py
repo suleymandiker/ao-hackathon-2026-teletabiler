@@ -51,12 +51,103 @@ ACQUISITION_VALIDATION = {
     'PAGE_HANDOFF': frozenset({'EMPTY_PAGE_STREAM', 'COUNT_MISMATCH'}),
 }
 
+FAILURE_CLASSIFICATIONS = frozenset({
+    'SYSTEMIC', 'TRANSIENT_INFRA', 'WINDOW_LOCAL', 'UNKNOWN', 'ESCALATED_SYSTEMIC'
+})
+
 
 def safe_acquisition_validation(site, reason):
     if (type(site) is str and type(reason) is str and
             reason in ACQUISITION_VALIDATION.get(site, ())):
         return {'validation_site': site, 'validation_reason': reason}
     return {}
+
+
+def safe_failure_signature(category, safe_reason_code=None, error_stage=None,
+                           validation_site=None, validation_reason=None):
+    """Deterministic, bounded structural failure signature. Never includes raw exception text."""
+    cat = category if isinstance(category, str) and category in MESSAGES else 'UNKNOWN'
+    rc = safe_reason_code if isinstance(safe_reason_code, str) and (
+        safe_reason_code in ACQUISITION_REASONS or safe_reason_code in LIMIT_REASONS) else ''
+    st = error_stage if isinstance(error_stage, str) and error_stage in PIPELINE_STAGES else ''
+    vs = validation_site if isinstance(validation_site, str) and validation_site in ACQUISITION_VALIDATION else ''
+    vr = validation_reason if (vs and isinstance(validation_reason, str)
+                               and validation_reason in ACQUISITION_VALIDATION.get(vs, ())) else ''
+    return f'{cat}:{rc}:{st}:{vs}:{vr}'
+
+
+def extract_safe_diagnostics(category, diagnostics=None):
+    """Extract allowlisted structural diagnostics and deterministic signature."""
+    cat = category if isinstance(category, str) and category in MESSAGES else 'UNKNOWN'
+    if not isinstance(diagnostics, dict):
+        return {
+            'category': cat,
+            'safe_reason_code': None,
+            'error_stage': None,
+            'validation_site': None,
+            'validation_reason': None,
+            'signature': safe_failure_signature(cat),
+        }
+    reason = diagnostics.get('reason_code')
+    if cat.startswith('OPENSEARCH') and reason not in ACQUISITION_REASONS:
+        reason = 'QUERY_FAILURE_UNKNOWN'
+    elif reason not in ACQUISITION_REASONS and reason not in LIMIT_REASONS:
+        reason = None
+    stage = diagnostics.get('error_stage') or diagnostics.get('pipeline_stage')
+    stage = safe_pipeline_stage(stage) if stage else None
+    validation = safe_acquisition_validation(diagnostics.get('validation_site'),
+                                            diagnostics.get('validation_reason'))
+    site = validation.get('validation_site')
+    v_reason = validation.get('validation_reason')
+    sig = safe_failure_signature(cat, reason, stage, site, v_reason)
+    return {
+        'category': cat,
+        'safe_reason_code': reason,
+        'error_stage': stage,
+        'validation_site': site,
+        'validation_reason': v_reason,
+        'signature': sig,
+    }
+
+
+def classify_failure(category, *, safe_reason_code=None, error_stage=None,
+                     validation_site=None, validation_reason=None):
+    """Authoritative failure classification matrix."""
+    cat = category if isinstance(category, str) and category in MESSAGES else 'UNKNOWN'
+    # 1. SYSTEMIC (Cluster, config, auth, or storage errors affecting all windows)
+    if cat in ('OPENSEARCH_AUTH', 'OPENSEARCH_CONFIG', 'PERSISTENCE'):
+        return 'SYSTEMIC'
+    if safe_reason_code in ('AUTH_FAILURE', 'MAPPING_INCOMPATIBLE'):
+        return 'SYSTEMIC'
+    if validation_site == 'SOURCE_SCOPE':
+        return 'SYSTEMIC'
+    if error_stage == 'source_setup':
+        return 'SYSTEMIC'
+
+    # 2. TRANSIENT_INFRA (Temporary network or cluster timeouts/hiccups)
+    if cat in ('OPENSEARCH_TIMEOUT', 'INTERRUPTED'):
+        return 'TRANSIENT_INFRA'
+    if safe_reason_code in ('CONNECTION_TIMEOUT', 'SEARCH_TIMEOUT', 'HTTP_429', 'HTTP_5XX', 'SHARD_FAILURE'):
+        return 'TRANSIENT_INFRA'
+
+    # 3. WINDOW_LOCAL (Errors specific to the log contents/format of this single window)
+    if cat == 'ACQUISITION_LIMIT':
+        return 'WINDOW_LOCAL'
+    if cat == 'POLICY':
+        return 'WINDOW_LOCAL'
+    if cat == 'PIPELINE' and error_stage in (
+        'assembly', 'parsing', 'boundary_observation', 'provenance_enrichment',
+        'parsed_observation', 'template_processing', 'template_accumulation',
+        'time_quality', 'downstream', 'result_building', 'pipeline_execution', 'accumulator'
+    ):
+        return 'WINDOW_LOCAL'
+    if safe_reason_code in ('INVALID_TIMESTAMP', 'INVALID_SEQUENCE', 'MISSING_REQUIRED_FIELD', 'INVALID_CURSOR'):
+        return 'WINDOW_LOCAL'
+    if error_stage == 'content_acquisition' and safe_reason_code == 'INVALID_RESPONSE':
+        return 'WINDOW_LOCAL'
+
+    # 4. UNKNOWN (Requires bounded retry, escalates to ESCALATED_SYSTEMIC if repeating)
+    return 'UNKNOWN'
 
 
 def safe_pipeline_stage(stage):

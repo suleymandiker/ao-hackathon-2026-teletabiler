@@ -26,6 +26,7 @@ class RunStatus(str, Enum):
     RUNNING = 'RUNNING'
     SUCCESS = 'SUCCESS'
     FAILED = 'FAILED'
+    QUARANTINED = 'QUARANTINED'
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,8 @@ class DeploymentMonitor:
     archived: bool = False
     manual_requested_at: datetime | None = None
     pending_window: 'Window | None' = None
+    processing_cursor: datetime | None = None
+    target_retry_window: 'Window | None' = None
 
 
 @dataclass(frozen=True)
@@ -111,14 +114,17 @@ class Window:
 
 
 def next_window(monitor: DeploymentMonitor) -> Window:
-    # Once claimed, an interval remains authoritative through failure/restart.
+    # 1. An explicit targeted historical retry window takes highest priority.
+    if monitor.target_retry_window is not None:
+        return monitor.target_retry_window
+    # 2. Once claimed, an interval remains authoritative through failure/restart.
     if monitor.pending_window is not None:
         return monitor.pending_window
-    if monitor.last_successful_end is None and monitor.manual_requested_at is not None:
+    if monitor.last_successful_end is None and monitor.processing_cursor is None and monitor.manual_requested_at is not None:
         end = monitor.manual_requested_at - timedelta(
             seconds=monitor.definition.ingestion_delay_seconds + monitor.definition.overlap_seconds)
         return Window(end - timedelta(seconds=monitor.definition.window_seconds), end)
-    start = monitor.last_successful_end or monitor.definition.initial_start
+    start = monitor.processing_cursor or monitor.last_successful_end or monitor.definition.initial_start
     return Window(start, start + timedelta(seconds=monitor.definition.window_seconds))
 
 
@@ -132,6 +138,8 @@ def ready_at(monitor: DeploymentMonitor, now: datetime) -> datetime:
 
     Lifecycle and running ownership are checked separately by the repository.
     """
+    if monitor.target_retry_window is not None:
+        return utc(now)
     cadence = utc(now) if monitor.manual_requested_at is not None else monitor.next_run_at
     return max(cadence, safe_at(next_window(monitor), monitor.definition))
 
@@ -166,6 +174,12 @@ class MonitorRun:
     result_reference: str | None = None
     error_category: str | None = None
     error_summary: str | None = None
+    window_local_failures: int = 0
+    failure_classification: str | None = None
+    error_stage: str | None = None
+    safe_reason_code: str | None = None
+    reason_streak: int = 0
+    last_failure_signature: str | None = None
 
 
 def new_id() -> str:
