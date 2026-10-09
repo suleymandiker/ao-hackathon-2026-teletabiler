@@ -4,7 +4,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import logging
 import os
-
 import opensearch_application as application
 from ingestion_layer.opensearch_client import OpenSearchClient, OpenSearchClientError
 from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourceError,
@@ -17,49 +16,72 @@ from monitoring.errors import (MonitoringError, safe_failure_details, ACQUISITIO
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
-from monitoring.sharded_acquisition import AcquisitionShard, StreamingAcquisition, plan_shards, retry_read
+from monitoring.sharded_acquisition import (AcquisitionShard, StreamingAcquisition,
+                                                plan_shards, retry_read)
 from monitoring.window_accumulator import WindowAccumulator
 from monitoring.worker import structured_log
 from parser_layer.timestamp.source_policy import TimestampContext, resolve_event_time
 from verified_policy_resolver import (VerifiedPolicyResolver, PolicyResolutionError,
                                       MAX_SAMPLE_RECORDS, MAX_SAMPLE_CHARACTERS)
-
-
 MAX_POLICY_BUFFER_PAGES = 20
-_OWNED_WINDOW_METADATA = '__aiops_monitor_owned_window__'
+
+# Internal monitoring marker. In the streaming path, OpenSearch query lanes are
+# authoritative for logical-window ownership; source timestamps are still
+# parsed for ordering/ledger evidence, but are not used to reclassify a hit.
+ACQUISITION_LANE_METADATA_KEY = 'monitoring_acquisition_lane'
+PRE_OVERLAP = 'PRE_OVERLAP'
+OWNED_WINDOW = 'OWNED_WINDOW'
+POST_OVERLAP = 'POST_OVERLAP'
 
 
-@dataclass(frozen=True)
-class AcquisitionLane:
-    start: datetime
-    end: datetime
-    owned: bool
-    name: str
+def acquisition_lanes(retrieval_start: datetime, window_start: datetime,
+                      window_end: datetime, retrieval_end: datetime,
+                      owned_shards=()):
+    """Build ordered, non-empty PRE/OWNED/POST acquisition lanes."""
+    lanes = []
+    if retrieval_start < window_start:
+        lanes.append((PRE_OVERLAP, False, (
+            AcquisitionShard(shard_id=f'{PRE_OVERLAP}:0',
+                             start=retrieval_start, end=window_start),
+        )))
+    if window_start < window_end:
+        shards = tuple(
+            replace(shard, shard_id=f'{OWNED_WINDOW}:{shard.shard_id}')
+            for shard in owned_shards
+        )
+        if shards:
+            lanes.append((OWNED_WINDOW, True, shards))
+    if window_end < retrieval_end:
+        lanes.append((POST_OVERLAP, False, (
+            AcquisitionShard(shard_id=f'{POST_OVERLAP}:0',
+                             start=window_end, end=retrieval_end),
+        )))
+    return tuple(lanes)
 
 
-def acquisition_lanes(retrieval_start, window, retrieval_end):
-    """Exact half-open content ranges in one chronological assembly stream."""
-    candidates = (
-        AcquisitionLane(retrieval_start, window.start, False, 'PRE_OVERLAP'),
-        AcquisitionLane(window.start, window.end, True, 'OWNED_WINDOW'),
-        AcquisitionLane(window.end, retrieval_end, False, 'POST_OVERLAP'),
-    )
-    return tuple(lane for lane in candidates if lane.start < lane.end)
+def acquisition_lane(record):
+    """Return the monitoring lane attached to a record, if present."""
+    for key, value in reversed(tuple(record.metadata or ())):
+        if key == ACQUISITION_LANE_METADATA_KEY:
+            return value
+    return None
 
+
+def mark_acquisition_lane(record, lane):
+    """Attach a bounded structural marker without changing source identity."""
+    metadata = tuple(record.metadata or ())
+    return replace(record, metadata=metadata + ((ACQUISITION_LANE_METADATA_KEY, lane),))
 
 def source_time(record):
     # The acquisition contract deliberately carries raw @timestamp unchanged.
     # Resolve only its absolute instant, without applying a message timezone.
     return resolve_event_time(None, TimestampContext(source_record_time=record.source_timestamp,
                                                       source_record_raw=record.source_timestamp_raw)).source_record_time
-
-
 class WindowOwnership:
     """Keep context for assembly; select each event before parser/learning.
-
     Monitoring acquisition lanes assign ownership; the legacy path uses the
-    first included source-record time, never message time.
-    Orphans at the left retrieval cut are reported and excluded. Finite tails
+    first included source-record time, never message time. Orphans at the left
+    retrieval cut are reported and excluded. Finite tails
     retain the existing analysis_end semantics and are explicitly counted.
     """
     def __init__(self, run, consumed=(), ledger=None):
@@ -69,13 +91,13 @@ class WindowOwnership:
         self.receipts = {}
         self.diagnostics = dict(context_events=0, duplicate_events=0, orphan_events=0,
                                 boundary_tail_events=0, overlap_conflicts=0)
-
     def __call__(self, event):
         first, evidence = next((record, evidence) for record, evidence in zip(event.records, event.evidence)
                                if evidence.included)
         first_time = source_time(first)
         if first_time is None:
             raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP')
+        first_lane = acquisition_lane(first)
         keys = {reference_key(record) for record in event.records}
         if self.ledger is not None:
             duplicates = {key for key in keys if self.ledger.consumed(key) or self.ledger.owned(key)}
@@ -89,11 +111,12 @@ class WindowOwnership:
         if not evidence.decision.start_new_event:
             self.diagnostics['orphan_events'] += 1
             return False
-        lane_owned = next((value for key, value in reversed(first.metadata)
-                           if key == _OWNED_WINDOW_METADATA), None)
-        if lane_owned is None:
-            lane_owned = self.run.window.start <= first_time < self.run.window.end
-        if not lane_owned:
+        if first_lane is not None:
+            if first_lane != OWNED_WINDOW:
+                self.diagnostics['context_events'] += 1
+                return False
+        elif not self.run.window.start <= first_time < self.run.window.end:
+            # Legacy/manual execution has no acquisition lane marker.
             self.diagnostics['context_events'] += 1
             return False
         if event.emission_reason == 'analysis_end':
@@ -104,8 +127,6 @@ class WindowOwnership:
             self.receipts.update({reference_key(record): source_time(record).isoformat()
                                   for record in event.records})
         return True
-
-
 @dataclass(frozen=True)
 class ExecutionResult:
     presentation: dict
@@ -113,28 +134,19 @@ class ExecutionResult:
     receipts: dict[str, str]
     metrics: dict | None = None
     pattern_metrics: tuple = ()
-
-
 class _DiscardOutput:
     # Legacy pipeline prints can contain raw RCA debug evidence. Never retain
     # them in memory or forward them from the unattended monitoring worker.
     def write(self, value):
         return len(value)
-
     def flush(self):
         pass
-
-
 class _NoTrace:
     """Normal compact monitoring does not retain diagnostic stage items."""
-
     def acquisition(self, *args, **kwargs):
         pass
-
     def __call__(self, *args, **kwargs):
         pass
-
-
 @contextmanager
 def quiet_pipeline():
     # This executor is single-owner/single-threaded. Preconfigured logging
@@ -147,8 +159,6 @@ def quiet_pipeline():
             yield
     finally:
         logging.disable(previous)
-
-
 def redact_ai_secret(value):
     secret = os.environ.get('SAKA_API_KEY')
     if isinstance(value, dict):
@@ -156,8 +166,6 @@ def redact_ai_secret(value):
     if isinstance(value, list):
         return [redact_ai_secret(item) for item in value]
     return value.replace(secret, '[redacted]') if secret and isinstance(value, str) else value
-
-
 class OpenSearchMonitorExecutor:
     def __init__(self, pipeline_factory, *, connection_loader=application.load_connection,
                  client_factory=OpenSearchClient, source_factory=OpenSearchSource,
@@ -172,7 +180,6 @@ class OpenSearchMonitorExecutor:
         self.repository = repository
         self.log = log
         self.read_only = read_only
-
     def _execute_streaming(self, run):
         definition = run.definition
         try:
@@ -206,11 +213,9 @@ class OpenSearchMonitorExecutor:
         unique = 0
         duplicates = 0
         pipeline_stage = 'source_setup'
-
         def mark_pipeline_stage(stage):
             nonlocal pipeline_stage
             pipeline_stage = stage
-
         def failure(category, *, error=None, reason_code=None, stage=None,
                     validation_site=None, validation_reason=None):
             if acquisition is not None:
@@ -252,7 +257,6 @@ class OpenSearchMonitorExecutor:
             error.acquisition_diagnostics = redact_ai_secret(
                 application.presentation_result({}, safe_summary, config)['source_summary'])
             return error
-
         try:
             with self.client_factory(config) as client:
                 if self.source_factory is OpenSearchSource:
@@ -287,7 +291,10 @@ class OpenSearchMonitorExecutor:
                 except Exception:
                     raise MonitoringError('PERSISTENCE') from None
                 mark_pipeline_stage('shard_planning')
-                lanes = acquisition_lanes(start, run.window, end)
+                owned_shards = plan_shards(run.window.start, run.window.end, metrics,
+                                           definition.page_size, definition.max_pages)
+                lanes = acquisition_lanes(start, run.window.start, run.window.end, end,
+                                          owned_shards)
                 def save_shard(shard, status, **values):
                     try:
                         self.repository.record_shard(run, shard, status, **values)
@@ -300,79 +307,75 @@ class OpenSearchMonitorExecutor:
                     ownership = WindowOwnership(run, ledger=ledger)
                     unique_inside_window = 0
                     stream_exhausted = False
-
                     def pages():
-                        nonlocal stream_exhausted
-                        for lane in lanes:
-                            planned = plan_shards(lane.start, lane.end, metrics,
-                                                  definition.page_size, definition.max_pages)
-                            shards = tuple(replace(shard, shard_id=f'{lane.name}:{shard.shard_id}')
-                                           if isinstance(shard, AcquisitionShard) else shard
-                                           for shard in planned)
-                            for page in acquisition.pages(shards):
-                                yield from selected_page(page, lane.owned)
+                        nonlocal unique, unique_inside_window, duplicates, stream_exhausted
+                        for lane, owned, lane_shards in lanes:
+                            for page in acquisition.pages(lane_shards):
+                                if len(page.records) > definition.page_size:
+                                    raise MonitoringError('ACQUISITION_LIMIT')
+                                with ledger.page():
+                                    selected = []
+                                    for record in page.records:
+                                        stamp = source_time(record)
+                                        identity = record.stream_identity
+                                        if stamp is None:
+                                            raise MonitoringError(
+                                                'OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
+                                                stage='content_acquisition',
+                                                validation_site='TIMESTAMP',
+                                                validation_reason='INVALID_FORMAT')
+
+                                        # The acquisition lane is the authoritative
+                                        # membership boundary. Do not reject a hit by
+                                        # reparsing source_timestamp and comparing it
+                                        # with the overall retrieval interval again.
+                                        if identity is None:
+                                            raise MonitoringError(
+                                                'OPENSEARCH_QUERY', reason_code='MISSING_REQUIRED_FIELD',
+                                                stage='content_acquisition',
+                                                validation_site='STREAM_IDENTITY',
+                                                validation_reason='REQUIRED_COMPONENT_MISSING')
+                                        if record.source_reference.source_scope != config.source_scope:
+                                            raise MonitoringError(
+                                                'OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                stage='content_acquisition',
+                                                validation_site='SOURCE_SCOPE',
+                                                validation_reason='SOURCE_PROFILE_MISMATCH')
+                                        for field, reason in (
+                                                ('namespace', 'NAMESPACE_MISMATCH'),
+                                                ('workload', 'WORKLOAD_MISMATCH'),
+                                                ('container', 'CONTAINER_MISMATCH')):
+                                            expected = getattr(definition, field)
+                                            if expected is not None and getattr(identity, field) != expected:
+                                                raise MonitoringError(
+                                                    'OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                    stage='content_acquisition',
+                                                    validation_site='STREAM_IDENTITY',
+                                                    validation_reason=reason)
+                                        if (definition.document_cluster_id is not None and
+                                                identity.source_scope != definition.document_cluster_id):
+                                            raise MonitoringError(
+                                                'OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                stage='content_acquisition',
+                                                validation_site='SOURCE_SCOPE',
+                                                validation_reason='DOCUMENT_CLUSTER_MISMATCH')
+
+                                        key = reference_key(record)
+                                        repeated = ledger.seen(key, stamp.isoformat())
+                                        marked = mark_acquisition_lane(record, lane)
+                                        trace.acquisition(marked, timestamp=stamp,
+                                                          inside_window=owned,
+                                                          overlap=not owned,
+                                                          duplicate=repeated)
+                                        if repeated:
+                                            duplicates += 1
+                                            continue
+                                        unique += 1
+                                        if owned:
+                                            unique_inside_window += 1
+                                        selected.append(marked)
+                                    yield replace(page, records=tuple(selected))
                         stream_exhausted = True
-
-                    def selected_page(page, lane_owned):
-                        nonlocal unique, unique_inside_window, duplicates
-                        if len(page.records) > definition.page_size:
-                            raise MonitoringError('ACQUISITION_LIMIT')
-                        with ledger.page():
-                            selected = []
-                            for record in page.records:
-                                stamp = source_time(record)
-                                identity = record.stream_identity
-                                if stamp is None:
-                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
-                                                          stage='content_acquisition',
-                                                          validation_site='TIMESTAMP',
-                                                          validation_reason='INVALID_FORMAT')
-                                if not start <= stamp < end:
-                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
-                                                          stage='content_acquisition',
-                                                          validation_site='TIMESTAMP',
-                                                          validation_reason='OUTSIDE_RETRIEVAL')
-                                if identity is None:
-                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='MISSING_REQUIRED_FIELD',
-                                                          stage='content_acquisition',
-                                                          validation_site='STREAM_IDENTITY',
-                                                          validation_reason='REQUIRED_COMPONENT_MISSING')
-                                if record.source_reference.source_scope != config.source_scope:
-                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                          stage='content_acquisition',
-                                                          validation_site='SOURCE_SCOPE',
-                                                          validation_reason='SOURCE_PROFILE_MISMATCH')
-                                for field, reason in (('namespace', 'NAMESPACE_MISMATCH'),
-                                                      ('workload', 'WORKLOAD_MISMATCH'),
-                                                      ('container', 'CONTAINER_MISMATCH')):
-                                    expected = getattr(definition, field)
-                                    if expected is not None and getattr(identity, field) != expected:
-                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                              stage='content_acquisition',
-                                                              validation_site='STREAM_IDENTITY',
-                                                              validation_reason=reason)
-                                if (definition.document_cluster_id is not None and
-                                        identity.source_scope != definition.document_cluster_id):
-                                    raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                          stage='content_acquisition',
-                                                          validation_site='SOURCE_SCOPE',
-                                                          validation_reason='DOCUMENT_CLUSTER_MISMATCH')
-                                key = reference_key(record)
-                                repeated = ledger.seen(key, stamp.isoformat())
-                                trace.acquisition(record, timestamp=stamp,
-                                    inside_window=lane_owned,
-                                    overlap=not lane_owned,
-                                    duplicate=repeated)
-                                if repeated:
-                                    duplicates += 1
-                                    continue
-                                unique += 1
-                                if lane_owned:
-                                    unique_inside_window += 1
-                                selected.append(replace(record, metadata=record.metadata +
-                                    ((_OWNED_WINDOW_METADATA, lane_owned),)))
-                            yield replace(page, records=tuple(selected))
-
                     with closing(pages()) as stream:
                         buffered_pages = []
                         sample = []
@@ -410,11 +413,9 @@ class OpenSearchMonitorExecutor:
                                 raise MonitoringError('POLICY') from None
                         else:
                             snapshot = None
-
                         def selected_pages():
                             yield from buffered_pages
                             yield from stream
-
                         mark_pipeline_stage('accumulator')
                         accumulator = WindowAccumulator(window_seconds=definition.window_seconds)
                         accumulator.configure_anomalies(run, metrics, history, pattern_history)
@@ -428,22 +429,6 @@ class OpenSearchMonitorExecutor:
                             if self.read_only:
                                 arguments['persist_learning'] = False
                             result = self.pipeline_factory().process_ingested_pages(selected_pages(), **arguments)
-                    metrics_count_after = None
-                    if stream_exhausted:
-                        try:
-                            recount = metrics_source.count(
-                                run.window.start, run.window.end, definition)
-                            if type(recount) is int and recount >= 0:
-                                metrics_count_after = recount
-                        except Exception:
-                            # This second read is diagnostic only. The original exact
-                            # metrics count remains the success/failure authority.
-                            pass
-                    summary['metrics_recount'] = {
-                        'metrics_count_before': metrics.total,
-                        'metrics_count_after': metrics_count_after,
-                        'unique_inside_window': unique_inside_window,
-                    }
                     mark_pipeline_stage('result_building')
                     if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                         reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
@@ -495,7 +480,6 @@ class OpenSearchMonitorExecutor:
                     compact = metrics.to_dict()
                     compact.update(parsed_events=accumulator.parsed_events,
                                    logical_events=stats.get('segmented', 0),
-                                   metrics_recount=summary['metrics_recount'],
                                    severity_counts=dict(accumulator.severity_counts),
                                    error_pods=accumulator.error_pods,
                                    error_containers=accumulator.error_containers,
@@ -531,10 +515,10 @@ class OpenSearchMonitorExecutor:
             raise failure(category, reason_code=error.reason_code) from None
         except Exception as error:
             raise failure('PIPELINE', error=error) from None
-
     def execute(self, run: MonitorRun, consumed: set[str]) -> ExecutionResult:
         if self.repository is not None:
             return self._execute_streaming(run)
+
         definition = run.definition
         try:
             config = self.connection_loader(definition.page_size)
@@ -542,42 +526,73 @@ class OpenSearchMonitorExecutor:
             raise MonitoringError('OPENSEARCH_CONFIG') from None
         if config.source_scope != definition.source_profile:
             raise MonitoringError('OPENSEARCH_CONFIG')
-        trace = TraceCollector(run.id, limits=self.trace_limits,
-                               secrets=(config.password, config.username, *config.hosts, os.environ.get('SAKA_API_KEY')))
+
+        trace = TraceCollector(
+            run.id,
+            limits=self.trace_limits,
+            secrets=(config.password, config.username, *config.hosts,
+                     os.environ.get('SAKA_API_KEY')),
+        )
         overlap = timedelta(seconds=definition.overlap_seconds)
         start, end = run.window.start - overlap, run.window.end + overlap
-        resolved_index = resolve_index_expression(config.index_expression, start, end, strategy=config.index_strategy)
-        summary = dict(start=run.window.start.isoformat(), end=run.window.end.isoformat(),
-                       retrieval_start=start.isoformat(), retrieval_end=end.isoformat(),
-                       index_expression=config.index_expression, index_strategy=config.index_strategy,
-                       resolved_index=resolved_index, namespace=definition.namespace,
-                       workload=definition.workload, container=definition.container,
-                       source_timezone=definition.source_timezone, source_profile=definition.source_profile,
-                       source_scope=config.source_scope, cluster_alias=definition.cluster_alias,
-                       document_cluster_id=definition.document_cluster_id,
-                       pages_read=0, records_read=0, unique_records=0,
-                       duplicate_records=0, budget_reached=False, stop_reason='interval_exhausted',
-                       page_size=definition.page_size, max_pages=definition.max_pages,
-                       record_budget=definition.page_size * definition.max_pages)
+        resolved_index = resolve_index_expression(
+            config.index_expression, start, end, strategy=config.index_strategy)
+        summary = dict(
+            start=run.window.start.isoformat(),
+            end=run.window.end.isoformat(),
+            retrieval_start=start.isoformat(),
+            retrieval_end=end.isoformat(),
+            index_expression=config.index_expression,
+            index_strategy=config.index_strategy,
+            resolved_index=resolved_index,
+            namespace=definition.namespace,
+            workload=definition.workload,
+            container=definition.container,
+            source_timezone=definition.source_timezone,
+            source_profile=definition.source_profile,
+            source_scope=config.source_scope,
+            cluster_alias=definition.cluster_alias,
+            document_cluster_id=definition.document_cluster_id,
+            pages_read=0,
+            records_read=0,
+            unique_records=0,
+            duplicate_records=0,
+            budget_reached=False,
+            stop_reason='interval_exhausted',
+            page_size=definition.page_size,
+            max_pages=definition.max_pages,
+            record_budget=definition.page_size * definition.max_pages,
+        )
         ownership = WindowOwnership(run, consumed)
+
         def query_diagnostics(mapping):
-            filters = [{'range': {mapping.timestamp: {'gte': start.isoformat(), 'lt': end.isoformat()}}},
-                       {'term': {mapping.namespace_exact: definition.namespace}},
-                       {'term': {mapping.workload_exact: definition.workload}}]
+            filters = [
+                {'range': {mapping.timestamp: {
+                    'gte': start.isoformat(), 'lt': end.isoformat()}}},
+                {'term': {mapping.namespace_exact: definition.namespace}},
+                {'term': {mapping.workload_exact: definition.workload}},
+            ]
             if definition.container:
                 filters.append({'term': {mapping.container_exact: definition.container}})
             if definition.document_cluster_id:
-                filters.append({'term': {mapping.cluster_id_exact: definition.document_cluster_id}})
-            summary.update(effective_query={'bool': {'filter': filters}},
-                           document_cluster_filter_active=definition.document_cluster_id is not None,
-                           sort_fields=[mapping.timestamp, mapping.sequence])
+                filters.append({'term': {
+                    mapping.cluster_id_exact: definition.document_cluster_id}})
+            summary.update(
+                effective_query={'bool': {'filter': filters}},
+                document_cluster_filter_active=definition.document_cluster_id is not None,
+                sort_fields=[mapping.timestamp, mapping.sequence],
+            )
+
         query_diagnostics(config.field_mapping)
         summary['mapping_verified'] = False
         summary['query_executed'] = False
         pipeline_stage = 'policy_resolution'
+        seen = set()
+
         def mark_pipeline_stage(stage):
             nonlocal pipeline_stage
             pipeline_stage = stage
+
         def failure(category, *, error=None):
             summary['unique_records'] = len(seen)
             if category == 'ACQUISITION_LIMIT':
@@ -586,85 +601,108 @@ class OpenSearchMonitorExecutor:
                 summary['stop_reason'] = 'acquisition_failed'
             if category == 'PIPELINE' and error is not None:
                 summary.update(safe_failure_details(pipeline_stage, error))
-            error = MonitoringError(category)
-            error.acquisition_diagnostics = redact_ai_secret(application.presentation_result({}, summary, config)['source_summary'])
-            return error
+            failure_error = MonitoringError(category)
+            failure_error.acquisition_diagnostics = redact_ai_secret(
+                application.presentation_result({}, summary, config)['source_summary'])
+            return failure_error
+
         try:
-            # Acquire all bounded pages before any learning. A page cap is a
-            # failed run, never a successful partial window/watermark advance.
-            pages, seen, cursor = [], set(), None
+            # Legacy/manual path: acquire the complete bounded retrieval before
+            # learning. The repository-backed monitoring path above is the
+            # production streaming path and uses explicit acquisition lanes.
+            pages, cursor = [], None
             with self.client_factory(config) as client:
                 if self.source_factory is OpenSearchSource:
-                    names = ('namespace', 'workload') + (('container',) if definition.container else ())
+                    names = ('namespace', 'workload') + (
+                        ('container',) if definition.container else ())
                     if definition.document_cluster_id:
                         names += ('cluster_id',)
                     config = resolve_exact_mapping(client, start, end, names=names)
                     client.config = config
                     query_diagnostics(config.field_mapping)
                     summary['mapping_verified'] = True
+
                 source = self.source_factory(client)
                 for _ in range(definition.max_pages):
                     summary['query_executed'] = True
-                    page = source.read_page(start=start, end=end, namespace=definition.namespace,
-                                            workload=definition.workload, container=definition.container,
-                                            cluster_id=definition.document_cluster_id, page_size=definition.page_size, cursor=cursor)
+                    page = source.read_page(
+                        start=start,
+                        end=end,
+                        namespace=definition.namespace,
+                        workload=definition.workload,
+                        container=definition.container,
+                        cluster_id=definition.document_cluster_id,
+                        page_size=definition.page_size,
+                        cursor=cursor,
+                    )
                     summary['pages_read'] += 1
                     summary['records_read'] += len(page.records)
                     if len(page.records) > definition.page_size:
                         raise MonitoringError('ACQUISITION_LIMIT')
+
                     records = []
                     for record in page.records:
                         timestamp = source_time(record)
                         if timestamp is None or not start <= timestamp < end:
                             raise MonitoringError('OPENSEARCH_QUERY')
                         identity = record.stream_identity
-                        # SourceReference identifies the acquisition profile;
-                        # StreamIdentity carries the document's cluster UUID.
-                        if (record.source_reference.source_scope != config.source_scope or identity is None
-                                or (definition.document_cluster_id is not None
-                                    and identity.source_scope != definition.document_cluster_id)
-                                or identity.namespace != definition.namespace or identity.workload != definition.workload
-                                or (definition.container and identity.container != definition.container)):
+                        if (record.source_reference.source_scope != config.source_scope or
+                                identity is None or
+                                (definition.document_cluster_id is not None and
+                                 identity.source_scope != definition.document_cluster_id) or
+                                identity.namespace != definition.namespace or
+                                identity.workload != definition.workload or
+                                (definition.container and
+                                 identity.container != definition.container)):
                             raise MonitoringError('OPENSEARCH_QUERY')
+
                         key = reference_key(record)
-                        trace.acquisition(record, timestamp=timestamp,
-                                          inside_window=run.window.start <= timestamp < run.window.end,
-                                          overlap=not run.window.start <= timestamp < run.window.end,
-                                          duplicate=key in seen)
+                        trace.acquisition(
+                            record,
+                            timestamp=timestamp,
+                            inside_window=run.window.start <= timestamp < run.window.end,
+                            overlap=not run.window.start <= timestamp < run.window.end,
+                            duplicate=key in seen,
+                        )
                         if key in seen:
                             summary['duplicate_records'] += 1
                             continue
                         seen.add(key)
                         records.append(record)
+
                     pages.append(replace(page, records=tuple(records)))
                     if page.interval_exhausted:
                         break
                     if page.cycle_budget_reached:
                         raise MonitoringError('ACQUISITION_LIMIT')
-                    if not page.records or page.next_cursor is None or page.next_cursor == cursor:
+                    if (not page.records or page.next_cursor is None or
+                            page.next_cursor == cursor):
                         raise MonitoringError('OPENSEARCH_QUERY')
                     cursor = page.next_cursor
                 else:
                     raise MonitoringError('ACQUISITION_LIMIT')
+
             summary['unique_records'] = len(seen)
         except MonitoringError as error:
             raise failure(error.category) from None
         except OpenSearchClientError as error:
-            text = str(error)
-            category = ('OPENSEARCH_AUTH' if text in ('OpenSearch HTTP failure (401)', 'OpenSearch HTTP failure (403)')
-                        else 'OPENSEARCH_TIMEOUT' if text == 'OpenSearch connection or timeout failure'
+            category = ('OPENSEARCH_AUTH' if error.reason_code == 'AUTH_FAILURE'
+                        else 'OPENSEARCH_TIMEOUT'
+                        if error.reason_code == 'CONNECTION_TIMEOUT'
                         else 'OPENSEARCH_QUERY')
             raise failure(category) from None
         except OpenSearchSourceError as error:
-            category = 'OPENSEARCH_TIMEOUT' if str(error) == 'Search timed out or lacks completion evidence' else 'OPENSEARCH_QUERY'
+            category = ('OPENSEARCH_TIMEOUT'
+                        if error.reason_code == 'SEARCH_TIMEOUT'
+                        else 'OPENSEARCH_QUERY')
             raise failure(category) from None
         except Exception:
             raise failure('OPENSEARCH_QUERY') from None
 
         if seen:
             try:
-                # Same bounded verified-policy resolver used by manual OpenShift.
-                sample = tuple(record for page in pages for record in page.records)[:definition.page_size]
+                sample = tuple(record for page in pages for record in page.records)[
+                    :definition.page_size]
                 resolution = VerifiedPolicyResolver().resolve(sample, self.policy_loader())
                 summary['policy_selection'] = resolution.diagnostics()
             except (PolicyResolutionError, application.ApplicationError):
@@ -672,30 +710,44 @@ class OpenSearchMonitorExecutor:
             snapshot = resolution.snapshot
         else:
             snapshot = None
+
         try:
             mark_pipeline_stage('pipeline_construction')
             with quiet_pipeline():
                 result = self.pipeline_factory().process_ingested_pages(
-                    pages, policy_provider=lambda key, record: snapshot,
-                    source_timezone=definition.source_timezone, assembled_event_filter=ownership, observer=trace,
-                    stage_callback=mark_pipeline_stage)
+                    pages,
+                    policy_provider=lambda key, record: snapshot,
+                    source_timezone=definition.source_timezone,
+                    assembled_event_filter=ownership,
+                    observer=trace,
+                    stage_callback=mark_pipeline_stage,
+                )
             mark_pipeline_stage('result_building')
             if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                 reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
-                if any(count for reason, count in reasons.items() if reason != 'blank_context'):
+                if any(count for reason, count in reasons.items()
+                       if reason != 'blank_context'):
                     raise MonitoringError('POLICY')
+
             summary['window_assembly'] = ownership.diagnostics
-            summary['pattern_count'] = len({row['template_id'] for row in result.get('signals', [])
-                                            if row.get('template_id') is not None})
+            summary['pattern_count'] = len({
+                row['template_id'] for row in result.get('signals', [])
+                if row.get('template_id') is not None
+            })
             if 'event_provenance' in result:
-                summary['boundary_quality'] = build_boundary_quality(result['event_provenance'])
+                summary['boundary_quality'] = build_boundary_quality(
+                    result['event_provenance'])
+
             stats = result['stats']
-            counts = RunCounts(summary['records_read'], len(seen), stats.get('segmented', 0),
-                               stats.get('parsed', 0), stats.get('templated', 0),
-                               *(stats.get(key, 0) for key in ('signal_candidates', 'qualified_signals', 'correlations', 'incidents', 'rca')))
-            # Reuse the established safe presentation projection; never persist
-            # canonical raw traces or arbitrary transport/pipeline exceptions.
-            presentation = redact_ai_secret(application.presentation_result(result, summary, config))
+            counts = RunCounts(
+                summary['records_read'], len(seen), stats.get('segmented', 0),
+                stats.get('parsed', 0), stats.get('templated', 0),
+                *(stats.get(key, 0) for key in (
+                    'signal_candidates', 'qualified_signals', 'correlations',
+                    'incidents', 'rca')),
+            )
+            presentation = redact_ai_secret(
+                application.presentation_result(result, summary, config))
             presentation['detailed_pipeline_trace'] = trace.finish(result)
             return ExecutionResult(presentation, counts, ownership.receipts)
         except MonitoringError as error:
