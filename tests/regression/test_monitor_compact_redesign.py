@@ -41,7 +41,7 @@ def test_read_connection_has_no_writer_transaction_and_constructor_can_skip_ddl(
         assert reader.list_monitor_summaries() == []
     with sqlite3.connect(path) as db:
         assert db.execute('PRAGMA journal_mode').fetchone()[0].lower() == 'wal'
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
 
 
 def test_future_schema_is_rejected_on_ui_read_path(tmp_path):
@@ -64,7 +64,7 @@ def test_sqlite_statistics_survive_repository_restart_and_maintenance(tmp_path):
     reopened = SQLiteMonitorRepository(path, compact_mode=True)
     assert reopened.get(monitor.id).id == monitor.id
     with sqlite3.connect(path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
         assert db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'").fetchone()
 
 
@@ -88,13 +88,14 @@ def test_v5_statistics_and_missing_reason_streak_migrate_without_reset(tmp_path)
     with sqlite3.connect(path) as db:
         db.execute('ALTER TABLE monitor_runs DROP COLUMN reason_streak')
         db.execute('ANALYZE')
+        db.execute('PRAGMA user_version=5')
         assert db.execute('PRAGMA user_version').fetchone()[0] == 5
     reopened = SQLiteMonitorRepository(path, compact_mode=True)
     assert reopened.get(monitor.id).id == monitor.id
     with sqlite3.connect(path) as db:
         columns = {row[1] for row in db.execute('PRAGMA table_info(monitor_runs)')}
         assert 'reason_streak' in columns
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
 
 
 def test_compact_success_publishes_atomic_state_without_legacy_detail(tmp_path):

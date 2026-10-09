@@ -16,7 +16,7 @@ from typing import Protocol
 
 from monitoring.domain import (
     DeploymentMonitor, MonitorDefinition, MonitorRun, MonitorStatus, RunCounts,
-    RunStatus, Window, new_id, next_window, safe_at, utc,
+    RunStatus, Window, new_id, next_window, safe_at, utc, ready_at,
 )
 from monitoring.errors import MESSAGES
 
@@ -54,6 +54,8 @@ class MonitorRepository(Protocol):
     def list(self, *, include_archived: bool = False) -> list[DeploymentMonitor]: ...
     def update(self, monitor_id: str, definition: MonitorDefinition, *, revision: int, now: datetime) -> DeploymentMonitor: ...
     def set_enabled(self, monitor_id: str, enabled: bool, *, now: datetime) -> DeploymentMonitor: ...
+    def request_run_now(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
+    def resume_now(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def archive(self, monitor_id: str, *, now: datetime) -> DeploymentMonitor: ...
     def claim(self, now: datetime) -> MonitorRun | None: ...
     def schedule_summary(self, now: datetime) -> 'ScheduleSummary': ...
@@ -194,7 +196,7 @@ class SQLiteMonitorRepository:
         else:
             with self._read_connection() as db:
                 version = db.execute('PRAGMA user_version').fetchone()[0]
-                if version not in (4, 5):
+                if version not in (4, 5, 6):
                     raise MonitoringSchemaError('Unsupported monitoring schema version',
                                                 'UNSUPPORTED_SCHEMA_VERSION')
 
@@ -204,7 +206,7 @@ class SQLiteMonitorRepository:
         with sqlite3.connect(self.path, timeout=10) as setup:
             setup.execute('PRAGMA busy_timeout=10000')
             version = setup.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, 5):
+            if version not in (0, 1, 2, 3, 4, 5, 6):
                 raise MonitoringSchemaError('Unsupported monitoring schema version',
                                             'UNSUPPORTED_SCHEMA_VERSION')
             _validate_monitoring_ownership(setup)
@@ -212,14 +214,15 @@ class SQLiteMonitorRepository:
             setup.execute('PRAGMA synchronous=NORMAL')
         with self._transaction() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, 5):
+            if version not in (0, 1, 2, 3, 4, 5, 6):
                 raise MonitoringSchemaError('Unsupported monitoring schema version',
                                             'UNSUPPORTED_SCHEMA_VERSION')
             _validate_monitoring_ownership(db)
-            if version == 5:
+            if version in (5, 6):
                 columns = {row['name'] for row in db.execute('PRAGMA table_info(monitor_runs)')}
                 if 'reason_streak' not in columns:
                     db.execute('ALTER TABLE monitor_runs ADD COLUMN reason_streak INTEGER NOT NULL DEFAULT 0')
+                self._migrate_operator_controls(db)
                 return
             statements = (
                 '''CREATE TABLE IF NOT EXISTS monitors (
@@ -309,7 +312,26 @@ class SQLiteMonitorRepository:
             db.execute('CREATE INDEX IF NOT EXISTS monitor_findings_recent ON monitor_findings(monitor_id,created_at DESC)')
             if version > 0:
                 self._backfill_compact(db)
-            db.execute('PRAGMA user_version=5')
+            self._migrate_operator_controls(db)
+
+    @staticmethod
+    def _migrate_operator_controls(db):
+        """v6: bounded intent plus a pinned interval; no historical timestamp edits."""
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(monitors)')}
+        for name in ('manual_requested_at', 'pending_window_start', 'pending_window_end'):
+            if name not in columns:
+                db.execute(f'ALTER TABLE monitors ADD COLUMN {name} TEXT')
+        if db.execute('PRAGMA user_version').fetchone()[0] < 6:
+            # A legacy failed/running first window must never be replaced by a
+            # fresh-window manual request, even before any watermark exists.
+            db.execute('''UPDATE monitors SET (pending_window_start,pending_window_end) =
+                (SELECT window_start,window_end FROM monitor_runs r
+                 WHERE r.monitor_id=monitors.id AND r.status IN ('FAILED','RUNNING')
+                 AND r.window_start=COALESCE(monitors.last_successful_end,
+                                            json_extract(monitors.definition,'$.initial_start'))
+                 ORDER BY r.window_start DESC LIMIT 1)
+                WHERE pending_window_start IS NULL''')
+            db.execute('PRAGMA user_version=6')
 
     @staticmethod
     def _backfill_compact(db):
@@ -397,7 +419,10 @@ class SQLiteMonitorRepository:
         return DeploymentMonitor(
             row['id'], read_definition(row['definition']), bool(row['enabled']), MonitorStatus(row['status']),
             instant(row['last_successful_end']), instant(row['next_run_at']), instant(row['created_at']),
-            instant(row['updated_at']), row['revision'], row['error_category'], row['error_summary'], bool(row['archived']))
+            instant(row['updated_at']), row['revision'], row['error_category'], row['error_summary'], bool(row['archived']),
+            instant(row['manual_requested_at']) if 'manual_requested_at' in row.keys() else None,
+            Window(instant(row['pending_window_start']), instant(row['pending_window_end']))
+            if 'pending_window_start' in row.keys() and row['pending_window_start'] else None)
 
     @staticmethod
     def _run(row):
@@ -438,13 +463,16 @@ class SQLiteMonitorRepository:
             if old.revision != revision or old.status == MonitorStatus.RUNNING:
                 raise ValueError('Monitor changed or is running; refresh before editing')
             has_history = db.execute('SELECT 1 FROM monitor_runs WHERE monitor_id=? LIMIT 1', (monitor_id,)).fetchone()
-            if has_history and replace(definition, name=old.definition.name, interval_seconds=old.definition.interval_seconds) != old.definition:
+            established = has_history or old.last_successful_end or old.manual_requested_at or old.pending_window
+            if established and replace(definition, name=old.definition.name,
+                                       interval_seconds=old.definition.interval_seconds) != old.definition:
                 raise ValueError('After the first run, only name and interval can change; create a new monitor for a new scope or policy')
             db.execute('UPDATE monitors SET definition=?, updated_at=?, revision=revision+1 WHERE id=?',
                        (definition_json(definition), utc(now).isoformat(), monitor_id))
         return self.get(monitor_id)
 
     def set_enabled(self, monitor_id, enabled, *, now):
+        """Lifecycle-only compatibility API. Operator resume uses resume_now()."""
         now = utc(now).isoformat()
         with self._transaction() as db:
             old = db.execute('SELECT archived FROM monitors WHERE id=?', (monitor_id,)).fetchone()
@@ -455,8 +483,36 @@ class SQLiteMonitorRepository:
             db.execute('''UPDATE monitors SET enabled=?, status=CASE
                 WHEN ?=0 THEN 'PAUSED'
                 WHEN EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=? AND status='RUNNING') THEN 'RUNNING'
-                ELSE 'ACTIVE' END, next_run_at=?, updated_at=?, revision=revision+1 WHERE id=?''',
-                (int(enabled), int(enabled), monitor_id, now, now, monitor_id))
+                ELSE 'ACTIVE' END, manual_requested_at=CASE WHEN ?=0 THEN NULL ELSE manual_requested_at END,
+                updated_at=?, revision=revision+1 WHERE id=?''',
+                (int(enabled), int(enabled), monitor_id, int(enabled), now, monitor_id))
+        return self.get(monitor_id)
+
+    def request_run_now(self, monitor_id, *, now):
+        """Run/Retry Now: coalesce durable intent without changing cadence."""
+        return self._request_run(monitor_id, now=now, resume=False)
+
+    def resume_now(self, monitor_id, *, now):
+        """Atomically enable and request work. An owned run simply continues."""
+        return self._request_run(monitor_id, now=now, resume=True)
+
+    def _request_run(self, monitor_id, *, now, resume):
+        stamp = utc(now).isoformat()
+        with self._transaction() as db:
+            row = db.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
+            if row is None:
+                raise KeyError('Monitor not found')
+            if row['archived'] or (not row['enabled'] and not resume):
+                raise ValueError('Monitor must be active; resume a paused monitor first')
+            running = db.execute("SELECT 1 FROM monitor_runs WHERE monitor_id=? AND status='RUNNING'",
+                                 (monitor_id,)).fetchone()
+            if resume and not row['enabled']:
+                db.execute('''UPDATE monitors SET enabled=1,status=?,manual_requested_at=?,
+                    updated_at=?,revision=revision+1 WHERE id=?''',
+                    ('RUNNING' if running else 'ACTIVE', None if running else stamp, stamp, monitor_id))
+            elif not running and row['manual_requested_at'] is None:
+                db.execute('''UPDATE monitors SET manual_requested_at=?,updated_at=?,
+                    revision=revision+1 WHERE id=?''', (stamp, stamp, monitor_id))
         return self.get(monitor_id)
 
     def archive(self, monitor_id, *, now):
@@ -467,20 +523,21 @@ class SQLiteMonitorRepository:
         """
         with self._transaction() as db:
             db.execute("""UPDATE monitors SET archived=1,enabled=0,status='ARCHIVED',
-                updated_at=?,revision=revision+1 WHERE id=? AND archived=0""",
+                manual_requested_at=NULL,updated_at=?,revision=revision+1 WHERE id=? AND archived=0""",
                 (utc(now).isoformat(), monitor_id))
         return self.get(monitor_id)
 
     def claim(self, now):
         now = utc(now)
         with self._transaction() as db:
-            rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0 AND next_run_at<=?
+            rows = db.execute('''SELECT * FROM monitors WHERE enabled=1 AND archived=0
+                AND (next_run_at<=? OR manual_requested_at IS NOT NULL)
                 AND NOT EXISTS(SELECT 1 FROM monitor_runs WHERE monitor_id=monitors.id AND status='RUNNING')
                 ORDER BY updated_at,next_run_at,id''', (now.isoformat(),)).fetchall()
             for row in rows:
                 monitor = self._monitor(row)
                 window = next_window(monitor)
-                if safe_at(window, monitor.definition) > now:
+                if ready_at(monitor, now) > now:
                     continue
                 existing = db.execute('SELECT * FROM monitor_runs WHERE monitor_id=? AND window_start=? AND window_end=?',
                                       (monitor.id, window.start.isoformat(), window.end.isoformat())).fetchone()
@@ -501,7 +558,9 @@ class SQLiteMonitorRepository:
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
                         run_id, monitor.id, window.start.isoformat(), window.end.isoformat(), definition_json(monitor.definition),
                         now.isoformat(), None, now.isoformat(), 'RUNNING', token, 1, encode(asdict(RunCounts())), None, None, None))
-                db.execute("UPDATE monitors SET status='RUNNING',updated_at=?,revision=revision+1 WHERE id=?", (now.isoformat(), monitor.id))
+                db.execute("""UPDATE monitors SET status='RUNNING',manual_requested_at=NULL,
+                    pending_window_start=?,pending_window_end=?,updated_at=?,revision=revision+1 WHERE id=?""",
+                    (window.start.isoformat(), window.end.isoformat(), now.isoformat(), monitor.id))
                 return self._run(db.execute('SELECT * FROM monitor_runs WHERE id=?', (run_id,)).fetchone())
         return None
 
@@ -522,11 +581,11 @@ class SQLiteMonitorRepository:
                                       (monitor.id, window.start.isoformat(), window.end.isoformat())).fetchone()
                 if existing and existing['status'] == 'SUCCESS':
                     continue
-                ready_at = max(monitor.next_run_at, safe_at(window, monitor.definition))
-                if ready_at <= now:
+                ready = ready_at(monitor, now)
+                if ready <= now:
                     due += 1
-                if next_due_at is None or ready_at < next_due_at:
-                    next_due_at = ready_at
+                if next_due_at is None or ready < next_due_at:
+                    next_due_at = ready
             return ScheduleSummary(enabled, due, next_due_at)
 
     @staticmethod
@@ -564,6 +623,7 @@ class SQLiteMonitorRepository:
             due = now if safe_at(following, monitor.definition) <= now else max(
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
             db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
+                pending_window_start=NULL,pending_window_end=NULL,
                 error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1 WHERE id=?''',
                 (run.window.end.isoformat(), due.isoformat(),
                  'ARCHIVED' if monitor.archived else 'ACTIVE' if monitor.enabled else 'PAUSED', now.isoformat(), run.monitor_id))
@@ -605,6 +665,7 @@ class SQLiteMonitorRepository:
             due = now if safe_at(following, monitor.definition) <= now else max(
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))
             db.execute('''UPDATE monitors SET last_successful_end=?,next_run_at=?,status=?,
+                pending_window_start=NULL,pending_window_end=NULL,
                 error_category=NULL,error_summary=NULL,updated_at=?,revision=revision+1,
                 latest_run_id=?,latest_status='SUCCESS',latest_completed_at=?,latest_physical_logs=?,
                 latest_logical_events=?,latest_pattern_count=?,latest_signal_count=?,
@@ -821,7 +882,11 @@ class SQLiteMonitorRepository:
         detail_cutoff = (now - timedelta(days=3)).isoformat()
         with self._transaction() as db:
             ids = [row[0] for row in db.execute('''SELECT id FROM monitor_runs
-                WHERE status!='RUNNING' AND finished_at<? ORDER BY finished_at LIMIT ?''',
+                WHERE status!='RUNNING' AND finished_at<?
+                AND NOT EXISTS(SELECT 1 FROM monitors m WHERE m.id=monitor_runs.monitor_id
+                    AND m.pending_window_start=monitor_runs.window_start
+                    AND m.pending_window_end=monitor_runs.window_end)
+                ORDER BY finished_at LIMIT ?''',
                 (run_cutoff, batch))]
             for run_id in ids:
                 db.execute('DELETE FROM monitor_results WHERE run_id=?', (run_id,))

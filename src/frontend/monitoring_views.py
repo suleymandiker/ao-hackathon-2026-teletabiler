@@ -134,7 +134,8 @@ def monitor_form(repo, connection, redact, monitor=None):
     key = monitor.id if monitor else 'new'
     def field(name):
         return 'monitor_field_' + key + '_' + name
-    locked = bool(monitor and repo.history(monitor.id, limit=1))
+    locked = bool(monitor and (monitor.last_successful_end or monitor.manual_requested_at or monitor.pending_window
+                              or repo.history(monitor.id, limit=1)))
     namespace, workload, container = (old.namespace, old.workload, old.container) if old else (None, None, None)
     valid = False
     if monitor:
@@ -142,7 +143,7 @@ def monitor_form(repo, connection, redact, monitor=None):
     if locked or (monitor and connection is None):
         st.text_input('Namespace 🔒', value=redact(namespace), disabled=True, key=field('namespace'))
         st.text_input('Workload 🔒', value=redact(workload), disabled=True, key=field('workload'))
-        st.caption('Target cannot be changed after monitoring history exists.' if locked else 'Source unavailable; target changes require source validation.')
+        st.caption('Target is locked after monitoring starts or a run is requested.' if locked else 'Source unavailable; target changes require source validation.')
         valid = True
     else:
         try:
@@ -223,7 +224,10 @@ def monitor_form(repo, connection, redact, monitor=None):
             if monitor:
                 repo.update(monitor.id, definition, revision=monitor.revision, now=now())
                 if enabled != monitor.enabled:
-                    repo.set_enabled(monitor.id, enabled, now=now())
+                    if enabled:
+                        repo.resume_now(monitor.id, now=now())
+                    else:
+                        repo.set_enabled(monitor.id, False, now=now())
                 st.session_state['monitor_edit_mode'] = None
             else:
                 created = repo.create(definition, enabled=enabled, now=now())
@@ -268,10 +272,27 @@ def filter_monitors(monitors, query='', status='All'):
                  or status == 'Paused' and not m.enabled and not m.archived)]
 
 
+def next_run_label(monitor, stamp):
+    from monitoring.domain import ready_at
+    if monitor.archived:
+        return 'Archived'
+    if not monitor.enabled:
+        return 'Paused'
+    if monitor.status.value == 'RUNNING':
+        return 'Running'
+    remaining = max(0, int((ready_at(monitor, stamp) - stamp).total_seconds()))
+    if monitor.manual_requested_at is not None:
+        return 'Run requested' if remaining == 0 else f'Requested · safe in {(remaining + 59) // 60} min'
+    return 'Due now' if remaining == 0 else f'{(remaining + 59) // 60} min'
+
+
 def render(connection, redact):
     st.session_state.setdefault('expanded_monitor_id', None)
     st.session_state.setdefault('create_form_open', False)
     st.session_state.setdefault('show_archived', False)
+    notice = st.session_state.pop('monitor_control_notice', None)
+    if notice:
+        st.success(notice)
     title, refresh, create = st.columns([5, 1.3, 1.8], vertical_alignment='center')
     with title:
         st.title('Deployment Monitors')
@@ -320,9 +341,7 @@ def render(connection, redact):
             left.metric('Last run', item['latest_status'] or 'None')
             middle.metric('Logs', item['physical_logs'] if item['physical_logs'] is not None else '—')
             right.metric('Findings', item['findings'] if item['findings'] is not None else '—')
-            remaining = max(0, int((monitor.next_run_at - now()).total_seconds()))
-            due.metric('Next run', ('Due now' if remaining == 0 else
-                                   f'{(remaining + 59) // 60} min') if monitor.enabled else 'Paused')
+            due.metric('Next run', next_run_label(monitor, now()))
             if st.button('Open ' + redact(monitor.definition.name), key='monitor_row_' + monitor.id):
                 st.session_state['expanded_monitor_id'] = monitor.id
                 st.session_state.pop('monitor_runs_snapshot', None)
@@ -377,9 +396,29 @@ def _render_compact_detail(repo, summary, connection, redact):
         except Exception:
             st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
     if not monitor.archived:
-        if st.button('Pause' if monitor.enabled else 'Resume', key='toggle_monitor_' + monitor_id):
+        running = monitor.status.value == 'RUNNING' or bool(runs and runs[0].status.value == 'RUNNING')
+        if running:
+            st.info('Current run may finish. Pause prevents any new run from starting.')
+        if monitor.manual_requested_at:
+            st.caption('Run requested. The worker will start when the next window is complete.')
+        if st.button('Pause' if monitor.enabled else 'Resume Now', key='toggle_monitor_' + monitor_id):
             try:
-                repo.set_enabled(monitor_id, not monitor.enabled, now=now())
+                if monitor.enabled:
+                    repo.set_enabled(monitor_id, False, now=now())
+                    st.session_state['monitor_control_notice'] = 'Paused. Any current run may finish safely.'
+                else:
+                    repo.resume_now(monitor_id, now=now())
+                    st.session_state['monitor_control_notice'] = 'Resumed. Run requested.'
+                invalidate_snapshot()
+                st.rerun()
+            except Exception:
+                st.error('Monitoring storage is temporarily unavailable. Refresh shortly.')
+        if monitor.enabled and not running and st.button(
+                'Retry Now' if monitor.status.value in ('ERROR', 'BLOCKED') else 'Run Now',
+                key='run_now_' + monitor_id, disabled=monitor.manual_requested_at is not None):
+            try:
+                repo.request_run_now(monitor_id, now=now())
+                st.session_state['monitor_control_notice'] = 'Run requested.'
                 invalidate_snapshot()
                 st.rerun()
             except Exception:
@@ -411,9 +450,13 @@ def monitor_actions(repo, redact, monitor):
         return
     left, right = st.columns([1, 3])
     with left:
-        if st.button('Pause monitor' if monitor.enabled else 'Enable monitor', key='toggle_monitor_' + monitor.id):
+        if st.button('Pause monitor' if monitor.enabled else 'Resume Now', key='toggle_monitor_' + monitor.id):
             try:
-                repo.set_enabled(monitor.id, not monitor.enabled, now=now())
+                if monitor.enabled:
+                    repo.set_enabled(monitor.id, False, now=now())
+                else:
+                    repo.resume_now(monitor.id, now=now())
+                invalidate_snapshot()
                 st.rerun()
             except (ValueError, KeyError):
                 st.error('Monitor changed; refresh before changing its status.')

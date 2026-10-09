@@ -96,6 +96,60 @@ def test_pause_and_refresh_invalidate_snapshot(monitoring_ui, monkeypatch):
     assert_safe(app)
 
 
+def test_run_now_writes_once_and_resume_requests_without_pipeline(monitoring_ui, monkeypatch):
+    ui, repo, monitor = monitoring_ui
+    from monitoring.repository import SQLiteMonitorRepository
+    import monitoring.execution
+    monkeypatch.setattr(monitoring.execution.OpenSearchMonitorExecutor, 'execute',
+                        lambda *a, **kw: pytest.fail('UI must never execute monitoring'))
+    writes = []
+    original = SQLiteMonitorRepository.request_run_now
+
+    def request(self, *args, **kwargs):
+        writes.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteMonitorRepository, 'request_run_now', request)
+    app = ui.app()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert app.button(key='run_now_' + monitor.id).label == 'Run Now'
+    app.button(key='run_now_' + monitor.id).click().run()
+    assert writes == [1] and repo.get(monitor.id).manual_requested_at == BASE
+    assert any('Run requested' in row.value for row in app.success)
+    assert app.button(key='run_now_' + monitor.id).disabled
+    app.text_input(key='monitor_search').set_value('app').run()
+    assert writes == [1] and repo.history(monitor.id) == []
+    app.button(key='toggle_monitor_' + monitor.id).click().run()
+    assert repo.get(monitor.id).manual_requested_at is None
+    assert app.button(key='toggle_monitor_' + monitor.id).label == 'Resume Now'
+    assert not [b for b in app.button if b.key == 'run_now_' + monitor.id]
+    app.button(key='toggle_monitor_' + monitor.id).click().run()
+    assert repo.get(monitor.id).enabled
+    assert repo.get(monitor.id).manual_requested_at == BASE
+    assert repo.history(monitor.id) == []
+    assert_safe(app)
+
+
+def test_running_and_archived_controls(monitoring_ui):
+    ui, repo, monitor = monitoring_ui
+    repo.request_run_now(monitor.id, now=BASE)
+    run = repo.claim(BASE)
+    app = ui.app()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert not [b for b in app.button if b.key == 'run_now_' + monitor.id]
+    assert any('Current run may finish' in item.value for item in app.info)
+    app.button(key='toggle_monitor_' + monitor.id).click().run()
+    assert repo.get(monitor.id).status.value == 'PAUSED'
+    assert repo.history(monitor.id)[0].id == run.id
+    app.button(key='archive_' + monitor.id).click().run()
+    app.button(key='confirm_archive_' + monitor.id).click().run()
+    app.checkbox(key='show_archived').check().run()
+    app.button(key='monitor_row_' + monitor.id).click().run()
+    assert not [b for b in app.button if b.key in
+                ('run_now_' + monitor.id, 'toggle_monitor_' + monitor.id)]
+    assert_safe(app)
+
+
 def test_compact_failure_reason_and_blocked_window_are_safe(monitoring_ui):
     ui, repo, monitor = monitoring_ui
     for attempt in range(3):
@@ -108,6 +162,10 @@ def test_compact_failure_reason_and_blocked_window_are_safe(monitoring_ui):
     assert any('ATTENTION / BLOCKED' in item.value and 'INVALID_CURSOR' in item.value
                for item in app.warning)
     assert any('Blocked window:' in item.value for item in app.caption)
+    assert app.button(key='run_now_' + monitor.id).label == 'Retry Now'
+    app.button(key='run_now_' + monitor.id).click().run()
+    assert repo.get(monitor.id).manual_requested_at == BASE
+    assert repo.get(monitor.id).last_successful_end is None
     assert 'password=secret' not in str(app)
     assert 'password=secret' not in str(repo.acquisition_diagnostics(run.id))
     assert_safe(app)

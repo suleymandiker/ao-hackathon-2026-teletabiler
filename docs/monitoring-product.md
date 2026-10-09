@@ -27,10 +27,21 @@ ATTENTION means it did. Failure remains FAILED, and log flow is unknown after
 failure. Flow indicators describe the last acquisition window, including
 bounded overlap, rather than a live check.
 
-Details use Overview, Findings, Runs and Settings. Findings summarize persisted
-qualified signals and incidents. Investigate opens the relevant persisted run.
-Runs are newest first; Investigation and Pipeline Trace live inside selected-run
-details. Opening results never acquires logs or executes analysis.
+Details show compact counters, the latest finding and the ten most recent runs.
+Older runs load only on explicit request. Debug Pipeline is an explicit secondary
+action; opening ordinary details never acquires logs or executes analysis.
+
+Active monitors offer Pause and Run Now; paused monitors offer Resume Now;
+ERROR/BLOCKED monitors offer Retry Now. Pause cancels unclaimed requests; already
+running work may finish safely without reactivating the monitor. Archive behaves
+similarly and preserves historical state. Requests coalesce durably, bypass
+cadence/backoff, and never bypass ingestion safety or skip a pending failed
+window. The worker normally picks them up within its two-second idle poll.
+For a fresh first Run Now, the selected window ends at request time minus ingestion
+delay and overlap, so there is no creation-time window wait. Automatic historical
+backlog scheduling is unchanged when no manual request exists. See
+[operator-control semantics](deployment-monitoring.md#operator-control-and-automatic-scheduling-schema-v6)
+for exact window selection, lifecycle and migration rules.
 
 Settings lock targets after any run history exists. Name and scheduling interval
 remain editable under existing repository rules; changing the interval after

@@ -797,7 +797,7 @@ explicit Refresh or monitor edit. Opening a monitor loads its latest ten compact
 runs and, when present, one latest finding. Older runs load only on request.
 The ordinary detail view does not load Investigation or Pipeline Trace JSON.
 
-The monitoring database schema is version 5. Normal worker execution stores a
+The monitoring database schema is version 6. Normal worker execution stores a
 durable claim before acquisition. After successful processing, one short
 transaction publishes compact run counters, the monitor's latest projection and
 watermark, a bounded baseline ring, up to ten actionable findings, and only the
@@ -856,6 +856,70 @@ repeated non-retryable failures of the same window/reason mark the monitor
 **BLOCKED** and delay its next attempt by at least one hour. The same window
 remains pending and its watermark does not advance. The UI displays only the
 stable reason, attempts, and blocked window. A successful retry clears BLOCKED.
+
+## Operator control and automatic scheduling (schema v6)
+
+Automatic cadence/backoff (`next_run_at`) and operator intent are separate.
+The UI never edits scheduling timestamps to trigger execution. Actions write
+bounded durable control state; only the independent worker runs the pipeline.
+
+| Action | Contract |
+| --- | --- |
+| Pause | Disable new claims and cancel unclaimed requests atomically. An owned run may finish; finalization leaves the monitor PAUSED. |
+| Resume Now | Enable and request execution in one transaction. If an owned run still exists, it continues without queuing another run. |
+| Run Now | Request the next safe window, bypassing automatic cadence. Repeated requests coalesce; requests during an owned run do not queue another run. |
+| Retry Now | Bypass ERROR/BLOCKED backoff for the same pending window and run ID. Reason streak, attempts and watermark are preserved. Failure reapplies backoff. |
+| Archive | Disable and cancel requests; owned work may finish but cannot reactivate the monitor. |
+
+For a fresh monitor with no watermark or claimed window, the first explicit
+request selects this deterministic recent interval, using the durable UTC
+request time `R`, window length `W`, ingestion delay `D`, and overlap `O`:
+
+```text
+logical window = [R - D - O - W, R - D - O)
+safe_at        = logical end + D + O = R
+```
+
+The first coalesced request fixes `R`, including across worker restarts. This
+explicit recent-window action supersedes the configured historical starting
+point only before a first claim; it does not rewrite `initial_start`, creation
+time, cadence or watermark. To process configured historical backlog from the
+start, use ordinary automatic scheduling without a first Run Now request.
+After any claim, the pending interval is pinned. After success, subsequent
+windows start exactly at the watermark. Manual requests cannot skip a failed
+window or make an incomplete next window safe early; they remain pending until
+`window.end + D + O`. The list displays “Run requested” or the remaining source
+safety wait rather than the old cadence/backoff delay.
+
+Additive v6 migration introduces three nullable monitor fields:
+`manual_requested_at`, `pending_window_start`, `pending_window_end`. Existing
+failed/running intervals are backfilled from the authoritative pending window;
+definitions, run IDs, watermarks, receipts, baseline and reason streaks are
+preserved. SQLite internal metadata remains accepted. Deploy the worker/explicit
+initializer before using the new controls; the UI performs no migrations.
+
+Claims consume the request and pin the interval in the same short write
+transaction that establishes run ownership. The unique monitor/window key and
+claim token still fence duplicate/stale workers. Pause, Archive, requests and
+claims serialize through the repository write transaction. Success clears the
+pinned interval atomically with compact publication and watermark advancement;
+failure retains it. Retention protects the pending failed run, even beyond the
+seven-day history horizon, so manual retry retains its identity and reason
+streak. Failed detail may still expire at the existing three-day horizon.
+
+The worker polls every **2 seconds** by default (`--poll-seconds`, range 1–60).
+Idle heartbeat logging remains **60 seconds** (`--heartbeat-seconds`, minimum
+10), independent of polling. There are no polling writes or UI scheduler
+threads. Command pickup is normally within one poll while idle; a currently
+executing window or maintenance operation may delay it because the single
+worker is deliberately not preempted. `--once` uses the same manual/automatic
+eligibility and completeness checks. UI actions acknowledge the request and
+invalidate snapshots; ordinary rerenders never resubmit commands.
+
+`set_enabled()` remains a lifecycle-only compatibility API and does not change
+cadence. Product resume paths use `resume_now()`; Run/Retry Now use
+`request_run_now()`. `next_window()` and `ready_at()` are the shared domain
+authority for claims, schedule summaries and countdown presentation.
 
 ## Validation and next phase
 

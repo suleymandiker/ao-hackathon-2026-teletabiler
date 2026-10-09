@@ -82,7 +82,7 @@ def test_create_read_edit_and_schema_is_separate(repo):
                          revision=monitor.revision, now=BASE)
     assert repo.list() == [edited]
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
         assert {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {
             'monitors', 'monitor_runs', 'monitor_results', 'monitor_receipts',
             'monitor_run_metrics', 'monitor_pattern_metrics', 'monitor_acquisition_shards',
@@ -106,7 +106,7 @@ def test_v2_migration_preserves_results_and_defaults_diagnostics(repo):
     assert reopened.get(monitor.id).last_successful_end == run.window.end
     assert reopened.acquisition_diagnostics(run.id) is None
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
         assert db.execute('SELECT * FROM monitor_runs').fetchone()[:15] == stored[:15]
 
 
@@ -249,7 +249,7 @@ def test_v1_migration_defaults_existing_monitors_and_preserves_all_audit_rows(re
     assert migrated.result(calls[0].id) == repo.result(calls[0].id)
     assert migrated.history(monitor.id) == repo.history(monitor.id)
     with sqlite3.connect(legacy_path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
         for table, records in before.items():
             rows = db.execute(f'SELECT * FROM {table}').fetchall()
             assert ([row[:15] for row in rows] if table == 'monitor_runs' else rows) == (
@@ -1417,7 +1417,7 @@ def test_legacy_monitor_json_keeps_alias_and_history_without_migration(repo, sou
     assert reopened.history(monitor.id)[0].definition == loaded.definition
     reopened.update(monitor.id, replace(loaded.definition, name='renamed'), revision=loaded.revision, now=BASE)
     with sqlite3.connect(repo.path) as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 6
         assert db.execute('SELECT * FROM monitor_runs WHERE id=?', (run.id,)).fetchone() == history_before
         assert db.execute('SELECT * FROM monitor_results WHERE run_id=?', (run.id,)).fetchone() == result_before
     # A separate legacy definition that has never run uses the corrected scope.

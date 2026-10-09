@@ -37,7 +37,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--once', action='store_true', help='One scheduler tick; at most --max-runs bounded runs')
     parser.add_argument('--max-runs', type=int, default=1, choices=range(1, 101), metavar='1..100')
-    parser.add_argument('--poll-seconds', type=int, default=10, choices=range(1, 61), metavar='1..60')
+    parser.add_argument('--poll-seconds', type=int, default=2, choices=range(1, 61), metavar='1..60',
+                        help='Scheduler/operator-request poll interval (default: 2 seconds)')
     parser.add_argument('--heartbeat-seconds', type=int, default=60, choices=range(10, 3601), metavar='10..3600')
     args = parser.parse_args(argv)
     load_environment()

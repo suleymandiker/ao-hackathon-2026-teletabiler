@@ -41,6 +41,54 @@ def events(capsys):
     return [json.loads(line[len('[MONITOR] '):]) for line in output]
 
 
+@pytest.mark.parametrize('once', [True, False])
+def test_manual_request_pickup_uses_two_second_poll_not_heartbeat(
+        worker_module, tmp_path, monkeypatch, capsys, once):
+    from monitoring.domain import RunCounts, safe_at
+    from monitoring.execution import ExecutionResult
+    from monitoring.repository import SQLiteMonitorRepository
+
+    repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
+    monitor = repo.create(definition(), enabled=True, now=NOW)
+    monkeypatch.setattr(worker_module, 'database_path', lambda: repo.path)
+    monkeypatch.setattr(worker_module, 'SQLiteMonitorRepository', lambda path, **kwargs: repo)
+    clock = [NOW]
+    elapsed = [0]
+    calls, sleeps = [], []
+    monkeypatch.setattr(worker_module, 'system_clock', lambda: clock[0])
+    monkeypatch.setattr(worker_module, 'monotonic_clock', lambda: elapsed[0])
+
+    class Executor:
+        def execute(self, run, consumed):
+            calls.append(run)
+            assert safe_at(run.window, run.definition) <= clock[0]
+            return ExecutionResult({'source_summary': {}}, RunCounts(), {},
+                                   metrics={'total_physical_logs': 0}, pattern_metrics=())
+
+    monkeypatch.setattr(worker_module, 'OpenSearchMonitorExecutor', lambda *a, **kw: Executor())
+
+    def sleep(seconds):
+        assert seconds == 2
+        sleeps.append(seconds)
+        elapsed[0] += seconds
+        clock[0] += timedelta(seconds=seconds)
+        if len(sleeps) == 1:
+            repo.request_run_now(monitor.id, now=clock[0])
+        if len(sleeps) == 3:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker_module.time, 'sleep', sleep)
+    if once:
+        repo.request_run_now(monitor.id, now=NOW)
+    assert worker_module.main(['--once'] if once else []) == 0
+    assert len(calls) == 1
+    assert sleeps == ([] if once else [2, 2, 2])
+    assert repo.get(monitor.id).last_successful_end == calls[0].window.end
+    logged = events(capsys)
+    assert sum(row['event'] == 'WORKER_IDLE' for row in logged) == (0 if once else 1)
+    assert sum(row['event'] == 'SUCCESS' for row in logged) == 1
+
+
 def test_schedule_summary_is_read_only_and_uses_claim_readiness(tmp_path):
     from monitoring.repository import SQLiteMonitorRepository
 
