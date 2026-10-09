@@ -42,6 +42,22 @@ NON_RETRYABLE_ACQUISITION_REASONS = ACQUISITION_REASONS - frozenset({
     'CONNECTION_TIMEOUT', 'SEARCH_TIMEOUT', 'HTTP_429', 'HTTP_5XX', 'SHARD_FAILURE',
 })
 
+# Fixed structural diagnostics only. Never copy failed record values or exception text.
+ACQUISITION_VALIDATION = {
+    'TIMESTAMP': frozenset({'INVALID_FORMAT', 'OUTSIDE_RETRIEVAL'}),
+    'STREAM_IDENTITY': frozenset({'REQUIRED_COMPONENT_MISSING', 'NAMESPACE_MISMATCH',
+                                  'WORKLOAD_MISMATCH', 'CONTAINER_MISMATCH'}),
+    'SOURCE_SCOPE': frozenset({'SOURCE_PROFILE_MISMATCH', 'DOCUMENT_CLUSTER_MISMATCH'}),
+    'PAGE_HANDOFF': frozenset({'EMPTY_PAGE_STREAM', 'COUNT_MISMATCH'}),
+}
+
+
+def safe_acquisition_validation(site, reason):
+    if (type(site) is str and type(reason) is str and
+            reason in ACQUISITION_VALIDATION.get(site, ())):
+        return {'validation_site': site, 'validation_reason': reason}
+    return {}
+
 
 def safe_pipeline_stage(stage):
     return stage if isinstance(stage, str) and stage in PIPELINE_STAGES else 'pipeline_execution'
@@ -129,9 +145,13 @@ def safe_pipeline_details(diagnostics):
 
 
 class MonitoringError(Exception):
-    def __init__(self, category, *, reason_code=None, stage=None):
+    def __init__(self, category, *, reason_code=None, stage=None,
+                 validation_site=None, validation_reason=None):
         self.category = category if category in MESSAGES else 'UNKNOWN'
         self.reason_code = reason_code if reason_code in ACQUISITION_REASONS else None
         self.retryable = self.reason_code in ACQUISITION_REASONS - NON_RETRYABLE_ACQUISITION_REASONS
         self.stage = stage if stage in PIPELINE_STAGES else None
+        validation = safe_acquisition_validation(validation_site, validation_reason)
+        self.validation_site = validation.get('validation_site')
+        self.validation_reason = validation.get('validation_reason')
         super().__init__(MESSAGES[self.category])

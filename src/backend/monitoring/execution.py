@@ -12,7 +12,8 @@ from ingestion_layer.opensearch_source import (OpenSearchSource, OpenSearchSourc
 from ingestion_layer.opensearch_indices import resolve_index_expression
 from monitoring.domain import MonitorRun, RunCounts
 from monitoring.boundary_quality import build_boundary_quality
-from monitoring.errors import MonitoringError, safe_failure_details, ACQUISITION_REASONS, safe_pipeline_stage
+from monitoring.errors import (MonitoringError, safe_failure_details, ACQUISITION_REASONS,
+                               safe_pipeline_stage, safe_acquisition_validation)
 from monitoring.identity import reference_key
 from monitoring.trace import TraceCollector
 from monitoring.metrics_source import OpenSearchMetricsSource
@@ -186,7 +187,8 @@ class OpenSearchMonitorExecutor:
             nonlocal pipeline_stage
             pipeline_stage = stage
 
-        def failure(category, *, error=None, reason_code=None, stage=None):
+        def failure(category, *, error=None, reason_code=None, stage=None,
+                    validation_site=None, validation_reason=None):
             if acquisition is not None:
                 summary.update(pages_read=acquisition.pages_read,
                                records_read=acquisition.records_read,
@@ -213,8 +215,11 @@ class OpenSearchMonitorExecutor:
             if category.startswith('OPENSEARCH'):
                 summary['error_stage'] = safe_pipeline_stage(
                     stage or (shard_failure or {}).get('error_stage') or pipeline_stage)
+                summary.update(safe_acquisition_validation(validation_site, validation_reason))
             error = MonitoringError(category, reason_code=reason_code,
-                                    stage=summary.get('error_stage'))
+                                    stage=summary.get('error_stage'),
+                                    validation_site=validation_site,
+                                    validation_reason=validation_reason)
             safe_summary = {key: value for key, value in summary.items()
                             if key not in ('effective_query', 'query', 'request_body', 'response_body')}
             error.acquisition_diagnostics = redact_ai_secret(
@@ -280,16 +285,39 @@ class OpenSearchMonitorExecutor:
                                     identity = record.stream_identity
                                     if stamp is None:
                                         raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
-                                                              stage='content_acquisition')
-                                    if (not start <= stamp < end or identity is None or
-                                            record.source_reference.source_scope != config.source_scope or
-                                            identity.namespace != definition.namespace or
-                                            identity.workload != definition.workload or
-                                            (definition.container and identity.container != definition.container) or
-                                            (definition.document_cluster_id and
-                                             identity.source_scope != definition.document_cluster_id)):
+                                                              stage='content_acquisition',
+                                                              validation_site='TIMESTAMP',
+                                                              validation_reason='INVALID_FORMAT')
+                                    if not start <= stamp < end:
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_TIMESTAMP',
+                                                              stage='content_acquisition',
+                                                              validation_site='TIMESTAMP',
+                                                              validation_reason='OUTSIDE_RETRIEVAL')
+                                    if identity is None:
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='MISSING_REQUIRED_FIELD',
+                                                              stage='content_acquisition',
+                                                              validation_site='STREAM_IDENTITY',
+                                                              validation_reason='REQUIRED_COMPONENT_MISSING')
+                                    if record.source_reference.source_scope != config.source_scope:
                                         raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                              stage='content_acquisition')
+                                                              stage='content_acquisition',
+                                                              validation_site='SOURCE_SCOPE',
+                                                              validation_reason='SOURCE_PROFILE_MISMATCH')
+                                    for field, reason in (('namespace', 'NAMESPACE_MISMATCH'),
+                                                          ('workload', 'WORKLOAD_MISMATCH'),
+                                                          ('container', 'CONTAINER_MISMATCH')):
+                                        expected = getattr(definition, field)
+                                        if expected is not None and getattr(identity, field) != expected:
+                                            raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                                  stage='content_acquisition',
+                                                                  validation_site='STREAM_IDENTITY',
+                                                                  validation_reason=reason)
+                                    if (definition.document_cluster_id is not None and
+                                            identity.source_scope != definition.document_cluster_id):
+                                        raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
+                                                              stage='content_acquisition',
+                                                              validation_site='SOURCE_SCOPE',
+                                                              validation_reason='DOCUMENT_CLUSTER_MISMATCH')
                                     key = reference_key(record)
                                     repeated = ledger.seen(key, stamp.isoformat())
                                     trace.acquisition(record, timestamp=stamp,
@@ -327,7 +355,9 @@ class OpenSearchMonitorExecutor:
                         if not buffered_pages:
                             if first_empty is None:
                                 raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                                      stage='content_acquisition')
+                                                      stage='content_acquisition',
+                                                      validation_site='PAGE_HANDOFF',
+                                                      validation_reason='EMPTY_PAGE_STREAM')
                             buffered_pages = [first_empty]
                         if sample and metrics.total:
                             mark_pipeline_stage('policy_resolution')
@@ -366,7 +396,9 @@ class OpenSearchMonitorExecutor:
                             raise MonitoringError('POLICY')
                     if unique_inside_window != metrics.total:
                         raise MonitoringError('OPENSEARCH_QUERY', reason_code='INVALID_RESPONSE',
-                                              stage='content_acquisition')
+                                              stage='content_acquisition',
+                                              validation_site='PAGE_HANDOFF',
+                                              validation_reason='COUNT_MISMATCH')
                     summary.update(pages_read=acquisition.pages_read,
                                    records_read=acquisition.records_read,
                                    unique_records=unique, duplicate_records=duplicates,
@@ -411,7 +443,9 @@ class OpenSearchMonitorExecutor:
                                            sanitize(compact),
                                            tuple(sanitize(item) for item in accumulator.pattern_metrics()))
         except MonitoringError as error:
-            raise failure(error.category, reason_code=error.reason_code, stage=error.stage) from None
+            raise failure(error.category, reason_code=error.reason_code, stage=error.stage,
+                          validation_site=error.validation_site,
+                          validation_reason=error.validation_reason) from None
         except OpenSearchClientError as error:
             category = ('OPENSEARCH_AUTH' if error.reason_code == 'AUTH_FAILURE'
                         else 'OPENSEARCH_TIMEOUT' if error.reason_code == 'CONNECTION_TIMEOUT'

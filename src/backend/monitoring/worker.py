@@ -4,7 +4,8 @@ import json
 import time
 from typing import Callable
 
-from monitoring.errors import MonitoringError, safe_pipeline_details, ACQUISITION_REASONS
+from monitoring.errors import (MonitoringError, safe_pipeline_details, ACQUISITION_REASONS,
+                               safe_acquisition_validation)
 from monitoring.repository import MonitorRepository
 
 
@@ -99,6 +100,9 @@ class MonitorWorker:
                     if stage in ('source_setup', 'metrics_acquisition', 'shard_planning',
                                  'content_acquisition'):
                         details['error_stage'] = stage
+                    if isinstance(diagnostics, dict):
+                        details.update(safe_acquisition_validation(
+                            diagnostics.get('validation_site'), diagnostics.get('validation_reason')))
                 self.log('FAILED', run_id=run.id, category=category, **details)
             finally:
                 receipt_state = getattr(result, 'receipts', None)

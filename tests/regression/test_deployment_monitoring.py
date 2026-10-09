@@ -627,7 +627,18 @@ def test_streaming_pipeline_failure_persists_only_stage_and_exception_type(
     assert retry.id == run.id and retry.window == run.window
 
 
-def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(repo, monkeypatch):
+@pytest.mark.parametrize('violation,reason,site,detail', [
+    ('timestamp_format', 'INVALID_TIMESTAMP', 'TIMESTAMP', 'INVALID_FORMAT'),
+    ('timestamp', 'INVALID_TIMESTAMP', 'TIMESTAMP', 'OUTSIDE_RETRIEVAL'),
+    ('identity', 'MISSING_REQUIRED_FIELD', 'STREAM_IDENTITY', 'REQUIRED_COMPONENT_MISSING'),
+    ('profile', 'INVALID_RESPONSE', 'SOURCE_SCOPE', 'SOURCE_PROFILE_MISMATCH'),
+    ('namespace', 'INVALID_RESPONSE', 'STREAM_IDENTITY', 'NAMESPACE_MISMATCH'),
+    ('workload', 'INVALID_RESPONSE', 'STREAM_IDENTITY', 'WORKLOAD_MISMATCH'),
+    ('container', 'INVALID_RESPONSE', 'STREAM_IDENTITY', 'CONTAINER_MISMATCH'),
+    ('cluster', 'INVALID_RESPONSE', 'SOURCE_SCOPE', 'DOCUMENT_CLUSTER_MISMATCH'),
+])
+def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(
+        repo, monkeypatch, violation, reason, site, detail):
     import monitoring.execution as execution
     from ingestion_layer.opensearch_config import OpenSearchConfig, OpenSearchFieldMapping
     from monitoring.metrics_source import WindowMetrics
@@ -637,7 +648,21 @@ def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(repo, 
     events = []
     secret = 'synthetic-private-source-value'
     bad = record('left', 3, secret)
-    bad = replace(bad, stream_identity=replace(bad.stream_identity, namespace='wrong'))
+    bad = replace(bad, stream_identity=replace(bad.stream_identity, source_scope=DOCUMENT_UUID),
+                  metadata=(('query', 'synthetic-private-query'),
+                            ('response_body', 'synthetic-private-response'),
+                            ('Authorization', 'synthetic-private-header')))
+    if violation == 'timestamp_format':
+        bad = replace(bad, source_timestamp_raw='synthetic-invalid-time')
+    elif violation == 'timestamp':
+        bad = replace(bad, source_timestamp_raw=(BASE - timedelta(minutes=2)).isoformat())
+    elif violation == 'identity':
+        bad = replace(bad, stream_identity=None)
+    elif violation == 'profile':
+        bad = replace(bad, source_reference=replace(bad.source_reference, source_scope='other-profile'))
+    else:
+        field = 'source_scope' if violation == 'cluster' else violation
+        bad = replace(bad, stream_identity=replace(bad.stream_identity, **{field: 'other-value'}))
     class Client:
         def __enter__(self):
             return self
@@ -674,7 +699,7 @@ def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(repo, 
         connection_loader=lambda size: config, client_factory=lambda cfg: Client(),
         source_factory=lambda client: object(), repository=repo,
         log=lambda event, **values: logs.append((event, values)))
-    monitor = repo.create(definition(), enabled=True, now=BASE)
+    monitor = repo.create(definition(container='main', document_cluster_id=DOCUMENT_UUID), enabled=True, now=BASE)
     worker = MonitorWorker(repo, executor, clock=lambda: BASE + timedelta(minutes=17),
                            log=lambda event, **values: logs.append((event, values)))
     assert worker.tick() == 0
@@ -685,16 +710,38 @@ def test_completed_left_shard_handoff_failure_keeps_safe_reason_and_stage(repo, 
     with repo._read_connection() as db:
         row = db.execute('SELECT safe_reason_code,error_stage FROM monitor_runs WHERE id=?',
                          (run.id,)).fetchone()
-        assert tuple(row) == ('INVALID_RESPONSE', 'content_acquisition')
+        assert tuple(row) == (reason, 'content_acquisition')
         assert db.execute('SELECT count(*) FROM monitor_baseline_state').fetchone()[0] == 0
         assert db.execute('SELECT count(*) FROM monitor_findings').fetchone()[0] == 0
     diagnostics = repo.acquisition_diagnostics(run.id)
-    assert diagnostics['reason_code'] == 'INVALID_RESPONSE'
+    assert diagnostics['reason_code'] == reason
     assert diagnostics['error_stage'] == 'content_acquisition'
+    assert (diagnostics['validation_site'], diagnostics['validation_reason']) == (site, detail)
     assert diagnostics['last_shard']['status'] == 'COMPLETE'
     assert ('FAILED', {'run_id': run.id, 'category': 'OPENSEARCH_QUERY',
-            'safe_reason_code': 'INVALID_RESPONSE', 'error_stage': 'content_acquisition'}) in logs
-    assert secret not in str(logs) + str(diagnostics)
+            'safe_reason_code': reason, 'error_stage': 'content_acquisition',
+            'validation_site': site, 'validation_reason': detail}) in logs
+    stored_and_logged = str(logs) + str(diagnostics)
+    for private in (secret, 'other-value', 'synthetic-private-query',
+                    'synthetic-private-response', 'synthetic-private-header',
+                    'test-password', 'test-user'):
+        assert private not in stored_and_logged
+    assert repo.claim(BASE + timedelta(minutes=18)) is None
+    retry = repo.claim(BASE + timedelta(minutes=33))
+    assert retry.id == run.id and retry.window == run.window
+    if violation == 'namespace':
+        repo.fail(retry, 'OPENSEARCH_QUERY', now=BASE + timedelta(minutes=33),
+                  diagnostics=diagnostics)
+        third = repo.claim(BASE + timedelta(minutes=49))
+        assert third.id == run.id and third.window == run.window
+        repo.fail(third, 'OPENSEARCH_QUERY', now=BASE + timedelta(minutes=49),
+                  diagnostics=diagnostics)
+        assert repo.get(monitor.id).status.value == 'BLOCKED'
+        assert repo.get(monitor.id).last_successful_end is None
+        assert repo.claim(BASE + timedelta(minutes=50)) is None
+        with repo._read_connection() as db:
+            assert db.execute('SELECT reason_streak FROM monitor_runs WHERE id=?',
+                              (run.id,)).fetchone()[0] == 3
 
 
 @pytest.mark.parametrize('guard,constant,reason,original_limit', [

@@ -857,6 +857,14 @@ repeated non-retryable failures of the same window/reason mark the monitor
 remains pending and its watermark does not advance. The UI displays only the
 stable reason, attempts, and blocked window. A successful retry clears BLOCKED.
 
+Content handoff failures carry fixed `validation_site` and `validation_reason`
+codes where the branch is known. They distinguish timestamp, stream identity,
+source scope, and page handoff checks after a completed shard yields its pages.
+These codes contain no record, query, response, or exception values. A completed
+child shard followed by `INVALID_RESPONSE` before the next child starts narrows
+the static path to record validation; the particular live condition requires the
+next safe site/reason diagnostic. Failure and watermark behavior are unchanged.
+
 ## Operator control and automatic scheduling (schema v6)
 
 Automatic cadence/backoff (`next_run_at`) and operator intent are separate.

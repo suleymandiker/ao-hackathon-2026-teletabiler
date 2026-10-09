@@ -696,8 +696,14 @@ class SQLiteMonitorRepository:
             # Executor already removes runtime credentials. Reapply the existing
             # safe projection at the storage boundary for alternate callers.
             from opensearch_application import presentation_result
+            from monitoring.errors import safe_acquisition_validation
             safe = {key: value for key, value in diagnostics.items()
-                    if key not in ('effective_query', 'query', 'request_body', 'response_body')}
+                    if type(key) is str and key.lower() not in (
+                        'effective_query', 'query', 'request_body', 'response_body',
+                        'raw_hit', 'hit', 'source_record', 'headers',
+                        'exception_message', 'exception', 'validation_site', 'validation_reason')}
+            safe.update(safe_acquisition_validation(diagnostics.get('validation_site'),
+                                                    diagnostics.get('validation_reason')))
             payload = encode(presentation_result({}, safe, None)['source_summary'])
         now = utc(now)
         from monitoring.errors import (ACQUISITION_REASONS, NON_RETRYABLE_ACQUISITION_REASONS,
