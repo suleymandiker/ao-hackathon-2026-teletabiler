@@ -637,6 +637,16 @@ class SQLiteMonitorRepository:
         findings = _compact_findings(run, result, now)
         metric_payload = _baseline_metric(metrics)
         pattern_payload = _baseline_patterns(patterns)
+        recount = metrics.get('metrics_recount')
+        if (not isinstance(recount, dict) or
+                type(recount.get('metrics_count_before')) is not int or
+                type(recount.get('unique_inside_window')) is not int or
+                (recount.get('metrics_count_after') is not None and
+                 type(recount.get('metrics_count_after')) is not int)):
+            recount = None
+        else:
+            recount = {key: recount[key] for key in (
+                'metrics_count_before', 'metrics_count_after', 'unique_inside_window')}
         with self._transaction() as db:
             if not self._owned(db, run):
                 raise ValueError('Run claim no longer owned')
@@ -657,10 +667,10 @@ class SQLiteMonitorRepository:
             duration_ms = max(0, int((now - run.actual_started_at).total_seconds() * 1000))
             db.execute('''UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,
                 physical_logs=?,pattern_count=?,duration_ms=?,result_reference=NULL,
-                error_category=NULL,error_summary=NULL,acquisition_diagnostics=NULL,
+                error_category=NULL,error_summary=NULL,acquisition_diagnostics=?,
                 error_stage=NULL,safe_reason_code=NULL,reason_streak=0 WHERE id=?''',
                 (now.isoformat(), encode(asdict(counts)), int(metrics['total_physical_logs']),
-                 len(patterns), duration_ms, run.id))
+                 len(patterns), duration_ms, encode(recount) if recount is not None else None, run.id))
             following = Window(run.window.end, run.window.end + timedelta(seconds=monitor.definition.window_seconds))
             due = now if safe_at(following, monitor.definition) <= now else max(
                 safe_at(following, monitor.definition), now + timedelta(seconds=monitor.definition.interval_seconds))

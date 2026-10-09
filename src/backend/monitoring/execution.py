@@ -393,6 +393,22 @@ class OpenSearchMonitorExecutor:
                             if self.read_only:
                                 arguments['persist_learning'] = False
                             result = self.pipeline_factory().process_ingested_pages(selected_pages(), **arguments)
+                    metrics_count_after = None
+                    if stream_exhausted:
+                        try:
+                            recount = metrics_source.count(
+                                run.window.start, run.window.end, definition)
+                            if type(recount) is int and recount >= 0:
+                                metrics_count_after = recount
+                        except Exception:
+                            # This second read is diagnostic only. The original exact
+                            # metrics count remains the success/failure authority.
+                            pass
+                    summary['metrics_recount'] = {
+                        'metrics_count_before': metrics.total,
+                        'metrics_count_after': metrics_count_after,
+                        'unique_inside_window': unique_inside_window,
+                    }
                     mark_pipeline_stage('result_building')
                     if result.get('ingestion_diagnostics', {}).get('unassembled_count', 0):
                         reasons = result['ingestion_diagnostics'].get('unassembled_by_reason', {})
@@ -444,6 +460,7 @@ class OpenSearchMonitorExecutor:
                     compact = metrics.to_dict()
                     compact.update(parsed_events=accumulator.parsed_events,
                                    logical_events=stats.get('segmented', 0),
+                                   metrics_recount=summary['metrics_recount'],
                                    severity_counts=dict(accumulator.severity_counts),
                                    error_pods=accumulator.error_pods,
                                    error_containers=accumulator.error_containers,

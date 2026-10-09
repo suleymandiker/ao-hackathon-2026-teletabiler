@@ -21,11 +21,13 @@ from monitoring.worker import MonitorWorker
 BASE = datetime(2026, 10, 9, 4, 17, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize('consume_all,duplicate_cross_shard',
-                         [(True, False), (False, False), (True, True)])
+@pytest.mark.parametrize('consume_all,duplicate_cross_shard,recount_fails',
+                         [(True, False, False), (False, False, False),
+                          (True, True, False), (True, False, True), (True, True, True)])
 def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, monkeypatch,
                                                                       consume_all,
-                                                                      duplicate_cross_shard):
+                                                                      duplicate_cross_shard,
+                                                                      recount_fails):
     import monitoring.execution as execution
 
     repo = SQLiteMonitorRepository(tmp_path / 'monitor.sqlite3', compact_mode=True)
@@ -35,6 +37,7 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
     run_end = BASE + timedelta(minutes=15)
     retrieval_start = BASE - timedelta(minutes=1)
     events = []
+    recount_windows = []
 
     class Client:
         def __enter__(self):
@@ -53,6 +56,11 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
             return WindowMetrics(36_000, (), {}, {}, 0, 0, True, True, {})
 
         def count(self, start, end, definition):
+            if start == BASE and end == run_end:
+                recount_windows.append((start, end))
+                if recount_fails:
+                    raise RuntimeError('synthetic-private-recount-error')
+                return 36_001
             return 1200 if BASE <= start and end <= run_end else 0
 
     class Source:
@@ -113,12 +121,19 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
          values.get('exception_type'), values.get('exception_file'), values.get('exception_line'))
         for event, values in events if event == 'FAILED']
     run = repo.history(monitor.id)[0]
+    assert recount_windows == ([(BASE, run_end)] if consume_all else [])
     if consume_all and not duplicate_cross_shard:
         assert run.status.value == 'SUCCESS'
         assert (run.counts.events_retrieved, run.counts.unique_records) == (36_000, 36_000)
         assert repo.get(monitor.id).last_successful_end == run_end
         assert sum(event == 'ACQUISITION_SHARD_COMPLETE' for event, _ in events) == 34
         assert not any(event == 'FAILED' for event, _ in events)
+        recount = repo.acquisition_diagnostics(run.id)
+        assert recount == {'metrics_count_before': 36_000,
+                           'metrics_count_after': None if recount_fails else 36_001,
+                           'unique_inside_window': 36_000}
+        assert 'metrics_recount' not in repo.successful_metrics(
+            monitor.id, run_end + timedelta(seconds=1))[0]
     else:
         assert run.status.value == 'FAILED' and repo.get(monitor.id).last_successful_end is None
         assert repo.acquisition_diagnostics(run.id).get('validation_site') == 'PAGE_HANDOFF', (
@@ -126,6 +141,11 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
             repo.acquisition_diagnostics(run.id).get('error_stage'))
         assert repo.acquisition_diagnostics(run.id)['validation_reason'] == 'COUNT_MISMATCH'
         count = repo.acquisition_diagnostics(run.id)['count_mismatch']
+        assert repo.acquisition_diagnostics(run.id)['metrics_recount'] == {
+            'metrics_count_before': 36_000,
+            'metrics_count_after': 36_001 if consume_all and not recount_fails else None,
+            'unique_inside_window': 35_999 if duplicate_cross_shard else count['unique_inside_window'],
+        }
         assert set(count) == {'metrics_total', 'unique_inside_window', 'unique_total',
                               'duplicate_records', 'acquisition', 'stream_exhausted',
                               'last_shard'}
@@ -147,6 +167,8 @@ def test_valid_records_and_incomplete_page_handoff_are_distinguished(tmp_path, m
             count['duplicate_records'], *count['acquisition'].values()))
         assert 'synthetic-private-log-body' not in str(repo.acquisition_diagnostics(run.id))
         assert 'synthetic-private-log-body' not in str(events)
+        assert 'synthetic-private-recount-error' not in str(repo.acquisition_diagnostics(run.id))
+        assert 'synthetic-private-recount-error' not in str(events)
         assert 'next_cursor' not in str(repo.acquisition_diagnostics(run.id))
         assert any(event == 'FAILED' and values.get('validation_reason') == 'COUNT_MISMATCH'
                    for event, values in events)
