@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 from data_paths import policy_data_dir
 
 
@@ -45,10 +46,21 @@ class ParserPolicyRegistry:
                 )
             """)
 
-    def get(self, signature):
+    def get(
+        self,
+        signature: str,
+        required_version: Optional[str] = None,
+        **kwargs
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Kayıtlı ayrıştırma politikasını bellekten veya SQLite'tan getirir."""
         policy = self._memory.get(signature)
         if policy is not None:
+            if required_version is not None:
+                policy_ver = policy.get("_policy_schema_version") or policy.get("version")
+                if policy_ver and policy_ver != required_version:
+                    return None, "version_mismatch"
             return dict(policy), "memory"
+
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT policy_json FROM parser_policies WHERE signature=? AND verified=1",
@@ -56,16 +68,27 @@ class ParserPolicyRegistry:
             ).fetchone()
             if not row:
                 return None, None
+
             now = time.time()
             conn.execute(
                 "UPDATE parser_policies SET hits=hits+1,last_used=? WHERE signature=?",
                 (now, signature),
             )
-        policy = json.loads(row[0])
+
+        try:
+            policy = json.loads(row[0])
+        except Exception:
+            return None, "corrupt"
+
+        if required_version is not None:
+            policy_ver = policy.get("_policy_schema_version") or policy.get("version")
+            if policy_ver and policy_ver != required_version:
+                return None, "version_mismatch"
+
         self._memory[signature] = policy
         return dict(policy), "sqlite"
 
-    def save(self, signature, policy, source, validation_success=1.0):
+    def save(self, signature, policy, source, validation_success=1.0, **kwargs):
         now = time.time()
         payload = json.dumps(policy, ensure_ascii=False, separators=(",", ":"))
         with self._lock, self._connect() as conn:

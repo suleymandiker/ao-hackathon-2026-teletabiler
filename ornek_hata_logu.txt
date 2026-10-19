@@ -1,0 +1,7 @@
+TIME=[2026-10-17T20:10:01.120Z] LEVEL=[ERROR] COMP=[BillingEngine] MSG=[Failed to process invoice #9012: Gateway Timeout]
+TIME=[2026-10-17T20:10:01.340Z] LEVEL=[WARN] COMP=[BillingEngine] MSG=[Retrying invoice #9012 with fallback provider]
+TIME=[2026-10-17T20:10:01.890Z] LEVEL=[ERROR] COMP=[BillingEngine] MSG=[Fallback provider also timed out (status 504)]
+TIME=[2026-10-17T20:10:02.100Z] LEVEL=[CRITICAL] COMP=[BillingEngine] MSG=[Invoice #9012 marked as FAILED - DB state inconsistent]
+TIME=[2026-10-17T20:10:02.450Z] LEVEL=[INFO] COMP=[BillingEngine] MSG=[Alert notification dispatched to ops on-call]
+TIME=[2026-10-17T20:10:02.890Z] LEVEL=[ERROR] COMP=[PaymentService] MSG=[Failed to acquire lock for account ACC-4421]
+TIME=[2026-10-17T20:10:03.110Z] LEVEL=[CRITICAL] COMP=[PaymentService] MSG=[Deadlock detected on resource balance_table]

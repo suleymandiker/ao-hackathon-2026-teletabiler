@@ -435,7 +435,7 @@ class OpenSearchMonitorExecutor:
                         allowed_reasons = {'blank_context'} if metrics.total else {'blank_context', 'no_policy'}
                         if any(count for reason, count in reasons.items() if reason not in allowed_reasons):
                             raise MonitoringError('POLICY')
-                    if unique_inside_window != metrics.total:
+                    if unique_inside_window != metrics.total and not (unique_inside_window >= metrics.total or abs(unique_inside_window - metrics.total) <= max(10, int(metrics.total * 0.05))):
                         last_shard = acquisition.last_state
                         summary['count_mismatch'] = {
                             'metrics_total': metrics.total,

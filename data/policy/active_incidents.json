@@ -1,0 +1,26 @@
+{
+  "unknown:application": {
+    "incident_id": "inc:47ca119c",
+    "first_seen_ms": 1792442161581,
+    "last_seen_ms": 1792444272796,
+    "count": 8
+  },
+  "unknown:database": {
+    "incident_id": "inc:d83026fc",
+    "first_seen_ms": 1792442557934,
+    "last_seen_ms": 1792442557962,
+    "count": 5
+  },
+  "unknown:external_io": {
+    "incident_id": "inc:5388a069",
+    "first_seen_ms": 1792443081959,
+    "last_seen_ms": 1792444920081,
+    "count": 7
+  },
+  "aida-document-digest-consumer-dds:external_io": {
+    "incident_id": "inc:deddb65b",
+    "first_seen_ms": 1792443623807,
+    "last_seen_ms": 1792444523807,
+    "count": 1
+  }
+}

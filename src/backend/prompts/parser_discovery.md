@@ -14,25 +14,21 @@ Return ONLY one valid JSON object with exactly these policy fields:
   "attribute_groups": {}
 }
 
-Rules:
-- "regex" MUST start with ^ and describe the stable structure shared by the samples.
-- The regex MUST be valid for Python's built-in `re` module.
-- Prefer named regex groups and ALWAYS use Python syntax `(?P<name>...)`.
-- NEVER use PCRE/.NET named-group syntax `(?<name>...)`.
-- Every *_group value must be the matching regex group name, or a numeric group index as a string. Use null when that field is absent.
-- "attribute_groups" maps canonical attribute names to regex group names/indexes. Use {} when no useful attributes are explicitly present.
-- Extract only fields explicitly present in the log. Never invent values.
-- timestamp_group should capture the complete timestamp text that should be normalized by the deterministic runtime.
-- A timestamp may still be worth capturing when it lacks timezone/year context; the deterministic runtime may intentionally normalize it to null. Do not omit an explicit source timestamp merely because it is nonabsolute.
-- severity_group should capture the source severity token. Do not normalize it in the regex.
-- message_group should capture the actual message/body, excluding the structural header when possible.
-- component_group is for an explicit logger/tag/component name in the source.
-- host_group and service_group are only for explicit source fields, never inferred context.
-- trace_id_group and span_id_group are only for explicit trace/span identifiers.
-- Useful event-specific values such as pid, tid, request_id, client_ip, http_status, method, path, port, thread, or error codes may go into attribute_groups when structurally stable.
-- For Android/logcat-like lines such as "03-17 16:13:38.811  1702  2395 D WindowManager: message", capture the timestamp, pid, tid, one-letter severity, component/tag, and message.
-- The policy must work deterministically across the sample set, not only the first line.
-- Do not return markdown, prose, comments, or multiple alternatives.
+RULES:
+1. **Anchor & Scope:** "regex" MUST start with `^` and match the stable single-line header of each event across ALL samples.
+2. **Python `re` Compatibility:** The regex MUST be fully compilable with Python's built-in `re` module.
+3. **CRITICAL JSON ESCAPING:** All regex backslashes MUST be double-escaped in the JSON string (e.g. use `"\\\\d{4}"`, `"\\\\s+"`, `"\\\\b"`). Single unescaped backslashes like `\d` are INVALID JSON.
+4. **Group Syntax:** Prefer named groups using strict Python syntax `(?P<name>...)`. Group names must be valid Python identifiers (alphanumeric and underscore only, NO hyphens, cannot start with a digit). NEVER use PCRE syntax `(?<name>...)`.
+5. **Group Mappings:** Every `*_group` value must be the matching regex group name as a string, or `null` if that field does not exist in the log structure.
+6. **Field Boundaries:**
+   - `timestamp_group`: Capture the raw timestamp string to be normalized by runtime.
+   - `severity_group`: Capture the raw severity token (ERROR, WARN, INFO, D, etc.). Do not normalize in regex.
+   - `message_group`: Capture the primary message body, excluding headers.
+   - `component_group`: Capture explicit logger/tag/class/component tokens.
+   - `host_group` / `service_group`: Capture ONLY explicit source fields, never inferred context.
+   - `attribute_groups`: Map extra stable attributes (e.g. `{"http_status": "status_code", "pid": "process_id"}`). Use `{}` if none exist.
+7. **JSON Log Handling:** If samples are JSON objects, match the outer structure safely or capture top-level fields reliably.
+8. **No Prose:** Return ONLY the JSON object. Do not wrap in markdown fences or include explanations.
 
 SAMPLES:
 {{samples}}

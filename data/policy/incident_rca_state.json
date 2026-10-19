@@ -1,0 +1,136 @@
+{
+  "active_incidents": {
+    "c4020fdb0c7bc19b": {
+      "incident_id": "inc:1792275366619:1",
+      "fingerprint": "c4020fdb0c7bc19b",
+      "first_seen_ms": 1792275366619,
+      "last_seen_ms": 1792275666619,
+      "services": [
+        "aida-document-digest-consumer-dds"
+      ],
+      "occurrences": 1
+    },
+    "7b6504cbf5a37f3f": {
+      "incident_id": "inc:1792276266619:1",
+      "fingerprint": "7b6504cbf5a37f3f",
+      "first_seen_ms": 1792276266619,
+      "last_seen_ms": 1792276566619,
+      "services": [
+        "aida-document-digest-consumer-dds"
+      ],
+      "occurrences": 1
+    },
+    "2eb371773d87705d": {
+      "incident_id": "inc:1792276563411:2",
+      "fingerprint": "2eb371773d87705d",
+      "first_seen_ms": 1792276563411,
+      "last_seen_ms": 1792276566607,
+      "services": [
+        "unknown"
+      ],
+      "occurrences": 1
+    },
+    "03265daae7e9803d": {
+      "incident_id": "inc:1792276566619:1",
+      "fingerprint": "03265daae7e9803d",
+      "first_seen_ms": 1792276566619,
+      "last_seen_ms": 1792276866619,
+      "services": [
+        "aida-document-digest-consumer-dds"
+      ],
+      "occurrences": 1
+    },
+    "26ee7dbfcf9c0083": {
+      "incident_id": "inc:1792276566779:2",
+      "fingerprint": "26ee7dbfcf9c0083",
+      "first_seen_ms": 1792276566779,
+      "last_seen_ms": 1792276645372,
+      "services": [
+        "unknown"
+      ],
+      "occurrences": 1
+    },
+    "anomaly:container_error_concentration": {
+      "incident_id": "inc:1792276866619:1",
+      "signature": "anomaly:container_error_concentration",
+      "first_seen_ms": 1792276866619,
+      "last_seen_ms": 1792277166619,
+      "occurrences": 1
+    },
+    "tpl_96980a0dc8d486c4": {
+      "incident_id": "inc:1792276998797:2",
+      "signature": "tpl_96980a0dc8d486c4",
+      "first_seen_ms": 1792276998797,
+      "last_seen_ms": 1792277010882,
+      "occurrences": 1
+    }
+  },
+  "last_case_analysis": {
+    "durum_ozeti": "I1 kapsayıcı hata yoğunlaşması (S1,S3,S7,S8) ile I2 veritabanı bağlantı kopması (S2,S6) ve belge işleme hataları (S4,S5) aynı servis/zaman penceresinde eşleşiyor; ancak korelasyon nedensellik kanıtı değil.",
+    "kok_neden_hipotezi": "En güçlü hipotez: PostgreSQL sunucusunun anormal şekilde bağlantıyı kesmesi (S2,S6) centroid silme ve oturum kapanışını bozmuş, ardından S4/S5 pipeline hataları tetiklenmiş olabilir. I1'in deterministik taban çizgisi ayrı bir kapsayıcı/servis sorunu olabilir.",
+    "guven": 0.55,
+    "nedensellik_durumu": "belirsiz",
+    "etkilenen_olaylar": [
+      "inc:1792276866619:1",
+      "inc:1792276998797:2"
+    ],
+    "karar_gerekcesi": [
+      "S2 ve S6 aynı psycopg2 OperationalError'ı gösteriyor; DB tarafı kesinti en erken belirgin hata.",
+      "S4/S5 hataları DB hatasından ~10 sn sonra başlıyor; sıralama uyumlu ama tek gözlem.",
+      "I1 sinyalleri jenerik yoğunlaşma; spesifik hata semantiği yok, ayrı kök olabilir."
+    ],
+    "alternatif_hipotezler": [
+      "I1 bağımsız bir kapsayıcı/pod sorunudur; I2 ile sadece zaman ve servis yakınlığı paylaşır.",
+      "S5'teki NoSuchKey eksik nesne kaynaklıdır; DB hatası ikincil veya bağımsız bir sorundur."
+    ],
+    "onerilen_incelemeler": [
+      "PostgreSQL sunucu loglarını ve bağlantı sonlanma kayıtlarını aynı zaman penceresinde inceleyin.",
+      "S2'deki DELETE sorgusunun tam metnini ve ilgili tablo kilitlemelerini doğrulayın.",
+      "S5'te NoSuchKey dönen nesne anahtarlarının varlığını ve yükleme akışını kontrol edin.",
+      "I1 kapsayıcı restart/OOM olaylarını pod loglarıyla karşılaştırın."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusunun neden bağlantıyı kestiğine dair sunucu tarafı kanıt yok.",
+      "S4/S5 ile DB hatası arasındaki nedensel zinciri doğrulayan trace yok.",
+      "I1'in I2 ile ilişkisini ayırt eden topoloji/bağımlılık verisi yok."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:9753bab45841426f9aaf3e3dfcd580d1:container_error_concentration:total",
+      "sig:tpl_96980a0dc8d486c4:src.processors.centroid_processor:1792276800000",
+      "sig:tpl_d8967aececcc1775:src.consumers.domain_data_source_consumer:1792276800000",
+      "sig:tpl_6e3399de366cdfa6:aida_core.clients.object_storage_client:1792276800000",
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792276800000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "ai_usage": {
+      "prompt_tokens": 2278,
+      "completion_tokens": 588,
+      "total_tokens": 2866,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.684,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 91,
+      "signals_selected": 8,
+      "signal_groups": 91,
+      "correlations_total": 2895,
+      "correlations_selected": 9,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5721,
+      "serialized_bytes": 5796,
+      "input_chars": 8965,
+      "input_bytes": 9128,
+      "approximate_tokens": 2242,
+      "compacted": true,
+      "prompt_tokens": 2278,
+      "completion_tokens": 588,
+      "total_tokens": 2866,
+      "finish_reason": "stop",
+      "duration_seconds": 8.684
+    }
+  },
+  "last_ai_time_ms": 1792277340934
+}

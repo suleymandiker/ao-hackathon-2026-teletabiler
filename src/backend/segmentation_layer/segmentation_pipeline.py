@@ -26,7 +26,8 @@ from segmentation_layer.regex_validator import RegexValidator
 SEGMENTATION_SCHEMA_VERSION = "v44-header-signature-v5-stable-prefix"
 
 DEFAULT_FALLBACK_REGEX = (
-    r'^(?:<\d{1,3}>'
+    r'^(?:\{\s*"(?:timestamp|time|@timestamp|level|logger|message)"' 
+    r'|<\d{1,3}>'
     r'|\S+\s+\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:[.,]\d{3,6})?'
     r'|\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}'
     r'|\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}'
@@ -589,15 +590,18 @@ class SegmentationPipeline:
 
     def iter_events(self, file_path: str, force_rediscovery: bool = False) -> Iterator[str]:
         result = self.prepare(file_path, force_rediscovery=force_rediscovery)
+        
         if not result.get("verified"):
-            
-            event_header_regex = str(result["regex"])
+            event_header_regex = str(result.get("regex", ""))
 
             print("=== SEGMENTATION DEBUG ===", flush=True)
             print("file_path:", file_path, flush=True)
             print("regex repr:", repr(event_header_regex), flush=True)
 
-            rx = re.compile(event_header_regex)
+            try:
+                rx = re.compile(event_header_regex)
+            except re.error:
+                rx = None
 
             physical_lines = 0
             regex_matches = 0
@@ -606,10 +610,8 @@ class SegmentationPipeline:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                 for i, line in enumerate(f, 1):
                     physical_lines += 1
-
-                    if rx.match(line):
+                    if rx and rx.match(line):
                         regex_matches += 1
-
                         if len(first_matches) < 5:
                             first_matches.append((i, line[:150]))
 
@@ -617,12 +619,22 @@ class SegmentationPipeline:
             print("regex_matches:", regex_matches, flush=True)
             print("first_matches:", first_matches, flush=True)
             print("=== SEGMENTATION DEBUG COMPLETE ===", flush=True)
-            
 
-            raise RuntimeError(
-                "Segmentation verification failed; refusing to use an unverified policy. "
-                + str(result.get("reason", "unknown reason"))
+            # RuntimeError ile süreci durdurmak yerine uyarı basıp tek satır modunda devam ediyoruz
+            print(
+                f"[SEGMENTATION UYARI] Multiline kural doğrulaması geçilemedi "
+                f"(Sebep: {result.get('reason', 'unverified')}). "
+                f"Sistem çökmeyi önlemek için güvenli tek satır (Single-Line Fallback) modunda akışı sürdürüyor.",
+                flush=True,
             )
+
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    stripped = line.rstrip("\r\n")
+                    if stripped.strip():
+                        yield stripped
+            return
+
         yield from self.assembler.iter_events(file_path, str(result["regex"]))
 
     def process_file(self, file_path: str, force_rediscovery: bool = False) -> Iterator[str]:

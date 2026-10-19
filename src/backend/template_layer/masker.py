@@ -73,6 +73,13 @@ class MessageMasker:
         (re.compile(r"(?<![\w:])(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}(?![\w:])"), "<IP>"),
         (re.compile(r"(?<![\w.])(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?![\w.])"), "<IP>"),
         (re.compile(r"\bhttps?://[^\s\]\[(){}<>\"']+", re.IGNORECASE), "<URL>"),
+        
+        # ====================================================================
+        # YENİ EKLENEN KURAL: Dosya Yolları ve İsimlerini Maskeleme
+        # İçinde /api-upload/ geçen veya .pdf, .doc, .txt gibi uzantılarla biten yolları yakalar
+        # ====================================================================
+        (re.compile(r"\b(?:api-upload|/tmp/|/var/)[^\s\]\[(){}<>\"']+(?:\.(?:pdf|docx?|xlsx?|txt|png|jpe?g|csv))?\b|\b[^\s\]\[(){}<>\"']+\.(?:pdf|docx?|xlsx?|txt|png|jpe?g|csv)\b", re.IGNORECASE), "<FILE_PATH>"),
+
         (re.compile(r"\b0x[0-9a-fA-F]+\b"), "<HEX>"),
         (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<HEX>"),
     )

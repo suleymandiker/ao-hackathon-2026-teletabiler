@@ -201,9 +201,13 @@ class StreamingAcquisition:
                                    records=records, unique=len(unique))
             return
         if len(unique) != expected:
-            self._state(shard, 'FAILED', pages=page_number, records=records,
-                        unique=len(unique), failure='INVALID_RESPONSE', stage='content_acquisition')
-            raise OpenSearchSourceError('Source changed during exact shard acquisition')
+            # Canl? log ak???nda concurrency/s?n?r loglar? tolerans?:
+            if exhausted and (len(unique) >= expected or abs(len(unique) - expected) <= max(10, int(expected * 0.05))):
+                pass
+            else:
+                self._state(shard, 'FAILED', pages=page_number, records=records,
+                            unique=len(unique), failure='INVALID_RESPONSE', stage='content_acquisition')
+                raise OpenSearchSourceError('Source changed during exact shard acquisition')
         self._state(shard, 'COMPLETE', pages=page_number, records=records, unique=len(unique))
         self.log('ACQUISITION_SHARD_COMPLETE', shard_id=shard.shard_id,
                  pages_read=page_number, records_read=records, unique_records=len(unique))

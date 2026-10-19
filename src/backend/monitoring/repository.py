@@ -760,6 +760,10 @@ class SQLiteMonitorRepository:
         findings = _compact_findings(run, result, now)
         metric_payload = _baseline_metric(metrics)
         pattern_payload = _baseline_patterns(patterns)
+        
+        # 1. Analiz sonucunu (case_analysis, plans, sinyaller vb.) JSON formatına çeviriyoruz
+        payload = encode(result)
+        
         recount = metrics.get('metrics_recount')
         if (not isinstance(recount, dict) or
                 type(recount.get('metrics_count_before')) is not int or
@@ -793,13 +797,19 @@ class SQLiteMonitorRepository:
             if len(baseline_json.encode('utf-8')) > MAX_BASELINE_BYTES:
                 raise ValueError('Monitoring baseline state limit reached')
             duration_ms = max(0, int((now - run.actual_started_at).total_seconds() * 1000))
+
+            # 2. Analiz çıktısını monitor_results tablosuna kaydediyoruz
+            db.execute('INSERT OR REPLACE INTO monitor_results VALUES (?,?)', (run.id, payload))
+
+            # 3. result_reference=NULL yerine result_reference=run.id veriyoruz
             db.execute('''UPDATE monitor_runs SET status='SUCCESS',finished_at=?,counts=?,
-                physical_logs=?,pattern_count=?,duration_ms=?,result_reference=NULL,
+                physical_logs=?,pattern_count=?,duration_ms=?,result_reference=?,
                 error_category=NULL,error_summary=NULL,acquisition_diagnostics=?,
                 error_stage=NULL,safe_reason_code=NULL,failure_classification=NULL,
                 reason_streak=0,last_failure_signature=NULL WHERE id=?''',
                 (now.isoformat(), encode(asdict(counts)), int(metrics['total_physical_logs']),
-                 len(patterns), duration_ms, encode(recount) if recount is not None else None, run.id))
+                 len(patterns), duration_ms, run.id, encode(recount) if recount is not None else None, run.id))
+            
             if is_historical_repair:
                 db.execute('''UPDATE monitor_gaps SET status='RESOLVED', resolved_at=?, resolved_run_id=?
                     WHERE monitor_id=? AND window_start=? AND window_end=?''',

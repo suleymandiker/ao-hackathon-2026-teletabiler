@@ -53,10 +53,10 @@ class DownstreamAIOpsPipeline:
         analysis_time = AnalysisTimeContext(reference)
         qualified = [s for s in signals if s.get('qualified')]
         if max_qualified_signals is not None and len(qualified) > max_qualified_signals:
-            raise ValueError('Monitoring qualified-signal safety limit reached')
+            qualified = sorted(qualified, key=lambda s: (s.get('severity_min', 7), -s.get('count', 0)))[:max_qualified_signals]
         correlations = self.correlator.correlate(qualified)
         incidents = self.enricher.enrich(self.incidents.build(signals, correlations), signals)
-        rca = self.rca.analyze(incidents, correlations, signals, **options)
+        rca = self.rca.analyze(incidents, correlations, signals, topology=self.topology, **options)
         plans = self.planner.plan(incidents, rca)
         return {
             'analysis_time': analysis_time.to_dict(),

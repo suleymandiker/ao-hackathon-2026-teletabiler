@@ -114,33 +114,36 @@ class Window:
 
 
 def next_window(monitor: DeploymentMonitor) -> Window:
-    # 1. An explicit targeted historical retry window takes highest priority.
     if monitor.target_retry_window is not None:
         return monitor.target_retry_window
-    # 2. Once claimed, an interval remains authoritative through failure/restart.
     if monitor.pending_window is not None:
         return monitor.pending_window
-    if monitor.last_successful_end is None and monitor.processing_cursor is None and monitor.manual_requested_at is not None:
-        end = monitor.manual_requested_at - timedelta(
-            seconds=monitor.definition.ingestion_delay_seconds + monitor.definition.overlap_seconds)
-        return Window(end - timedelta(seconds=monitor.definition.window_seconds), end)
+
+    if monitor.manual_requested_at is not None:
+        start_candidate = monitor.processing_cursor or monitor.last_successful_end or monitor.definition.initial_start
+        window_end = start_candidate + timedelta(seconds=monitor.definition.window_seconds)
+        safety_buffer = timedelta(seconds=monitor.definition.ingestion_delay_seconds + monitor.definition.overlap_seconds)
+        
+        if window_end + safety_buffer > monitor.manual_requested_at:
+            end = monitor.manual_requested_at - safety_buffer
+            return Window(end - timedelta(seconds=monitor.definition.window_seconds), end)
+
     start = monitor.processing_cursor or monitor.last_successful_end or monitor.definition.initial_start
     return Window(start, start + timedelta(seconds=monitor.definition.window_seconds))
 
 
 def safe_at(window: Window, definition: MonitorDefinition) -> datetime:
-    # The lookahead used to finish boundary events must also be indexed/stable.
     return window.end + timedelta(seconds=definition.ingestion_delay_seconds + definition.overlap_seconds)
 
 
 def ready_at(monitor: DeploymentMonitor, now: datetime) -> datetime:
-    """Shared readiness formula: operator intent bypasses cadence, never safety.
-
-    Lifecycle and running ownership are checked separately by the repository.
-    """
+    """Shared readiness formula: operator intent bypasses cadence, never safety."""
     if monitor.target_retry_window is not None:
         return utc(now)
-    cadence = utc(now) if monitor.manual_requested_at is not None else monitor.next_run_at
+    if monitor.manual_requested_at is not None:
+        return utc(now)
+
+    cadence = monitor.next_run_at
     return max(cadence, safe_at(next_window(monitor), monitor.definition))
 
 

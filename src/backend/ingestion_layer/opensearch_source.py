@@ -60,6 +60,17 @@ _SOURCE_FIELDS = (
 _STREAM_FIELDS = (
     "namespace", "workload", "pod", "pod_instance", "container", "container_instance", "channel",
 )
+_ADDITIONAL_SOURCE_FIELDS = (
+    "hostname",
+    "level",
+    "kubernetes.pod_name",
+    "kubernetes.pod_ip",
+    "kubernetes.container_image",
+    "kubernetes.container_iostream",
+    "kubernetes.labels.pod-template-hash",
+    "kubernetes.namespace_labels.tcserviceid",
+    "tcmonit_retag_tcserviceid",
+)
 _CURSOR_FORMAT = "opensearch-search-after-v1"
 _MISSING = object()
 
@@ -209,12 +220,16 @@ class OpenSearchSource:
             filters.append({"term": {mapping.container_exact: container}})
         if cluster_id is not None:
             filters.append({"term": {mapping.cluster_id_exact: cluster_id}})
+
+        base_source = [getattr(mapping, name) for name in _SOURCE_FIELDS]
+        source_fields = list(dict.fromkeys(base_source + list(_ADDITIONAL_SOURCE_FIELDS)))
+
         query = {
             "size": size,
             "query": {"bool": {"filter": filters}},
             "track_total_hits": False,
             "timeout": f"{math.ceil(self._config.request_timeout * 1000)}ms",
-            "_source": [getattr(mapping, name) for name in _SOURCE_FIELDS],
+            "_source": source_fields,
             "sort": [{mapping.timestamp: "asc"}, {mapping.sequence: "asc"}],
         }
         binding = hashlib.sha256(_json({
@@ -308,6 +323,7 @@ class OpenSearchSource:
         version = hit.get("_version")
         if "_version" in hit and (type(version) is not int or version < 1):
             raise OpenSearchSourceError("Invalid document version")
+
         metadata = [("sequence", values["sequence"])]
         owner = values["pod_owner"]
         if owner is not _MISSING:
@@ -315,17 +331,97 @@ class OpenSearchSource:
                     or (type(owner) is float and not math.isfinite(owner))):
                 raise OpenSearchSourceError("Invalid scalar pod_owner evidence")
             metadata.append(("pod_owner", owner))
-        return contracts.IngestedLogRecord(
-            raw_text=values["message"], source_timestamp_raw=timestamp,
-            source_timestamp_field=self._config.field_mapping.timestamp,
-            source_reference=contracts.SourceReference(
+
+        # --- P0 - P3 ÖZNİTELİK (ATTRIBUTE) VE METADATA ÇIKARIMI ---
+        extracted_attrs = {}
+
+        # Gerçek Kubernetes Pod Name (OpenShift'ten doğrudan çekilir)
+        pod_name = _path(source, "kubernetes.pod_name")
+        if _nonempty_text(pod_name):
+            extracted_attrs["pod_name"] = str(pod_name)
+
+        hostname = _path(source, "hostname")
+        if _nonempty_text(hostname):
+            extracted_attrs["hostname"] = hostname
+
+        level = _path(source, "level")
+        if _nonempty_text(level):
+            extracted_attrs["log_level"] = level
+
+        pod_ip = _path(source, "kubernetes.pod_ip")
+        if _nonempty_text(pod_ip):
+            extracted_attrs["pod_ip"] = pod_ip
+
+        container_image = _path(source, "kubernetes.container_image")
+        if _nonempty_text(container_image):
+            extracted_attrs["container_image"] = container_image
+
+        container_iostream = _path(source, "kubernetes.container_iostream")
+        if _nonempty_text(container_iostream):
+            extracted_attrs["container_iostream"] = container_iostream
+
+        pod_template_hash = _path(source, "kubernetes.labels.pod-template-hash")
+        if _nonempty_text(pod_template_hash):
+            extracted_attrs["pod_template_hash"] = pod_template_hash
+
+        service_id = _path(source, "tcmonit_retag_tcserviceid")
+        if not _nonempty_text(service_id):
+            service_id = _path(source, "kubernetes.namespace_labels.tcserviceid")
+        if _nonempty_text(service_id):
+            extracted_attrs["service_id"] = str(service_id)
+
+        # Gömülü structured JSON mesaj ayrıştırması
+        raw_message = values["message"]
+        if isinstance(raw_message, str):
+            stripped = raw_message.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    msg_json = json.loads(stripped)
+                    if isinstance(msg_json, dict):
+                        if "status_code" in msg_json:
+                            extracted_attrs["http_status"] = msg_json["status_code"]
+                        if "process_time_ms" in msg_json:
+                            try:
+                                extracted_attrs["process_time_ms"] = float(msg_json["process_time_ms"])
+                            except (ValueError, TypeError):
+                                pass
+                        if "request_id" in msg_json and msg_json["request_id"]:
+                            extracted_attrs["request_id"] = str(msg_json["request_id"])
+                        if "method" in msg_json and msg_json["method"]:
+                            extracted_attrs["http_method"] = str(msg_json["method"]).upper()
+                        if "url" in msg_json and msg_json["url"]:
+                            extracted_attrs["http_url"] = str(msg_json["url"])
+                        if "logger" in msg_json and msg_json["logger"]:
+                            extracted_attrs["logger"] = str(msg_json["logger"])
+                except (ValueError, TypeError):
+                    pass
+
+        for k, v in extracted_attrs.items():
+            if v is not None and v is not _MISSING:
+                if type(v) in (str, int, float, bool):
+                    if type(v) is float and not math.isfinite(v):
+                        continue
+                    metadata.append((k, v))
+
+        record_kwargs = {
+            "raw_text": values["message"],
+            "source_timestamp_raw": timestamp,
+            "source_timestamp_field": self._config.field_mapping.timestamp,
+            "source_reference": contracts.SourceReference(
                 source_scope=self._config.source_scope, source_partition=hit["_index"],
                 record_id=hit["_id"], version=version,
             ),
-            stream_identity=contracts.StreamIdentity(
+            "stream_identity": contracts.StreamIdentity(
                 source_scope=values["cluster_id"],
                 **{name: values[name] for name in _STREAM_FIELDS},
             ),
-            retrieval_order=order, framing=contracts.Framing.PHYSICAL_LINE,
-            metadata=tuple(metadata),
-        )
+            "retrieval_order": order,
+            "framing": contracts.Framing.PHYSICAL_LINE,
+            "metadata": tuple(metadata),
+        }
+
+        if (hasattr(contracts.IngestedLogRecord, "__dataclass_fields__")
+                and "attributes" in contracts.IngestedLogRecord.__dataclass_fields__):
+            record_kwargs["attributes"] = dict(extracted_attrs)
+
+        return contracts.IngestedLogRecord(**record_kwargs)

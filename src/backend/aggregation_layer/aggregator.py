@@ -17,6 +17,7 @@ def _resource(e: Dict[str, Any], key: str) -> str:
     value = e.get(key) or resource.get(key)
     return str(value).strip() if value not in (None, '') else 'unknown'
 
+
 _SERVICE_PATTERNS = [
     re.compile(r"\[([a-z0-9][a-z0-9._-]*(?:service|gateway|client|scheduler|controller|kubelet|alertmanager))\]", re.I),
     re.compile(r"\b(?:service|dependency|upstream|provider)[=: ]+['\"]?(?:https?://)?([a-z0-9][a-z0-9._-]+)", re.I),
@@ -80,6 +81,13 @@ class SignalAggregate:
     business_criticalities: List[str]
     source_order: int | None = None
     timestamp_basis_counts: Dict[str, int] = field(default_factory=dict)
+    # P0 - P3 Fazları İçin Genişletilmiş Alanlar:
+    pod_names: List[str] = field(default_factory=list)
+    pod_ips: List[str] = field(default_factory=list)
+    container_images: List[str] = field(default_factory=list)
+    service_ids: List[str] = field(default_factory=list)
+    pod_template_hashes: List[str] = field(default_factory=list)
+    avg_latency: float | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -107,17 +115,14 @@ class SignalAggregator:
             host = _resource(e, 'host')
             attrs = e.get('attributes') or {}
             alarm_type = str(attrs.get('alarm_type') or '').strip()
-            # Structured alarms have a stable alarm_type. Keep it in the grouping key so
-            # unrelated symptoms from the same service/window never collapse together.
             identity = service if service != 'unknown' else component if component != 'unknown' else host
             semantic_key = alarm_type or tid
             groups[(semantic_key, tid, identity, bucket)].append(dict(e, _signal_ts_ms=ts, _resolved=resolved,
-                                                        _service=service, _component=component,
-                                                        _namespace=namespace, _cluster=cluster, _host=host))
+                                                                      _service=service, _component=component,
+                                                                      _namespace=namespace, _cluster=cluster, _host=host))
 
         out: List[Dict[str, Any]] = []
         for (semantic_key, tid, identity, bucket), rows in groups.items():
-            # Preserve explicit source order; otherwise use stable event identity.
             rows.sort(key=order_key)
             times = [r['_signal_ts_ms'] for r in rows]
             count = len(rows)
@@ -126,13 +131,28 @@ class SignalAggregator:
             scope_parts = [x for x in (cluster, namespace, service) if x != 'unknown']
             scope = '/'.join(scope_parts) if scope_parts else (component if component != 'unknown' else host if host != 'unknown' else 'genel')
             burst = min(1.0, count / 10.0)
-            attrs=[r.get('attributes') or {} for r in rows]
-            alarm_type=str(attrs[0].get('alarm_type') or '')
-            source_sevs=[]
+            attrs = [r.get('attributes') or {} for r in rows]
+            alarm_type = str(attrs[0].get('alarm_type') or '')
+            source_sevs = []
             for a in attrs:
                 try: source_sevs.append(int(a.get('source_severity')))
-                except (TypeError,ValueError): pass
-            def vals(key): return sorted({str(a.get(key)) for a in attrs if a.get(key) not in (None,'')})
+                except (TypeError, ValueError): pass
+
+            def vals(key): return sorted({str(a.get(key)) for a in attrs if a.get(key) not in (None, '')})
+
+            pod_names = vals('pod_name')
+            pod_ips = vals('pod_ip')
+            container_images = vals('container_image')
+            service_ids = vals('service_id')
+            pod_template_hashes = vals('pod_template_hash')
+
+            latencies = []
+            for a in attrs:
+                if 'process_time_ms' in a:
+                    try: latencies.append(float(a['process_time_ms']))
+                    except (ValueError, TypeError): pass
+            avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else None
+
             out.append(SignalAggregate(
                 signal_id=f"sig:{tid}:{identity}:{bucket if bucket is not None else 'untimed'}", template_id=tid,
                 template=str(rows[0].get('template') or ''), scope=scope,
@@ -141,7 +161,7 @@ class SignalAggregator:
                 last_seen_ms=max(times) if bucket is not None else None,
                 severity_min=min(_severity_number(r) for r in rows),
                 service_name=service, component=component, namespace=namespace, cluster_name=cluster, host=host,
-                hosts=sorted({str(r.get('_host')) for r in rows if r.get('_host') not in (None,'unknown','')}),
+                hosts=sorted({str(r.get('_host')) for r in rows if r.get('_host') not in (None, 'unknown', '')}),
                 event_ids=[str(r.get('event_id') or '') for r in rows[:self.representative_limit]],
                 reliable_ratio=round(reliable, 4), burst_score=round(burst, 4),
                 timestamp_resolved=all(bool(r['_resolved']) for r in rows),
@@ -151,8 +171,14 @@ class SignalAggregator:
                 source_order=rows[0].get('source_order'),
                 timestamp_basis_counts={basis: total for basis in BASES
                     if (total := sum((r.get('timestamp_provenance') or {}).get('basis') == basis for r in rows))},
+                pod_names=pod_names,
+                pod_ips=pod_ips,
+                container_images=container_images,
+                service_ids=service_ids,
+                pod_template_hashes=pod_template_hashes,
+                avg_latency=avg_latency,
             ).to_dict())
             if observer is not None:
                 observer('membership', (out[-1]['signal_id'], rows))
         return sorted(out, key=lambda row: (row['window_start_ms'] is None,
-                      row['window_start_ms'] or 0, *signal_order(row)))
+                                            row['window_start_ms'] or 0, *signal_order(row)))

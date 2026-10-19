@@ -1,0 +1,24 @@
+project_name: ao-hackathon-teletabiler
+loglevel: info
+analyses:
+- analysis_name: teletabiler_analysis
+  source_directory: .
+  only_permit_languages:
+  - py
+  only_permit_file_extensions:
+  - .py
+  ignore_directories_containing:
+  - __pycache__
+  - .venv
+  - venv
+  - .git
+  file_scan:
+  - number_of_methods
+  - source_lines_of_code
+  - dependency_graph
+  - louvain_modularity
+  - fan_in_out
+  export:
+  - directory: ./emerge_export
+  - json
+  - d3

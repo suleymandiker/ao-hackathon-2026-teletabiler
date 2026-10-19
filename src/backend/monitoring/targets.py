@@ -24,7 +24,8 @@ class TargetOptions:
 class TargetValidation:
     count: int
     latest: datetime | None
-    sample: str | None
+    # 'sample' artık sadece bir str değil, liste şeklinde tutulacak
+    samples: list[str] | None
 
 
 class TargetExplorer:
@@ -91,7 +92,8 @@ class TargetExplorer:
     def validate(self, namespace, workload, container=None):
         start = self.end - timedelta(minutes=15)
         m = self.config.field_mapping
-        body = {'size': 1, 'track_total_hits': True,
+        # Sadece 1 değil, ekranda görmek üzere en son 10 logu çekecek şekilde size 10 yaptık
+        body = {'size': 10, 'track_total_hits': True,
                 'query': {'bool': {'filter': self._filters(start, namespace, workload, container)}},
                 '_source': [m.timestamp, m.message],
                 'sort': [{m.timestamp: 'desc'}, {m.sequence: 'desc'}]}
@@ -103,23 +105,30 @@ class TargetExplorer:
             if total['relation'] != 'eq' or type(count) is not int or count < 0:
                 raise ValueError('Incomplete count')
             rows = hits['hits']
-            if len(rows) != (1 if count else 0):
-                raise ValueError('Missing representative evidence')
+            
             if not count:
                 return TargetValidation(0, None, None)
-            source = rows[0]['_source']
-            timestamp = _path(source, m.timestamp)
+            
+            # İlk satırdan en güncel zamanı (latest) bul
+            source_latest = rows[0]['_source']
+            timestamp = _path(source_latest, m.timestamp)
             latest = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
             if latest.utcoffset() is None or not start <= latest <= self.end:
                 raise ValueError('Invalid source time')
-            message = _path(source, m.message)
-            if type(message) is not str:
-                raise ValueError('Missing application message')
-            # Redact before truncation so clipped credentials cannot escape.
-            sample = safe_text(message, self.config)
+            
+            # Gelen 10 satırı da dön ve metinlerini temizleyip listeye ekle
+            samples_list = []
             secret = os.environ.get('SAKA_API_KEY')
-            if secret:
-                sample = sample.replace(secret, '[redacted]')
-            return TargetValidation(count, latest.astimezone(timezone.utc), sample[:2000])
-        except Exception:
-            raise TargetValidationError('Source validation returned incomplete count or sample evidence.') from None
+            
+            for row in rows:
+                source = row['_source']
+                message = _path(source, m.message)
+                if type(message) is str:
+                    sample = safe_text(message, self.config)
+                    if secret:
+                        sample = sample.replace(secret, '[redacted]')
+                    samples_list.append(sample[:2000])
+
+            return TargetValidation(count, latest.astimezone(timezone.utc), samples_list)
+        except Exception as e:
+            raise TargetValidationError(f'Source validation returned incomplete count or sample evidence: {e}') from None

@@ -24,7 +24,7 @@ class SegmentationPolicyRegistry:
 
     def __init__(self, db_path: Optional[str] = None, max_entries: int = 5000):
         self.db_path = db_path or os.getenv(
-            "AIOPS_POLICY_REGISTRY_PATH",
+            "POLICY_REGISTRY_PATH",
             str(policy_data_dir() / "policy_registry.sqlite3"),
         )
         self.max_entries = max(100, int(max_entries))

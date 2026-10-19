@@ -13,8 +13,8 @@ from parser_layer.timestamp.source_policy import BASES
 
 
 MAX_STREAMS = 10_000
-MAX_PATTERNS = 1_000
-MAX_SIGNAL_GROUPS = 1_000
+MAX_PATTERNS = 5_000
+MAX_SIGNAL_GROUPS = 5_000
 MAX_DISTRIBUTION_KEYS = 32
 MAX_EVENT_REFERENCES = 6
 MAX_BOUNDARY_SAMPLES = 200
@@ -83,8 +83,8 @@ class _Pattern:
             source = contributors[0]['source_reference']
             index, document = redact_text(source['source_partition']), redact_text(source['record_id'])
             self.evidence.append(dict(timestamp=row.get('timestamp'),
-                                      index=index if index == source['source_partition'] else None,
-                                      document_id=document if document == source['record_id'] else None))
+                                     index=index if index == source['source_partition'] else None,
+                                     document_id=document if document == source['record_id'] else None))
 
     def to_dict(self):
         stored_template = (bounded_template(self.template, MAX_STORED_TEMPLATE_CHARS)
@@ -227,7 +227,7 @@ class WindowAccumulator:
             first = group.first
             scope = '/'.join(value for value in (first['cluster_name'], first['namespace'], first['service_name'])
                              if value != 'unknown') or (first['component'] if first['component'] != 'unknown' else
-                                                     first['host'] if first['host'] != 'unknown' else 'genel')
+                                                       first['host'] if first['host'] != 'unknown' else 'genel')
             output.append(dict(signal_id=f"sig:{tid}:{identity}:{bucket if bucket is not None else 'untimed'}",
                 template_id=tid, template=first['template'], scope=scope,
                 window_start_ms=bucket, window_end_ms=bucket + self.window_ms if bucket is not None else None,
@@ -245,7 +245,7 @@ class WindowAccumulator:
             output.extend(anomaly_signals(*self.anomaly_context[:2], self,
                                           *self.anomaly_context[2:]))
         return sorted(output, key=lambda row: (row['window_start_ms'] is None,
-                       row['window_start_ms'] or 0, row['signal_id']))
+                               row['window_start_ms'] or 0, row['signal_id']))
 
     def boundary_quality(self):
         return dict(total_events=self.boundary_total,

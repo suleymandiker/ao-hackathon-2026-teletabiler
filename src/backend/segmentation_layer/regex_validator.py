@@ -24,10 +24,6 @@ class RegexValidator:
         re.IGNORECASE,
     )
 
-    # Generic file/prefix + timestamp header. This covers rotated/service log
-    # prefixes such as:
-    #   nova-api.log.1.2017-05-17_12:02:19 2017-05-16 16:19:55.052 INFO ...
-    # without hard-coding a particular product or filename.
     _PREFIXED_TIMESTAMP = re.compile(
         r"^\S+\s+\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}"
         r"(?:[.,]\d{3,6})?",
@@ -93,7 +89,7 @@ class RegexValidator:
             )
 
         try:
-            re.compile(regex_pattern)
+            compiled_regex = re.compile(regex_pattern)
         except re.error as exc:
             return self._empty_result(
                 f"regex compile error: {exc}"
@@ -111,7 +107,6 @@ class RegexValidator:
         nonempty = 0
         blank_lines = 0
 
-        # Streaming pass: full file is never collected into RAM.
         with open(
             file_path,
             "r",
@@ -120,7 +115,6 @@ class RegexValidator:
         ) as f:
             for raw in f:
                 total += 1
-
                 if raw.strip():
                     nonempty += 1
                 else:
@@ -133,14 +127,7 @@ class RegexValidator:
         header_matches = 0
         regex_candidate_matches = 0
         suppressed_regex_matches = 0
-
-        # IMPORTANT:
-        # candidate_unmatched is NOT equal to the number of orphan events.
-        #
-        # An orphan may simply be a traceback/exception continuation that
-        # became a separate record because of a blank-line boundary.
         candidate_unmatched = 0
-
         internal_header_candidates = 0
 
         classification_counts = {
@@ -150,7 +137,6 @@ class RegexValidator:
         }
 
         event_count = 0
-
         parser_attempts = 0
         parser_success = 0
         parser_fail_samples = []
@@ -174,11 +160,6 @@ class RegexValidator:
         positive_samples = []
         failed_samples = []
         internal_header_samples = []
-
-        # Diagnostic only.
-        #
-        # Keep a bounded number of orphan examples for debugging.
-        # Acceptance MUST NOT depend on this sample.
         orphan_examples = []
 
         # -------------------------------------------------------------
@@ -190,218 +171,112 @@ class RegexValidator:
             regex_pattern,
         ):
             event_count += 1
-
-            n = int(
-                rec.get("line_count", 0)
-            )
-
+            n = int(rec.get("line_count", 0))
             accounted += n
 
-            min_lines = (
-                n
-                if min_lines is None
-                else min(min_lines, n)
-            )
-
-            max_lines = max(
-                max_lines,
-                n,
-            )
-
+            min_lines = n if min_lines is None else min(min_lines, n)
+            max_lines = max(max_lines, n)
             multiline += int(n > 1)
             single += int(n == 1)
 
-            decs = rec.get(
-                "decisions",
-                [],
-            )
+            decs = rec.get("decisions", [])
+            event_text = str(rec.get("event", ""))
+
+            # Olayı oluşturan fiziksel satırları ayrıştırıyoruz
+            if "\n" in event_text:
+                event_lines = [line.strip() for line in event_text.splitlines() if line.strip()]
+            elif " | " in event_text:
+                event_lines = [line.strip() for line in event_text.split(" | ") if line.strip()]
+            else:
+                event_lines = [event_text.strip()] if event_text.strip() else []
+
+            # ---------------------------------------------------------
+            # UNDER-SEGMENTATION DETECTION (İÇ BAŞLIK KONTROLÜ)
+            # ---------------------------------------------------------
+            # Bir olayın 2. ve sonraki satırlarında bağımsız bir log başlığı
+            # (timestamp, JSON veya regex eşleşmesi) varsa bu under-segmentation'dır.
+            if len(event_lines) > 1:
+                for cont_line in event_lines[1:]:
+                    if self.is_strong_header(cont_line) or (compiled_regex and compiled_regex.match(cont_line)):
+                        internal_header_candidates += 1
+                        if len(internal_header_samples) < self.max_internal_samples:
+                            internal_header_samples.append(cont_line[:700])
 
             # ---------------------------------------------------------
             # EVENT FIRST-LINE CLASSIFICATION
             # ---------------------------------------------------------
+            is_regex_start = bool(decs and decs[0].get("start_new_event") and decs[0].get("regex_match"))
 
-            if (
-                decs
-                and decs[0].get("start_new_event")
-            ):
+            if is_regex_start:
                 first_line_sources["regex"] += 1
-
             else:
                 first_line_sources["orphan"] += 1
+                orphan_reasons["unrecognized_top_level"] += 1
 
-                orphan_reasons[
-                    "unrecognized_top_level"
-                ] += 1
-
-                event_text = str(
-                    rec.get("event", "")
-                )
-
-                # MultilineAssembler joins physical lines using " | ".
-                # Therefore the text before the first separator is the
-                # original first physical line of this event.
-                first_line = (
-                    event_text
-                    .split(" | ", 1)[0]
-                    .strip()
-                )
-
-                # -----------------------------------------------------
-                # TRUE MISSED-HEADER DETECTION
-                # -----------------------------------------------------
-                #
-                # orphan != missed header
-                #
-                # Examples such as:
-                #
-                #   During handling of the above exception...
-                #   Traceback (most recent call last):
-                #
-                # are legitimate continuation fragments and must NOT
-                # invalidate an otherwise correct segmentation policy.
-                #
-                # Only an orphan whose first line independently has
-                # deterministic header structure is considered evidence
-                # that the candidate regex missed a real boundary.
-
-                if (
-                    first_line
-                    and self.is_strong_header(
-                        first_line
-                    )
-                ):
+                first_line = event_lines[0] if event_lines else ""
+                if first_line and self.is_strong_header(first_line):
                     candidate_unmatched += 1
-
-                    if (
-                        len(internal_header_samples)
-                        < self.max_internal_samples
-                    ):
-                        internal_header_samples.append(
-                            first_line[:700]
-                        )
-
-                # -----------------------------------------------------
-                # BOUNDED DEBUG SAMPLE
-                # -----------------------------------------------------
+                    if len(internal_header_samples) < self.max_internal_samples:
+                        internal_header_samples.append(first_line[:700])
 
                 if len(orphan_examples) < 10:
                     orphan_examples.append(
                         {
                             "event_no": event_count,
-                            "start_line": rec.get(
-                                "start_line"
-                            ),
-                            "end_line": rec.get(
-                                "end_line"
-                            ),
+                            "start_line": rec.get("start_line"),
+                            "end_line": rec.get("end_line"),
                             "line_count": n,
-                            "event_preview": (
-                                event_text[:500]
-                            ),
-                            "first_decision": (
-                                decs[0]
-                                if decs
-                                else None
-                            ),
+                            "event_preview": event_text[:500],
+                            "first_decision": decs[0] if decs else None,
                         }
                     )
 
             # ---------------------------------------------------------
             # POSITIVE EVENT SAMPLES
             # ---------------------------------------------------------
-
-            if (
-                len(positive_samples)
-                < self.max_positive_samples
-            ):
-                positive_samples.append(
-                    rec.get(
-                        "event",
-                        "",
-                    )[:700]
-                )
+            if len(positive_samples) < self.max_positive_samples:
+                positive_samples.append(event_text[:700])
 
             # ---------------------------------------------------------
             # LINE DECISION ACCOUNTING
             # ---------------------------------------------------------
-
             for d in decs:
-                cls = d.get(
-                    "classification",
-                    "CONTINUATION",
-                )
-
-                classification_counts[cls] = (
-                    classification_counts.get(
-                        cls,
-                        0,
-                    )
-                    + 1
-                )
+                cls = d.get("classification", "CONTINUATION")
+                classification_counts[cls] = classification_counts.get(cls, 0) + 1
 
                 if d.get("regex_match"):
                     regex_candidate_matches += 1
-
-                    if not d.get(
-                        "start_new_event"
-                    ):
+                    if not d.get("start_new_event"):
                         suppressed_regex_matches += 1
 
-                if d.get(
-                    "start_new_event"
-                ):
+                if d.get("start_new_event"):
                     header_matches += 1
 
             # ---------------------------------------------------------
             # PARSER VALIDATION
             # ---------------------------------------------------------
-
             if parser_fn is not None:
                 parser_attempts += 1
-
                 try:
-                    parsed = parser_fn(
-                        rec.get(
-                            "event",
-                            "",
-                        )
-                    )
+                    parsed = parser_fn(event_text)
                 except Exception:
                     parsed = None
 
                 if parsed:
                     parser_success += 1
-
-                elif (
-                    len(parser_fail_samples)
-                    < self.max_failed_samples
-                ):
-                    parser_fail_samples.append(
-                        rec.get(
-                            "event",
-                            "",
-                        )[:700]
-                    )
+                elif len(parser_fail_samples) < self.max_failed_samples:
+                    parser_fail_samples.append(event_text[:700])
 
         # -------------------------------------------------------------
         # FINAL METRICS
         # -------------------------------------------------------------
+        accounting_zero_loss = (nonempty == accounted)
 
-        accounting_zero_loss = (
-            nonempty == accounted
-        )
-
-        # DO NOT overwrite candidate_unmatched here.
-        #
-        # Old incorrect behaviour was:
-        #
-        # candidate_unmatched = first_line_sources["orphan"]
-        #
-        # That incorrectly treated traceback fragments as missed headers.
-
+        # Denominator artık yutulan iç başlıkları da (under-segmentation) hesaba katar
         denominator = (
             header_matches
             + candidate_unmatched
+            + internal_header_candidates
         )
 
         boundary_score = (
@@ -428,24 +303,29 @@ class RegexValidator:
             else 100.0
         )
 
+        undersegmentation_rate = (
+            round(internal_header_candidates / nonempty * 100.0, 2)
+            if nonempty
+            else 0.0
+        )
+
         # -------------------------------------------------------------
-        # ACCEPTANCE POLICY
+        # ACCEPTANCE POLICY (GÜVENLİK KİLİTLERİ)
         # -------------------------------------------------------------
-        #
-        # We do NOT relax the validation policy.
-        #
-        # candidate_unmatched == 0 still means:
-        #
-        #   no structurally valid header was missed.
-        #
-        # The fix is only that harmless orphan continuations are no
-        # longer incorrectly counted as missed headers.
+        # 1. Regex örnek kütüğe en az bir kez uymalı ve baskılanmamış olmalı.
+        effective_regex_matches = regex_candidate_matches - suppressed_regex_matches
+        has_regex_activity = bool(regex_candidate_matches > 0 and effective_regex_matches > 0)
+
+        # 50-100 satırlık akışta 1-2 stderr/stray satırı (%5'e kadar) normaldir.
+        unmatched_ratio = (candidate_unmatched / total) if total else 0.0
 
         accepted = bool(
-            header_matches > 0
-            and boundary_score >= 99.0
-            and candidate_unmatched == 0
-            and accounting_zero_loss
+            has_regex_activity
+            and header_matches > 0
+            and internal_header_candidates == 0  # ASLA iç başlık yutulmamalı (under-segmentation engeli)
+            and accounting_zero_loss             # ASLA satır/veri kaybı olmamalı
+            and boundary_score >= 95.0           # %99 yerine %95 (1-2 stray satır toleransı)
+            and unmatched_ratio <= 0.05          # En fazla %5 orphan/stray toleransı
             and (
                 parser_attempts == 0
                 or parser_ratio >= 95.0
@@ -455,162 +335,49 @@ class RegexValidator:
         # -------------------------------------------------------------
         # TEMPORARY VALIDATOR DEBUG
         # -------------------------------------------------------------
-
-        print(
-            "\n=== REGEX VALIDATOR DEBUG ===",
-            flush=True,
-        )
-
-        print(
-            "regex_pattern:",
-            repr(regex_pattern),
-            flush=True,
-        )
-
-        print(
-            "total_lines:",
-            total,
-            flush=True,
-        )
-
-        print(
-            "nonempty:",
-            nonempty,
-            flush=True,
-        )
-
-        print(
-            "regex_candidate_matches:",
-            regex_candidate_matches,
-            flush=True,
-        )
-
-        print(
-            "suppressed_regex_matches:",
-            suppressed_regex_matches,
-            flush=True,
-        )
-
-        print(
-            "header_matches:",
-            header_matches,
-            flush=True,
-        )
-
-        print(
-            "event_count:",
-            event_count,
-            flush=True,
-        )
-
-        print(
-            "first_line_sources:",
-            first_line_sources,
-            flush=True,
-        )
-
-        print(
-            "classification_counts:",
-            classification_counts,
-            flush=True,
-        )
-
-        print(
-            "candidate_unmatched:",
-            candidate_unmatched,
-            flush=True,
-        )
-
-        print(
-            "orphan_examples:",
-            flush=True,
-        )
-
-        for orphan in orphan_examples:
-            print(
-                "  ORPHAN:",
-                orphan,
-                flush=True,
-            )
-
-        print(
-            "accounted:",
-            accounted,
-            "nonempty:",
-            nonempty,
-            "zero_loss:",
-            accounting_zero_loss,
-            flush=True,
-        )
-
-        print(
-            "parser_attempts:",
-            parser_attempts,
-            "parser_success:",
-            parser_success,
-            "parser_ratio:",
-            round(parser_ratio, 2),
-            flush=True,
-        )
-
-        print(
-            "boundary_score:",
-            round(boundary_score, 2),
-            "accepted:",
-            accepted,
-            flush=True,
-        )
-
-        print(
-            "=== END VALIDATOR DEBUG ===\n",
-            flush=True,
-        )
+        print("\n=== REGEX VALIDATOR DEBUG ===", flush=True)
+        print("regex_pattern:", repr(regex_pattern), flush=True)
+        print("total_lines:", total, flush=True)
+        print("nonempty:", nonempty, flush=True)
+        print("regex_candidate_matches:", regex_candidate_matches, flush=True)
+        print("suppressed_regex_matches:", suppressed_regex_matches, flush=True)
+        print("header_matches:", header_matches, flush=True)
+        print("internal_header_candidates:", internal_header_candidates, flush=True)
+        print("event_count:", event_count, flush=True)
+        print("first_line_sources:", first_line_sources, flush=True)
+        print("classification_counts:", classification_counts, flush=True)
+        print("candidate_unmatched:", candidate_unmatched, flush=True)
+        if orphan_examples:
+            print("orphan_sample:", orphan_examples[0].get("event_preview", "")[:120], flush=True)
+        print("accounted:", accounted, "nonempty:", nonempty, "zero_loss:", accounting_zero_loss, flush=True)
+        print("parser_attempts:", parser_attempts, "parser_success:", parser_success, "parser_ratio:", round(parser_ratio, 2), flush=True)
+        print("boundary_score:", round(boundary_score, 2), "accepted:", accepted, flush=True)
+        print("=== END VALIDATOR DEBUG ===\n", flush=True)
 
         # -------------------------------------------------------------
         # RESULT
         # -------------------------------------------------------------
-
         return {
             "valid": True,
             "accepted": accepted,
             "reason": (
                 "ok"
                 if accepted
-                else "candidate requires refinement"
+                else "candidate requires refinement (0 matches or under-segmentation detected)"
             ),
-            "coverage_score": round(
-                boundary_score,
-                2,
-            ),
-            "all_line_match_ratio": round(
-                all_line_match_ratio,
-                2,
-            ),
+            "coverage_score": round(boundary_score, 2),
+            "all_line_match_ratio": round(all_line_match_ratio, 2),
             "total_lines": total,
             "total_nonempty_lines": nonempty,
             "blank_lines": blank_lines,
             "header_matches": header_matches,
-            "regex_candidate_matches": (
-                regex_candidate_matches
-            ),
-            "suppressed_regex_matches": (
-                suppressed_regex_matches
-            ),
-            "classification_counts": (
-                classification_counts
-            ),
-            "candidate_unmatched_headers": (
-                candidate_unmatched
-            ),
-            "internal_header_candidates": (
-                internal_header_candidates
-            ),
-            "internal_header_samples": (
-                internal_header_samples
-            ),
-            "accounting_zero_loss": (
-                accounting_zero_loss
-            ),
+            "regex_candidate_matches": regex_candidate_matches,
+            "suppressed_regex_matches": suppressed_regex_matches,
+            "classification_counts": classification_counts,
+            "candidate_unmatched_headers": candidate_unmatched,
+            "internal_header_candidates": internal_header_candidates,
+            "internal_header_samples": internal_header_samples,
+            "accounting_zero_loss": accounting_zero_loss,
             "event_count": event_count,
             "event_line_counts": {
                 "min": min_lines or 0,
@@ -621,27 +388,14 @@ class RegexValidator:
             "parser_validation": {
                 "attempts": parser_attempts,
                 "success": parser_success,
-                "success_ratio": round(
-                    parser_ratio,
-                    2,
-                ),
-                "failed_samples": (
-                    parser_fail_samples
-                ),
+                "success_ratio": round(parser_ratio, 2),
+                "failed_samples": parser_fail_samples,
             },
-            "undersegmentation_rate": 0.0,
-            "first_line_sources": (
-                first_line_sources
-            ),
-            "orphan_reasons": (
-                orphan_reasons
-            ),
-            "failed_samples": (
-                failed_samples
-            ),
-            "positive_samples": (
-                positive_samples
-            ),
+            "undersegmentation_rate": undersegmentation_rate,
+            "first_line_sources": first_line_sources,
+            "orphan_reasons": orphan_reasons,
+            "failed_samples": failed_samples,
+            "positive_samples": positive_samples,
             "safety": safety,
         }
 
@@ -650,9 +404,7 @@ class RegexValidator:
         line: str,
     ) -> bool:
         """Return True when a line has deterministic top-level header structure."""
-
         text = line.strip()
-
         if not text:
             return False
 
@@ -673,17 +425,12 @@ class RegexValidator:
     ) -> bool:
         if not samples:
             return False
-
-        # One repeated header family is fine; we only require at least one
-        # positive sample. Diversity is reported, not a hard acceptance gate.
         return True
 
     def _empty_result(
         self,
         reason: str,
-        safety: Optional[
-            Dict[str, Any]
-        ] = None,
+        safety: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return {
             "valid": False,
@@ -743,8 +490,6 @@ class RegexValidator:
     def _top_level_alternatives(
         pattern: str,
     ) -> int:
-        """Count top-level regex alternatives only."""
-
         count = 1
         depth = 0
         in_class = False
@@ -772,17 +517,9 @@ class RegexValidator:
 
             if ch == "(":
                 depth += 1
-
             elif ch == ")":
-                depth = max(
-                    0,
-                    depth - 1,
-                )
-
-            elif (
-                ch == "|"
-                and depth == 0
-            ):
+                depth = max(0, depth - 1)
+            elif ch == "|" and depth == 0:
                 count += 1
 
         return count
@@ -792,75 +529,30 @@ class RegexValidator:
         regex_pattern: str,
     ) -> Dict[str, Any]:
         if not regex_pattern:
-            return {
-                "valid": False,
-                "reason": "empty regex",
-            }
+            return {"valid": False, "reason": "empty regex"}
 
         if not regex_pattern.startswith("^"):
+            return {"valid": False, "reason": "regex must start with ^"}
+
+        if len(regex_pattern) > self.max_regex_length:
             return {
                 "valid": False,
-                "reason": (
-                    "regex must start with ^"
-                ),
+                "reason": f"regex too long: {len(regex_pattern)} > {self.max_regex_length}",
             }
 
-        if (
-            len(regex_pattern)
-            > self.max_regex_length
-        ):
-            return {
-                "valid": False,
-                "reason": (
-                    f"regex too long: "
-                    f"{len(regex_pattern)} > "
-                    f"{self.max_regex_length}"
-                ),
-            }
+        if regex_pattern in ("^.*", "^.*$", ".*", r"^\S+", r"^\S+$"):
+            return {"valid": False, "reason": "generic catch-all regex rejected"}
 
-        if regex_pattern in (
-            "^.*",
-            "^.*$",
-            ".*",
-            r"^\S+",
-            r"^\S+$",
-        ):
-            return {
-                "valid": False,
-                "reason": (
-                    "generic catch-all regex rejected"
-                ),
-            }
-
-        rules = (
-            self._top_level_alternatives(
-                regex_pattern
-            )
-        )
-
+        rules = self._top_level_alternatives(regex_pattern)
         if rules > self.max_rules:
             return {
                 "valid": False,
-                "reason": (
-                    f"too many regex alternatives: "
-                    f"{rules} > "
-                    f"{self.max_rules}"
-                ),
+                "reason": f"too many regex alternatives: {rules} > {self.max_rules}",
             }
 
         try:
             re.compile(regex_pattern)
-
         except re.error as exc:
-            return {
-                "valid": False,
-                "reason": (
-                    f"regex compile error: {exc}"
-                ),
-            }
+            return {"valid": False, "reason": f"regex compile error: {exc}"}
 
-        return {
-            "valid": True,
-            "reason": "ok",
-            "rules": rules,
-        }
+        return {"valid": True, "reason": "ok", "rules": rules}

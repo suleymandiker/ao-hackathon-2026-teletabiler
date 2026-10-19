@@ -23,7 +23,7 @@ st.markdown(theme.CSS, unsafe_allow_html=True)
 
 logo = Path(__file__).resolve().parent / 'assets' / 'ai-in-ai-logo.png'
 with st.sidebar:
-    st.image(str(logo), width=161)
+    #st.image(str(logo), width=161)
     st.caption('Deployment Monitors')
 
 try:

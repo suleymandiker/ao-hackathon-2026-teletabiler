@@ -176,6 +176,12 @@ class RCAEvidenceSelector:
             counts = [number(row.get('count')) for row in rows]
             if all(value is not None for value in counts):
                 item['total_occurrences'] = sum(counts)
+            
+            # --- P2 / P3 TOPOLOJİ VE LATENCY ALANLARI EKLENTİSİ ---
+            if 'avg_latency' in representative and representative['avg_latency'] is not None:
+                item['avg_latency'] = representative['avg_latency']
+            # -----------------------------------------------------
+            
             for name, reducer in (('severity_min', min), ('qualification_score', max)):
                 values = [number(row.get(name)) for row in rows]
                 if all(value is not None for value in values):
@@ -190,9 +196,17 @@ class RCAEvidenceSelector:
                     item[name] = value
             item['evidence'] = strings(value for row in rows for value in row.get('qualification_evidence', []))
             context = {}
-            for name in ('hosts', 'data_centers', 'racks', 'business_criticalities'):
+            
+            # --- CONTEXT ALANLARI GENİŞLETİLDİ ---
+            context_fields = (
+                'hosts', 'data_centers', 'racks', 'business_criticalities',
+                'pod_names', 'pod_ips', 'container_images', 'service_ids', 'pod_template_hashes'
+            )
+            for name in context_fields:
                 if values := strings(value for row in rows for value in row.get(name, [])):
                     context[name] = values
+            # -------------------------------------
+            
             if context:
                 item['context'] = context
             if not item['evidence']:
@@ -210,8 +224,16 @@ class RCAEvidenceSelector:
             if root_view:
                 item['probable_root'] = root_view
             context = incident.get('context') or {}
-            compact_context = {name: values for name in ('services', 'components', 'hosts', 'data_centers', 'racks', 'business_criticalities')
+            
+            # --- INCIDENT CONTEXT ALANLARI GENİŞLETİLDİ ---
+            inc_context_fields = (
+                'services', 'components', 'hosts', 'data_centers', 'racks', 'business_criticalities',
+                'pod_names', 'container_images', 'service_ids'
+            )
+            compact_context = {name: values for name in inc_context_fields
                                if (values := strings(context.get(name, [])))}
+            # ----------------------------------------------
+            
             paths = sorted({tuple(strings_path) for dep in context.get('dependencies', [])
                             if isinstance(dep, dict) and (strings_path := self._path(dep.get('path')))})[:4]
             if paths:

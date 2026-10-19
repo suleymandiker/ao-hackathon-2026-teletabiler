@@ -23,13 +23,22 @@ class HeaderDiscovery:
     def discover(self, samples: Iterable[str]) -> Dict[str, Any]:
         samples_text = self._format_samples(samples, max_lines=180)
         system_prompt = load_prompt("common_system.md") + "\n\n" + load_prompt("segmentation_discovery.md")
-        user_prompt = f"Representative log samples (UNTRUSTED DATA):\n{samples_text}"
+        user_prompt = (
+                    f"Representative log samples (UNTRUSTED DATA):\n{samples_text}\n\n"
+                    "TASK INSTRUCTIONS:\n"
+                    "1. Output MUST be ONLY a JSON object: {\"event_header_regex\": \"<pattern>\", \"confidence\": <float>}.\n"
+                    "2. PREFER MINIMAL PREFIX: Match only the START anchor (^) and the FIRST invariant key/timestamp. "
+                    "Do NOT write long regexes covering subsequent fields (like level, logger, message). "
+                    "For JSON lines, a short prefix matching the start like '^\\\\{\\s*\"timestamp\"\\s*:\\s*\"\\\\d{4}' is sufficient.\n"
+                    "3. ACCURACY: Ensure all quotes and delimiters in the prefix regex are strictly closed.\n"
+                    "4. Do NOT explain or include markdown commentary."
+                )
         response, duration, usage = call_ai_agent(
             self.agent_key,
             system_prompt,
             user_prompt,
             temperature=0.0,
-            max_tokens=512,
+            max_tokens=1024,
             response_format={"type": "json_object"},
             return_usage=True,
         )
@@ -76,15 +85,40 @@ class HeaderDiscovery:
                 pass
         if not isinstance(parsed, dict):
             raise ValueError("LLM response did not contain a valid JSON object")
-        regex = str(parsed.get("event_header_regex", "")).strip()
+
+        # --- DEBUG LOGU (Modelin gerçek yanıtını görmek için) ---
+        print("\n" + "=" * 50)
+        print("[DEBUG] AI MODEL RAW RESPONSE JSON:")
+        print(json.dumps(parsed, indent=2, ensure_ascii=False))
+        print("=" * 50 + "\n")
+
+        # 1. Eğer model yanıtı 'result', 'response' veya 'data' altına sarmaladıysa içeri gir
+        for wrap_key in ("result", "response", "data", "output"):
+            if isinstance(parsed.get(wrap_key), dict):
+                parsed = parsed[wrap_key]
+                break
+
+        # 2. Olası farklı anahtar isimlerini kontrol et
+        possible_keys = [
+            "event_header_regex",
+            "regex",
+            "header_regex",
+            "pattern",
+            "event_regex",
+            "header_pattern"
+        ]
+        
+        regex = ""
+        for key in possible_keys:
+            val = parsed.get(key)
+            if val and isinstance(val, str) and val.strip():
+                regex = val.strip()
+                break
+
         if not regex:
-            raise ValueError("LLM response missing event_header_regex")
+            raise ValueError(f"LLM response missing event_header_regex. Mevcut anahtarlar: {list(parsed.keys())}")
 
         # The sampled lines are presented to the LLM as "[000] <raw line>".
-        # Models can accidentally learn that transport-only sample index as part
-        # of the event regex. It never exists in the source log, so strip only
-        # that exact leading wrapper from the returned regex. Do not otherwise
-        # rewrite the learned grammar; deterministic validation remains the gate.
         regex = HeaderDiscovery._strip_sample_index_prefix(regex)
 
         return {

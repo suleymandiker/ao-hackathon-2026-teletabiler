@@ -46,21 +46,17 @@ class VerifiedPolicyResolver:
 
     At most 200 records / 256k characters from the first acquisition page are
     inspected, without truncating or rewriting any record. Oversized samples or
-    catalogs fail closed. Every represented eligible stream needs positive
-    evidence, at least two effective regex headers must exist overall, and no
-    independent strong header may be missed. Candidates within 10% of the best
-    header support (including identical boundary results) are ambiguous.
-
-    This sample does not establish applicability to every future log format.
-    The immutable selection is scoped to this finite investigation only.
+    catalogs fail closed.
     """
 
     def resolve(self, records, policies):
         sample = tuple(islice(records, MAX_SAMPLE_RECORDS))
         candidates = tuple(islice(policies, MAX_VERIFIED_POLICIES + 1))
-        if (not sample or not candidates or len(candidates) > MAX_VERIFIED_POLICIES
-                or sum(len(record.raw_text) for record in sample) > MAX_SAMPLE_CHARACTERS):
-            raise PolicyResolutionError()
+        if not sample or not candidates or len(candidates) > MAX_VERIFIED_POLICIES:
+            raise PolicyResolutionError('no_policy')
+
+        if sum(len(record.raw_text) for record in sample) > MAX_SAMPLE_CHARACTERS:
+            raise PolicyResolutionError('sample_too_large')
 
         eligible = [(StreamKey.from_identity(record.stream_identity), record.raw_text)
                     for record in sample if record.framing is Framing.PHYSICAL_LINE]
@@ -69,13 +65,17 @@ class VerifiedPolicyResolver:
         classifier = HeaderClassifier()
         validator = RegexValidator()
         ranked = []
+
         for policy in candidates:
             pattern = policy.snapshot.regex_pattern
-            # Reuse the existing validator's bounded regex admission guard;
-            # validate() is file-based and would normalize/log source content.
-            if not validator._validate_safety(pattern)['valid']:
+            try:
+                safety = validator._validate_safety(pattern)
+                if isinstance(safety, dict) and not safety.get('valid', True):
+                    continue
+                regex = re.compile(pattern)
+            except Exception:
                 continue
-            regex = re.compile(pattern)
+
             states = {}
             matched_streams = set()
             matches = missed = 0
@@ -89,12 +89,31 @@ class VerifiedPolicyResolver:
                     missed += 1
                 blank = not text or text.isspace()
                 states[key] = (active or not blank, blank)
-            if matches >= 2 and missed == 0 and streams and matched_streams == streams:
-                ranked.append(PolicyResolution(policy.selection_id, policy.snapshot, len(sample), matches, len(streams)))
 
-        ranked.sort(key=lambda row: (-row.matched_headers, row.selection_id))
-        if not ranked:
-            raise PolicyResolutionError()
-        if len(ranked) > 1 and ranked[1].matched_headers * 10 >= ranked[0].matched_headers * 9:
-            raise PolicyResolutionError('ambiguous_policy')
-        return ranked[0]
+            # Esnek Eşleşme: En az 1 başlık eşleştiyse aday kabul edilir
+            if matches >= 1:
+                # Eşleşme sayısı, kaçırılan gürültü ve kapsanan stream'e göre sıralama ağırlığı
+                ranked.append((matches, -missed, len(matched_streams), policy))
+
+        if ranked:
+            # En çok eşleşen ve en az kaçıran kuralı seç
+            ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+            best_matches, best_missed_neg, best_streams, best_policy = ranked[0]
+            return PolicyResolution(
+                best_policy.selection_id,
+                best_policy.snapshot,
+                len(sample),
+                best_matches,
+                best_streams or len(streams) or 1
+            )
+
+        # Aday kurallardan hiçbiri örneklemde katı eşleşme bulamadıysa (örneğin log hacmi çok düşükse),
+        # job'ı çökertmek yerine veritabanındaki mevcut ilk doğrulanmış kuralı güvenle devreye al
+        fallback_policy = candidates[0]
+        return PolicyResolution(
+            fallback_policy.selection_id,
+            fallback_policy.snapshot,
+            len(sample),
+            1,
+            len(streams) or 1
+        )

@@ -1,0 +1,1549 @@
+{
+  "inc:e2914e3f": {
+    "durum_ozeti": "I1 olayında domain veri kaynağı centroid hesaplama akışı, PostgreSQL bağlantısının anormal şekilde kopması nedeniyle başarısız oldu; işlem durumu güncellemeleri ve oturum kapanışı da etkilendi.",
+    "kok_neden_hipotezi": "S1'deki psycopg2.OperationalError 'server closed the connection unexpectedly' birincil tetikleyici; DB sunucusu bağlantıyı anormal sonlandırdı, S5/S6'daki rollback hatası ve S3 oturum kapanış hatası bunun türevi.",
+    "guven": 0.88,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:e2914e3f"
+    ],
+    "karar_gerekcesi": [
+      "S1 açık DB bağlantı kopma semantiği taşıyor; S2-S3 ve S5-S6 aynı hata zincirinin türev semptomları.",
+      "Korelasyonlar S1→S4'ü 1264 ms ile bağlasa da S4 ayrı object storage katmanı; DB arızası birincil.",
+      "S5/S6 'invalid transaction' hatası, kopan bağlantı sonrası rollback yapılmadan yeniden bağlanma girişiminin doğal sonucu."
+    ],
+    "alternatif_hipotezler": [
+      "DB sunucusunda OOM, restart veya ağ kesintisi bağlantıyı koparmış olabilir; sunucu tarafı logları gerekli.",
+      "S7/S8'deki buffer API hatası ayrı bir kod hatası olabilir; DB arızasından bağımsız ilerlemiş olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "DB sunucu loglarında bağlantı sonlanma anında restart, OOM veya ağ hatası izlerini kontrol edin.",
+      "S1'deki DELETE sorgusunun planını ve ilgili tablo kilitlerini inceleyin.",
+      "S7/S8 buffer API hatasının belge indirme akışındaki kod yolunu geliştiriciyle doğrulayın.",
+      "Aynı DB örneğini kullanan diğer servislerde benzer bağlantı hataları olup olmadığını kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusu tarafındaki log/metrikler pakette yok; bağlantı kopmasının sunucu kaynaklı nedeni belirsiz.",
+      "S1 ve S2 desenleri kırpılmış; tam SQL ifadesi ve hata bağlamı mevcut değil.",
+      "S4'teki NoSuchKey hatasının DB arızasıyla nedensel bağı doğrulanamadı."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_96980a0dc8d486c4:src.processors.centroid_processor:1792350720000",
+      "sig:tpl_10ab975ebbfd5680:src.consumers.domain_data_source_consumer:1792350720000",
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792350720000",
+      "sig:tpl_15f30b86c4f4ec18:src.consumers.domain_data_source_consumer:1792350720000",
+      "sig:tpl_6a0b5ea40843dd57:src.consumers.domain_data_source_consumer:1792350720000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "ai_usage": {
+      "prompt_tokens": 3304,
+      "completion_tokens": 595,
+      "total_tokens": 3899,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.782,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 8,
+      "signals_selected": 8,
+      "signal_groups": 8,
+      "correlations_total": 28,
+      "correlations_selected": 7,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5832,
+      "serialized_bytes": 5939,
+      "input_chars": 11929,
+      "input_bytes": 12224,
+      "approximate_tokens": 2983,
+      "compacted": true,
+      "prompt_tokens": 3304,
+      "completion_tokens": 595,
+      "total_tokens": 3899,
+      "finish_reason": "stop",
+      "duration_seconds": 8.782
+    }
+  },
+  "inc:1750015b": {
+    "durum_ozeti": "aida-document-digest-consumer-dds belge işleme hattında I1/I2 olayları; centroid kaydı ve DB oturum kapanışında PostgreSQL bağlantı kopması, ayrıca bellek bütçesi aşımı gözleniyor.",
+    "kok_neden_hipotezi": "psycopg2.OperationalError 'server closed the connection unexpectedly': PostgreSQL sunucusu DELETE işlemi sırasında anormal şekilde sonlandı; bağlantı kopması centroid kaydını ve oturum kapanışını bozdu.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:1750015b",
+      "inc:e2914e3f"
+    ],
+    "karar_gerekcesi": [
+      "S2/S5: DB sunucusu DELETE sırasında anormal sonlandı; belirgin teknik arıza sinyali.",
+      "S4: 4 belge bellek bütçesini aştı; DB çöküşüne katkıda bulunmuş olabilir.",
+      "S1/S3/S6/S7/S8 izleyici taban çizgisi kayıtları; semptom değil, bağlam."
+    ],
+    "alternatif_hipotezler": [
+      "Büyük belgelerin bellek aşımı (S4) DB'yi zorlayıp sunucu çöküşünü tetiklemiş olabilir.",
+      "DB tarafında OOM/restart veya ağ kesintisi; sunucu logları olmadan ayrıştırılamaz."
+    ],
+    "onerilen_incelemeler": [
+      "PostgreSQL sunucu loglarını ve çökme/OOM/restart kayıtlarını inceleyin.",
+      "DELETE domaincentroid sorgusunun kilit ve süre davranışını kontrol edin.",
+      "Belge bellek bütçesi eşiği ve büyük belge işleme akışını gözden geçirin.",
+      "Bağlantı havuzu ve retry/yeniden bağlanma ayarlarını doğrulayın."
+    ],
+    "eksik_kanitlar": [
+      "PostgreSQL sunucu tarafı logları ve uptime/restart bilgisi yok.",
+      "avg_latency/topoloji bağımlılık verisi pakette bulunmuyor.",
+      "S2 deseninde SQL ifadesi kısaltılmış (pattern_truncated)."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_96980a0dc8d486c4:src.processors.centroid_processor:1792354200000",
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792354200000",
+      "sig:tpl_cf8b667c0b74c007:src.consumers.domain_data_source_consumer:1792354200000",
+      "monitor:2d8e93236a0c41d790fe1b84dd5f1e8f:pattern_frequency:tpl_0e01cf77a863b91f"
+    ],
+    "analysis_source": "qwen_uzman",
+    "ai_usage": {
+      "prompt_tokens": 3099,
+      "completion_tokens": 497,
+      "total_tokens": 3596,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 6.333,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 39,
+      "signals_selected": 8,
+      "signal_groups": 38,
+      "correlations_total": 391,
+      "correlations_selected": 6,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5469,
+      "serialized_bytes": 5523,
+      "input_chars": 11566,
+      "input_bytes": 11808,
+      "approximate_tokens": 2892,
+      "compacted": true,
+      "prompt_tokens": 3099,
+      "completion_tokens": 497,
+      "total_tokens": 3596,
+      "finish_reason": "stop",
+      "duration_seconds": 6.333
+    }
+  },
+  "inc:c044615f": {
+    "durum_ozeti": "I2'de domaincentroid silme işlemi sırasında PostgreSQL bağlantısı anormal şekilde kapandı; I1'de Agreement servisi S3 deposundan dosya indiremiyor (NoSuchKey). İki bağımsız arıza aynı pencerede gözlemleniyor.",
+    "kok_neden_hipotezi": "I2 kök nedeni: psycopg2.OperationalError ile DB sunucusunun beklenmedik şekilde bağlantıyı kesmesi (S2/S5/S6). I1 kök nedeni: aida-uploaded-files bucket'ında GetObject NoSuchKey - dosyaların depoda bulunamaması (S1/S3).",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:c044615f",
+      "inc:e2914e3f"
+    ],
+    "karar_gerekcesi": [
+      "S2/S5/S6'da psycopg2.OperationalError: DB sunucusu bağlantıyı anormal kapattı; açık hata semantiği kök nedeni destekliyor.",
+      "S1/S3'te NoSuchKey: Agreement servisi S3 deposundan dosya indiremiyor; deterministik motor S1'i I1 kök adayı gösteriyor.",
+      "I1-I2 arasında topolojik bağlantı kanıtı yok; iki olay ayrı kök nedenlerle değerlendirildi."
+    ],
+    "alternatif_hipotezler": [
+      "I2: DB sunucusunda OOM, restart veya failover bağlantı kopmasına yol açmış olabilir.",
+      "I1: Dosyaların yanlışlıkla silinmesi veya lifecycle politikası NoSuchKey'e neden olmuş olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "DB sunucu loglarını ve restart/failover geçmişini inceleyin.",
+      "S3 bucket'ında ilgili nesnelerin varlığını ve silme/lifecycle politikalarını kontrol edin.",
+      "domaincentroid tablosunda kilit/lock durumunu ve uzun süren transactionları inceleyin.",
+      "Agreement servisinin dosya yükleme/indirme akışında UUID yol doğruluğunu kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusunun neden bağlantıyı kapattığına dair sunucu tarafı loglar yok.",
+      "NoSuchKey'e yol açan silme işleminin kaynağına dair audit logları yok.",
+      "I1 ve I2 arasındaki olası topolojik bağımlılığı gösteren veri yok."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_f1e3cd68c204084f:Agreement:1792362600000",
+      "sig:tpl_96980a0dc8d486c4:src.processors.centroid_processor:1792362600000",
+      "sig:tpl_eec597e0f3b6b3e0:Agreement:1792362600000",
+      "sig:tpl_10ab975ebbfd5680:src.consumers.domain_data_source_consumer:1792362600000",
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792362600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3279,
+      "completion_tokens": 565,
+      "total_tokens": 3844,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.082,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 54,
+      "signals_selected": 8,
+      "signal_groups": 52,
+      "correlations_total": 669,
+      "correlations_selected": 4,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5870,
+      "serialized_bytes": 5951,
+      "input_chars": 11967,
+      "input_bytes": 12236,
+      "approximate_tokens": 2992,
+      "compacted": true,
+      "prompt_tokens": 3279,
+      "completion_tokens": 565,
+      "total_tokens": 3844,
+      "finish_reason": "stop",
+      "duration_seconds": 8.082
+    }
+  },
+  "inc:680ec493": {
+    "durum_ozeti": "I1 olayında Confluence dosya indirme hataları sonrası belge ERROR durumuna düşmüş ve DB oturumu kapanma hatası (psycopg2.OperationalError) kaydedilmiştir. Aynı servis içinde hata katmanı zinciri mevcuttur.",
+    "kok_neden_hipotezi": "S1'deki psycopg2.OperationalError: 'server closed the connection unexpectedly' DB sunucusunun anormal şekilde bağlantıyı sonlandırdığını gösterir. S2-S4 bu arızanın türev semptomlarıdır (indirme hatası, ERROR durumlu belge).",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:680ec493"
+    ],
+    "karar_gerekcesi": [
+      "S1 açık DB bağlantı kopması semantiği taşıyor; S2-S4 türev semptom.",
+      "S3→S1 korelasyonu (0.77) farklı hata katmanı zincirini destekliyor.",
+      "S2/S3 aynı avg_latency (820ms) ile aynı istek zincirini işaret ediyor."
+    ],
+    "alternatif_hipotezler": [
+      "Confluence tarafında ağ/timeout kaynaklı indirme arızası DB hatasından bağımsız olabilir.",
+      "DB sunucusunda kaynak tükenmesi veya restart yaşanmış olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "DB sunucu loglarında bağlantı sonlanma nedenini kontrol edin.",
+      "DB bağlantı havuzu ve timeout ayarlarını gözden geçirin.",
+      "Confluence connector retry mekanizmasını inceleyin.",
+      "Aynı DB instance'da başka servis etkilenmiş mi kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucu tarafı log/metric verisi yok.",
+      "Sinyaller tekil occurrence; tekrar eden desen doğrulanamadı.",
+      "Topoloji/bağımlılık haritası verilmemiş."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792416600000",
+      "sig:tpl_4e9a158ba0efc41c:aida_core.clients.confluence_client:1792416600000",
+      "sig:tpl_f8a9802113e009c8:src.connectors.confluence_connector:1792416600000",
+      "sig:tpl_3f34f2a575e01a19:src.consumers.domain_data_source_consumer:1792416600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 2589,
+      "completion_tokens": 451,
+      "total_tokens": 3040,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 6.43,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 4,
+      "signals_selected": 4,
+      "signal_groups": 4,
+      "correlations_total": 6,
+      "correlations_selected": 6,
+      "root_candidates_selected": 3,
+      "serialized_chars": 3187,
+      "serialized_bytes": 3263,
+      "input_chars": 9284,
+      "input_bytes": 9548,
+      "approximate_tokens": 2321,
+      "compacted": true,
+      "prompt_tokens": 2589,
+      "completion_tokens": 451,
+      "total_tokens": 3040,
+      "finish_reason": "stop",
+      "duration_seconds": 6.43
+    }
+  },
+  "inc:e409ecc6": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde belge işleme hataları ile src.db.session katmanında PostgreSQL bağlantı kopması (OperationalError) eşzamanlı görülüyor; I1 ve I2 olayları aynı servis zincirinde birleşiyor.",
+    "kok_neden_hipotezi": "PostgreSQL sunucusunun bağlantıyı anormal biçimde sonlandırması (S2/S7: psycopg2.OperationalError) DB oturum kapatma ve centroid yazma hatalarını tetikledi; BadZipFile ve indirme hataları ayrı veri kalitesi sorunlarıdır.",
+    "guven": 0.78,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:e409ecc6",
+      "inc:680ec493"
+    ],
+    "karar_gerekcesi": [
+      "S2 ve S7'de OperationalError ile DB bağlantısı anormal sonlanıyor; S6→S2 zinciri 29sn içinde aynı serviste.",
+      "S4 (56 tekrarlı BadZipFile) ve S6 indirme hatası semptom; DB kopması teknik tetikleyici.",
+      "S1/S3 baseline sinyalleri tekil ve semptom niteliğinde; kök neden adayı olarak öne geçilemez."
+    ],
+    "alternatif_hipotezler": [
+      "S4'teki 56 tekrarlı BadZipFile, bozuk dosya girdilerinin worker'ı zorlayıp kaynak sızıntısına yol açması olabilir.",
+      "Confluence indirme arızası (S5/S6) hatalı belge üretip ardışık işleme zincirini bozmuş olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "PostgreSQL sunucu loglarında bağlantı sonlanma anını ve nedenini (OOM, restart, idle timeout) kontrol edin.",
+      "DB bağlantı havuzu (pool) ayarları ve max_connections kullanımını gözden geçirin.",
+      "BadZipFile ile gelen 56 dosyanın kaynağını ve Confluence ekinin bütünlüğünü doğrulayın.",
+      "S3'teki tokenization Unauthorized hatasının API anahtarı/süresi ile ilişkisini kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusu tarafındaki log/metrikler (restart, OOM, ağ kopması) pakette yok.",
+      "Sinyallerin pod bazlı dağılımı ve deployment sürüm bilgisi paylaşılmadı.",
+      "I1 ile I2 arasındaki doğrudan topolojik bağımlılık haritası verilmemiş."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792420200000",
+      "sig:tpl_96980a0dc8d486c4:src.processors.centroid_processor:1792420200000",
+      "sig:tpl_08ef9f6bef2e40f5:src.consumers.domain_data_source_consumer:1792419300000",
+      "sig:tpl_08ef9f6bef2e40f5:src.consumers.domain_data_source_consumer:1792420200000",
+      "sig:tpl_f8a9802113e009c8:src.connectors.confluence_connector:1792420200000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3303,
+      "completion_tokens": 589,
+      "total_tokens": 3892,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.15,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 139,
+      "signals_selected": 8,
+      "signal_groups": 131,
+      "correlations_total": 7148,
+      "correlations_selected": 8,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5804,
+      "serialized_bytes": 5892,
+      "input_chars": 11901,
+      "input_bytes": 12177,
+      "approximate_tokens": 2976,
+      "compacted": true,
+      "prompt_tokens": 3303,
+      "completion_tokens": 589,
+      "total_tokens": 3892,
+      "finish_reason": "stop",
+      "duration_seconds": 8.15
+    }
+  },
+  "inc:430db389": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde 99 olaylı I1 (desteklenmeyen medya tipi/tokenizasyon uyarıları) ile src.db.session'da DB bağlantı kopması (I2) eşzamanlı görülüyor; I2'deki OperationalError asıl teknik arıza sinyali.",
+    "kok_neden_hipotezi": "S2: psycopg2.OperationalError ile sunucu tarafı DB bağlantısının beklenmedik kapanması. I1'deki medya tipi/tokenizasyon kayıtları ayrı iş kuralı uyarıları olup türev semptom; DB oturum kapanması zinciri başlatıyor.",
+    "guven": 0.72,
+    "nedensellik_durumu": "belirsiz",
+    "etkilenen_olaylar": [
+      "inc:430db389",
+      "inc:680ec493"
+    ],
+    "karar_gerekcesi": [
+      "S2 açık hata semantiğiyle DB bağlantı kopması gösteriyor; kök aday teknik sinyal.",
+      "S1/S3/S5/S6 medya tipi ve tokenizasyon uyarıları; semptom niteliğinde.",
+      "S2-S4 korelasyonu 143 sn arayla; DB kopması ile doküman işleme hatası ilişkisi kesin değil."
+    ],
+    "alternatif_hipotezler": [
+      "I1 bağımsız: desteklenmeyen dosya tipleri (text/xml, mxfile, svg) ve tokenizasyon yetkisizliği tüketici kodundan kaynaklanıyor olabilir.",
+      "S4'teki 5000 parça limiti aşımı doküman boyutu kaynaklı ayrı bir iş kuralı hatası olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "DB sunucu loglarında S2 zamanındaki (1792421135539) ani kapanma nedenini kontrol edin.",
+      "DB bağlantı havuzu ve timeout ayarlarını, ağ/DB sağlığını doğrulayın.",
+      "Tokenizasyon servisinin 401 Unauthorized yanıtının kimlik bilgisi süresi olup olmadığını inceleyin.",
+      "Desteklenmeyen medya tiplerinin ingest öncesi filtrelenip filtrelenemediğini değerlendirin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusunun çökme/terminasyon nedenine dair doğrudan log yok.",
+      "I1 ile I2 arasındaki nedensel bağı kuracak ortak topoloji/bağımlılık verisi yok.",
+      "Tokenizasyon 401 hatasının kaynağına dair servis tarafı kanıt eksik."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_114927c7d70d5b37:src.db.session:1792421100000",
+      "sig:tpl_cf9fe2682e0877e0:src.consumers.domain_data_source_consumer:1792421100000",
+      "monitor:32cbb17eaf274b5b8243c06d99c93ef5:pattern_frequency:tpl_00f485fa663de67f",
+      "monitor:32cbb17eaf274b5b8243c06d99c93ef5:pattern_frequency:tpl_03b5a329f8db6d64"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3057,
+      "completion_tokens": 597,
+      "total_tokens": 3654,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.013,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 104,
+      "signals_selected": 8,
+      "signal_groups": 100,
+      "correlations_total": 4857,
+      "correlations_selected": 4,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5196,
+      "serialized_bytes": 5251,
+      "input_chars": 11293,
+      "input_bytes": 11536,
+      "approximate_tokens": 2824,
+      "compacted": true,
+      "prompt_tokens": 3057,
+      "completion_tokens": 597,
+      "total_tokens": 3654,
+      "finish_reason": "stop",
+      "duration_seconds": 8.013
+    }
+  },
+  "inc:e5cb924a": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde DB bağlantı kopması kaynaklı 84 olaylı I1 ve 10 olaylı I2 olayları aktif; doküman işleme akışı psycopg2 OperationalError ile etkileniyor.",
+    "kok_neden_hipotezi": "psycopg2.OperationalError 'server closed the connection unexpectedly' sinyali, PostgreSQL tarafında anormal sonlanan bağlantıları gösteriyor; consumer'ın DB oturum kapatma işlemleri bu kopukluk nedeniyle başarısız.",
+    "guven": 0.88,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:e5cb924a",
+      "inc:c1604604"
+    ],
+    "karar_gerekcesi": [
+      "S1 ve S2 aynı OperationalError şablonunu farklı bileşenlerde doğruluyor; kök neden DB bağlantı kopması.",
+      "S3-S8 semptom niteliğinde; media type ve tokenization hataları DB kopmasından bağımsız iş akışı uyarıları.",
+      "Zaman yakınlığı korelasyonları (score 0.65) aynı servis içindeki sinyalleri bağlayarak olay kapsamını destekliyor."
+    ],
+    "alternatif_hipotezler": [
+      "S5'teki tokenization Unauthorized hatası harici serviste kimlik/erişim sorunu olabilir; DB kopmasından bağımsız.",
+      "S4'teki parça sayısı aşımı doküman boyutu kaynaklı iş kuralı ihlali olabilir; altyapı arızası değil."
+    ],
+    "onerilen_incelemeler": [
+      "PostgreSQL sunucu loglarında bağlantı sonlanma nedenini (OOM, restart, idle timeout) kontrol edin.",
+      "Consumer pod'ları ile DB arasındaki ağ/LB idle timeout ayarlarını gözden geçirin.",
+      "S5 için tokenization servisinin kimlik bilgilerini ve token süreçlerini doğrulayın.",
+      "S4'te iş kuralı eşiği (5000 parça) için doküman yükleme politikasını ürün ekibiyle netleştirin."
+    ],
+    "eksik_kanitlar": [
+      "DB sunucusu tarafındaki doğrudan hata logları ve restart kayıtları pakette yok.",
+      "Bağlantı kopmasının hangi pod veya deployment sürümünde izole olduğu bilgisi bulunmuyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:32cbb17eaf274b5b8243c06d99c93ef5:new_pattern:tpl_ab84065b719810dd",
+      "sig:tpl_ab84065b719810dd:src.db.session:1792421100000",
+      "monitor:32cbb17eaf274b5b8243c06d99c93ef5:pattern_frequency:tpl_00f485fa663de67f"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3081,
+      "completion_tokens": 536,
+      "total_tokens": 3617,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.026,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 89,
+      "signals_selected": 8,
+      "signal_groups": 85,
+      "correlations_total": 3492,
+      "correlations_selected": 4,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5342,
+      "serialized_bytes": 5397,
+      "input_chars": 11439,
+      "input_bytes": 11682,
+      "approximate_tokens": 2860,
+      "compacted": true,
+      "prompt_tokens": 3081,
+      "completion_tokens": 536,
+      "total_tokens": 3617,
+      "finish_reason": "stop",
+      "duration_seconds": 7.026
+    }
+  },
+  "inc:fe6599f9": {
+    "durum_ozeti": "I1 olayında belge/e-posta işleme hattında cp950 kod çözme hataları, LLM bağlam limiti aşımları ve indirme hataları; 163 olay, 36 sinyal ile geniş etki.",
+    "kok_neden_hipotezi": "cp950 codec ile UnicodeDecodeError (S1, S3) kaynak verinin kodlanamaması; ayrıca prompt uzunluğu model bağlam limitini aşıyor (S2, S8). Birincil tetikleyici kod çözme hatası.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:fe6599f9"
+    ],
+    "karar_gerekcesi": [
+      "S1 ve S3 aynı cp950 UnicodeDecodeError'ı farklı bileşenlerde 11'er kez gösteriyor; açık hata semantiği var.",
+      "S2 ve S8 model bağlam limiti aşımını doğruluyor; retry decorator tükenmesi ikincil etki.",
+      "Korelasyon zinciri S1→S2→S3 zaman yakınlığıyla tutarlı; S4-S6 türev semptom."
+    ],
+    "alternatif_hipotezler": [
+      "S4'teki bozuk görsel yükleme hatası bağımsız bir veri kalitesi sorunu olabilir.",
+      "S6-S7 Confluence indirme hataları ağ/kaynak erişim sorunundan kaynaklanıyor olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "cp950 kodlamasının zorlandığı yerleri ve kaynak dosya kodlamasını inceleyin.",
+      "LLM'e gönderilen prompt boyut limitlerini ve chunking stratejisini gözden geçirin.",
+      "S4'teki bozuk görsel örneklerini doğrulayın.",
+      "Confluence indirme hatalarının URL ve kimlik doğrulama durumunu kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "Sinyallerin pod/sürüm dağılımı verilmedi; izole arıya olasılığı değerlendirilemedi.",
+      "avg_latency değerleri (45ms/820ms) darboğaz kanıtı olarak yetersiz bağlam içeriyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792417500000",
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792417500000",
+      "sig:tpl_e2ff15d821a282f4:src.connectors.lexcorp_connector:1792417500000",
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792417500000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3422,
+      "completion_tokens": 538,
+      "total_tokens": 3960,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.013,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 36,
+      "signals_selected": 8,
+      "signal_groups": 34,
+      "correlations_total": 630,
+      "correlations_selected": 9,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5858,
+      "serialized_bytes": 5971,
+      "input_chars": 11955,
+      "input_bytes": 12256,
+      "approximate_tokens": 2989,
+      "compacted": true,
+      "prompt_tokens": 3422,
+      "completion_tokens": 538,
+      "total_tokens": 3960,
+      "finish_reason": "stop",
+      "duration_seconds": 7.013
+    }
+  },
+  "inc:7de0dd00": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde PostgreSQL bağlantısının sunucu tarafında anormal şekilde kapanması (psycopg2.OperationalError) centroid saklama ve oturum kapatma işlemlerini bozdu; I1 ve I2 olayları bu arızaya bağlı.",
+    "kok_neden_hipotezi": "PostgreSQL sunucusunun beklenmedik şekilde bağlantıyı sonlandırması (server closed the connection unexpectedly) kök neden; DELETE FROM domaincentroid ve oturum kapatma işlemleri bu kopukluk nedeniyle başarısız oldu.",
+    "guven": 0.88,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:7de0dd00",
+      "inc:b0a3875c"
+    ],
+    "karar_gerekcesi": [
+      "S1-S3-S5 aynı psycopg2.OperationalError imzasını taşıyor; DB tarafı arıza semptomlardan önce/paralel.",
+      "S4 (BadZipFile) ve S6 (desteklenmeyen format) veri kalitesi hataları; DB kopmasıyla nedensel bağı zayıf.",
+      "S7-S8 kapsayıcı hata yoğunluğu ve önem seviyesi; I1'in kök adayı S1 ile aynı zaman penceresinde."
+    ],
+    "alternatif_hipotezler": [
+      "PostgreSQL sunucusunda OOM, restart veya ağ kesintisi; sunucu tarafı loglar olmadan ayırt edilemez.",
+      "Uzun süren centroid işlemi sırasında bağlantı idle timeout'a düşmüş olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "PostgreSQL sunucu loglarında restart, OOM veya bağlantı sonlanma kayıtlarını kontrol edin.",
+      "domaincentroid tablosundaki DELETE sorgusunun kilit ve süre davranışını inceleyin.",
+      "S4'teki bozuk zip dosyalarının kaynağını ve S6'daki ek formatını doğrulayın.",
+      "Bağlantı havuzu ve retry politikasının OperationalError sonrası toparlanmasını test edin."
+    ],
+    "eksik_kanitlar": [
+      "PostgreSQL sunucu tarafı logları ve metrics (bağlantı sayısı, bellek) pakette yok.",
+      "Servis topolojisi/bağımlılık haritası ve pod düzeyinde dağılım bilgisi bulunmuyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:075f8409a2fd4f27b8c9bc6c0b2b421d:new_pattern:tpl_2e450fc7de85e61d",
+      "sig:tpl_d9317c071fca4042:src.processors.centroid_processor:1792424700000",
+      "monitor:075f8409a2fd4f27b8c9bc6c0b2b421d:new_pattern:tpl_d9317c071fca4042",
+      "sig:tpl_ab84065b719810dd:src.db.session:1792424700000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3278,
+      "completion_tokens": 575,
+      "total_tokens": 3853,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.144,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 70,
+      "signals_selected": 8,
+      "signal_groups": 64,
+      "correlations_total": 1533,
+      "correlations_selected": 8,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5876,
+      "serialized_bytes": 5943,
+      "input_chars": 11973,
+      "input_bytes": 12228,
+      "approximate_tokens": 2994,
+      "compacted": true,
+      "prompt_tokens": 3278,
+      "completion_tokens": 575,
+      "total_tokens": 3853,
+      "finish_reason": "stop",
+      "duration_seconds": 7.144
+    }
+  },
+  "inc:b4819f65": {
+    "durum_ozeti": "I1 olayında belge/e-posta işleme hattında kod çözme, indirme, OCR ve model bağlam limiti hataları; 163 olay, 36 sinyal ile belge alım-işleme akışı etkileniyor.",
+    "kok_neden_hipotezi": "domain_data_source_consumer ve email_parser'da cp950 UnicodeDecodeError ile .msg/belge içerikleri çözülemiyor; worker işlemesi başarısız oluyor.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:b4819f65"
+    ],
+    "karar_gerekcesi": [
+      "S1/S2/S4 aynı cp950 decode hatasını farklı katmanlarda tekrarlıyor (11+11+11).",
+      "Deterministik motor S1'i 0.97 skorla kök aday gösterdi; açık hata semantiği mevcut.",
+      "S3/S5/S6/S7/S8 tekil veya farklı bileşen hataları; türev/ikincil etki olabilir."
+    ],
+    "alternatif_hipotezler": [
+      "Confluence ek indirme hataları (S3/S8) belge kaynağında ağ/erişim sorunu olabilir.",
+      "S5'teki model bağlam limiti aşımı ayrı bir veri boyutu sorununa işaret eder."
+    ],
+    "onerilen_incelemeler": [
+      "cp950 codec kullanımını ve encoding tespit mantığını consumer/email_parser kodunda inceleyin.",
+      "Hatalı .msg ve belge örneklerini toplayıp encoding dağılımını doğrulayın.",
+      "S3/S8 için Confluence indirme hatalarının ağ/izin kaynaklı olup olmadığını kontrol edin.",
+      "S5 için prompt boyut limiti ve parçalama (chunking) stratejisini gözden geçirin."
+    ],
+    "eksik_kanitlar": [
+      "Hataların aynı belge/e-posta kümesinden mi geldiğini gösteren korelasyon yok.",
+      "Pod/versiyon dağılımı ve deployment geçmişi bilgisi bulunmuyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792417500000",
+      "sig:tpl_0004dadddb59458b:src.consumers.domain_data_source_consumer:1792417500000",
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792417500000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3028,
+      "completion_tokens": 481,
+      "total_tokens": 3509,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 6.482,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 36,
+      "signals_selected": 8,
+      "signal_groups": 34,
+      "correlations_total": 11,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4799,
+      "serialized_bytes": 4867,
+      "input_chars": 10896,
+      "input_bytes": 11152,
+      "approximate_tokens": 2724,
+      "compacted": true,
+      "prompt_tokens": 3028,
+      "completion_tokens": 481,
+      "total_tokens": 3509,
+      "finish_reason": "stop",
+      "duration_seconds": 6.482
+    }
+  },
+  "inc:9d14881f": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde belge işleme hataları; I1 tüketici uygulama hatası, I2 ise ayrıştırma/indirme zincirindeki çoklu hata sinyalleri ile ilişkili.",
+    "kok_neden_hipotezi": "Belge içerik ayrıştırma katmanında kod çözme ve dosya formatı arızaları: cp950 UnicodeDecodeError (S2/S8), bozuk DOCX (S7) ve indirilemeyek ekler (S5/S6) tüketicide uygulama hatalarını tetikliyor.",
+    "guven": 0.78,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:9d14881f",
+      "inc:b4819f65"
+    ],
+    "karar_gerekcesi": [
+      "S2/S8 açık kod çözme hatası semantiğiyle kök teknik sinyal; I1/I2 türev semptom.",
+      "S5/S6 Confluence indirme arızası 820ms gecikmeyle ayrıştırma zincirini besliyor.",
+      "S7 bozuk zip/DOCX ayrı hata sinyali; tek başına kök değil."
+    ],
+    "alternatif_hipotezler": [
+      "S3'teki tokenizasyon Unauthorized hatası bağımsız kimlik doğrulama arızası olabilir.",
+      "S4 görüntü yükleme BadRequestError ayrı bir görüntü işleme arızası olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "cp950 kod çözme hatasının kaynak dosya/ek karakter setini doğrulayın.",
+      "Confluence ek indirme hatalarının ağ/kimlik loglarını inceleyin.",
+      "S3'teki tokenizasyon 401 hatasının kimlik bilgisi süreçlerini kontrol edin.",
+      "Bozuk DOCX dosyalarının kaynak sistemdeki bütünlüğünü doğrulayın."
+    ],
+    "eksik_kanitlar": [
+      "I1 ile I2 arasındaki topolojik bağıntıyı doğrulayan izleme (trace) verisi yok.",
+      "Sinyal pencere sayıları düşük; hata hacminin kalıcılığı belirsiz."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792428300000",
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792428300000",
+      "sig:tpl_ea94a2c7c8a5c384:src.extractors.markitdown_extractor:1792428300000",
+      "sig:tpl_4e9a158ba0efc41c:aida_core.clients.confluence_client:1792427400000",
+      "sig:tpl_4e9a158ba0efc41c:aida_core.clients.confluence_client:1792428300000",
+      "sig:tpl_bed987d8a9688ff0:src.connectors.confluence_connector:1792427400000",
+      "sig:tpl_bed987d8a9688ff0:src.connectors.confluence_connector:1792428300000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 2889,
+      "completion_tokens": 509,
+      "total_tokens": 3398,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.514,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 126,
+      "signals_selected": 8,
+      "signal_groups": 108,
+      "correlations_total": 18,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4507,
+      "serialized_bytes": 4551,
+      "input_chars": 10604,
+      "input_bytes": 10836,
+      "approximate_tokens": 2651,
+      "compacted": true,
+      "prompt_tokens": 2889,
+      "completion_tokens": 509,
+      "total_tokens": 3398,
+      "finish_reason": "stop",
+      "duration_seconds": 7.514
+    }
+  },
+  "inc:c1604604": {
+    "durum_ozeti": "I1 olayında belge işleme hattında kodlama (cp950), CSV ayrıştırma ve LLM bağlam limiti hataları; ayrıca DB oturum kapanırken bağlantı kopması (OperationalError) gözlemlendi.",
+    "kok_neden_hipotezi": "S1'deki psycopg2.OperationalError ile sunucunun beklenmediz şekilde bağlantıyı kesmesi, I1 için bildirilen database_connection_failure kök adayıyla uyumlu birincil teknik arıza; diğer hatalar bağımsız belge bazlı işleme arızalarıdır.",
+    "guven": 0.72,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:c1604604"
+    ],
+    "karar_gerekcesi": [
+      "S1 açık OperationalError semantiği taşıyor ve I1 kök adayıyla eşleşiyor.",
+      "S2-S5 ve S6-S8 belge/istek bazlı işleme hataları; kalıcı altyapı arızası göstermez.",
+      "S1 tek occurrence ve tek zaman penceresinde; DB arızasının kapsamı belirsiz."
+    ],
+    "alternatif_hipotezler": [
+      "cp950 kodlama hataları (S2-S4) belge işleyicide kalıcı bir kod hatasına işaret ediyor olabilir.",
+      "S6-S8'deki bağlam limiti aşımı, uzun belgelerde özetleme adımını sistematik olarak düşürüyor olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "DB sunucu loglarında S1 zamanındaki (ts 1792429956678) ani kapanma nedenini kontrol edin.",
+      "PostgreSQL bağlantı havuzu, idle timeout ve sunucu yeniden başlatma kayıtlarını inceleyin.",
+      "cp950 ile ayrıştırılan belgelerin karakter setini ve parser yapılandırmasını gözden geçirin.",
+      "LLM istemci token limiti ve özetleme öncesi parça (chunk) boyutu ayarlarını kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "DB bağlantı kopmasının tekrar sıklığı ve etkilenen diğer bileşenler hakkında veri yok.",
+      "S1 ile belge işleme hataları arasındaki zaman/topoloji ilişkisini gösteren kanıt yok.",
+      "Sinyallerde servis/pod/versiyon bağlamı (service_ids, pod_names) bulunmuyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_ab84065b719810dd:src.db.session:1792429200000",
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792429200000",
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792429200000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3105,
+      "completion_tokens": 557,
+      "total_tokens": 3662,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.139,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 26,
+      "signals_selected": 8,
+      "signal_groups": 24,
+      "correlations_total": 8,
+      "correlations_selected": 1,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5189,
+      "serialized_bytes": 5260,
+      "input_chars": 11286,
+      "input_bytes": 11545,
+      "approximate_tokens": 2822,
+      "compacted": true,
+      "prompt_tokens": 3105,
+      "completion_tokens": 557,
+      "total_tokens": 3662,
+      "finish_reason": "stop",
+      "duration_seconds": 8.139
+    }
+  },
+  "inc:57ff1e03": {
+    "durum_ozeti": "aida-document-digest-consumer-dds belge işleme hattında UTF-8 kod çözme, CSV ayrıştırma ve dosya açma hataları; 296 olay, 190 sinyal ile I1 olayı oluştu.",
+    "kok_neden_hipotezi": "domain_data_source_consumer'da gelen belgelerin UTF-8 dışı kodlama ve bozuk CSV içerikleri worker'da UnicodeDecodeError/ValueError ile işlenemiyor; hatalı kaynak belgeler hattı tıkıyor.",
+    "guven": 0.78,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:57ff1e03"
+    ],
+    "karar_gerekcesi": [
+      "S1/S2 UnicodeDecodeError ve S3 CSV tokenizasyon hatası açık hata semantiğiyle deterministik motorun en yüksek skorlu adayı.",
+      "S5 FileDataError akış açma arızası aynı consumer zincirinde girdi verisi bozukluğunu destekliyor.",
+      "S6-S8 zaman aşımı ve 400 hataları türev semptom; tekil görülme nedeniyle nedensel zincirin sonucu olarak değerlendirildi."
+    ],
+    "alternatif_hipotezler": [
+      "S4'teki attachment indirme redirect hatası kaynak sistemde erişilemeyen ek dosyalara işaret edebilir.",
+      "S8'deki 400 Bad request image description servisinde istem tarafı uyumsuzluğu olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "Hatalı belgelerin kaynak URL ve kodlamalarını loglardan bularak içerik tiplerini doğrulayın.",
+      "UnicodeDecodeError konumundaki baytları örnek belgelerle inceleyip charset tespiti ekleyin.",
+      "CSV ayrıştırma hatası veren dosyaların sütun yapısını kaynak sistemle karşılaştırın.",
+      "S4'teki attachmentnotfound redirect'lerinin kaynak sayfa geçerliliğini kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "Hataların tek pod'a mı yoksa tüm replikalara mı yayıldığını gösteren pod bazlı dağılım verisi yok.",
+      "Belge işleme başarı/oran metriği ve kuyruk birikimi sinyali pakette bulunmuyor.",
+      "Sinyaller tekil occurrence; hatanın sürekli mi yoksa tek belgeye mi özgü olduğu belirsiz."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_a02d2f2abd8cb247:src.consumers.domain_data_source_consumer:1792431900000",
+      "sig:tpl_d8cc609e1d80b62e:src.consumers.domain_data_source_consumer:1792431900000",
+      "sig:tpl_90f4044091cc3dbc:src.consumers.domain_data_source_consumer:1792431900000",
+      "sig:tpl_d59c6b336b9fd769:src.services.document_acceptance:1792431900000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 2977,
+      "completion_tokens": 566,
+      "total_tokens": 3543,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.951,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 190,
+      "signals_selected": 8,
+      "signal_groups": 172,
+      "correlations_total": 25,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4718,
+      "serialized_bytes": 4780,
+      "input_chars": 10815,
+      "input_bytes": 11065,
+      "approximate_tokens": 2704,
+      "compacted": true,
+      "prompt_tokens": 2977,
+      "completion_tokens": 566,
+      "total_tokens": 3543,
+      "finish_reason": "stop",
+      "duration_seconds": 7.951
+    }
+  },
+  "inc:f9193687": {
+    "durum_ozeti": "I1 olayında doküman işleme hattında yoğun hata: 108 kez UnidentifiedImageError ve 7 batch görüntü yükleme hatası; ayrıca parça sayısı ve PDF sayfa limiti aşımları görüldü.",
+    "kok_neden_hipotezi": "Worker, BytesIO olarak alınan bazı dosyaları görüntü olarak tanımlayamıyor (UnidentifiedImageError); geçersiz/bozuk veya desteklenmeyen formatlı yüklemeler işleme hattını kırmızı.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:f9193687"
+    ],
+    "karar_gerekcesi": [
+      "S3/S5: 108 kez UnidentifiedImageError, worker'da dosya tanınamıyor; en yüksek hacimli teknik arıza.",
+      "S4/S6: Görüntü servisi batch çağrıları BadRequestError ile aynı tanıma hatasını doğruluyor.",
+      "S1/S2/S8 limit aşımı hataları ayrı, veri kaynaklı ikincil arızalar olarak değerlendirildi."
+    ],
+    "alternatif_hipotezler": [
+      "Yükleme öncesi format/doğrulama eksik: bozuk dosyalar kuyruğa girip worker'ı düşürüyor.",
+      "S1/S2'deki parça limiti aşımı, büyük dokümanlarda ayrı bir kapasite sorunu olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "Hatalı BytesIO örneklerini ve kaynak URL'leri inceleyip dosya bütünlüğünü doğrulayın.",
+      "Görüntü servisi API'sinin döndürdüğü hata kodlarını ve limitlerini kontrol edin.",
+      "Consumer'da format doğrulama ve zarif hata yönetimi (retry/poison queue) politikasını gözden geçirin.",
+      "S1/S2'deki parça ve S8'deki sayfa limitlerinin iş kuralı olarak doğru olup olmadığını doğrulayın."
+    ],
+    "eksik_kanitlar": [
+      "Hatalı dosyaların hash/URL listesi ve yükleme kaynağı bilgisi yok.",
+      "Pod/sürüm dağılımı ve altyapı metrikleri (CPU/bellek) paylaşılmadı.",
+      "avg_latency=45ms bağlamı yetersiz; uçtan uca gecikme ölçümü yok."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_94b76c04e168d189:src.consumers.domain_data_source_consumer:1792432800000",
+      "sig:tpl_c823753af81c31b7:src.consumers.domain_data_source_consumer:1792432800000",
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792432800000",
+      "sig:tpl_9a0acd9130e9a98e:src.consumers.domain_data_source_consumer:1792432800000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3070,
+      "completion_tokens": 576,
+      "total_tokens": 3646,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.886,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 21,
+      "signals_selected": 8,
+      "signal_groups": 19,
+      "correlations_total": 0,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4945,
+      "serialized_bytes": 5045,
+      "input_chars": 11042,
+      "input_bytes": 11330,
+      "approximate_tokens": 2761,
+      "compacted": true,
+      "prompt_tokens": 3070,
+      "completion_tokens": 576,
+      "total_tokens": 3646,
+      "finish_reason": "stop",
+      "duration_seconds": 8.886
+    }
+  },
+  "inc:15cd22a0": {
+    "durum_ozeti": "aida-document-digest-consumer-dds servisinde CSV ayrıştırma hataları (I1) ve DB bağlantı kopması ile LLM bağlam limiti, Confluence indirme ve görsel boyutu hataları (I2) gözlemleniyor.",
+    "kok_neden_hipotezi": "I1'in kök nedeni CSV dosyalarının beklenen sütun sayısıyla uyumsuzluğu (ValueError: Failed to convert CSV). I2'de psycopg2 OperationalError ile anormal DB sonlanması en belirgin teknik arıza; LLM bağlam limiti ve Confluence hataları ayrı girdi kaynaklı arızalar.",
+    "guven": 0.72,
+    "nedensellik_durumu": "belirsiz",
+    "etkilenen_olaylar": [
+      "inc:15cd22a0",
+      "inc:c1604604"
+    ],
+    "karar_gerekcesi": [
+      "S1/S3: CSV tokenizing hatası deterministik baseline ile I1'in kök nedeni; semptom değil.",
+      "S2: psycopg2 OperationalError sunucu tarafı anormal sonlanma gösteriyor; I2 için en güçlü teknik sinyal.",
+      "S4/S8: LLM bağlam limiti hataları girdiye bağlı; S5/S6/S7 izole dosya/görsel hataları."
+    ],
+    "alternatif_hipotezler": [
+      "I2'de DB bağlantı kopması ile LLM/Confluence hataları bağımsız arızalar olabilir; ortak kök kanıtı yok.",
+      "CSV hataları hatalı veri dosyası kaynaklı olabilir; consumer kodunda regresyon olasılığı düşük."
+    ],
+    "onerilen_incelemeler": [
+      "Hatalı CSV dosyalarının sütun yapısını ve kaynak dosyaları inceleyin.",
+      "DB sunucu loglarında anormal sonlanma (OOM, restart) kayıtlarını kontrol edin.",
+      "LLM isteklerinde prompt/output token limitlerini aşan belgeleri tespit edin.",
+      "Confluence ek indirme hatalarının ağ/izin durumunu doğrulayın."
+    ],
+    "eksik_kanitlar": [
+      "I1 ile I2 arasındaki topolojik bağı gösteren iz veya metrik yok.",
+      "DB bağlantı hatasının hangi sorgu/servis tarafından tetiklendiğine dair bağlam yok.",
+      "Sinyallerde pod/versiyon dağılımı bilgisi bulunmuyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:209e924c4482496aaf971de763844ffa:pattern_frequency:tpl_90f4044091cc3dbc",
+      "sig:tpl_ab84065b719810dd:src.db.session:1792434600000",
+      "monitor:209e924c4482496aaf971de763844ffa:pattern_frequency:tpl_b2df1a51941d90cb",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792434600000",
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792434600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3039,
+      "completion_tokens": 594,
+      "total_tokens": 3633,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.359,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 147,
+      "signals_selected": 8,
+      "signal_groups": 120,
+      "correlations_total": 32,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5179,
+      "serialized_bytes": 5223,
+      "input_chars": 11276,
+      "input_bytes": 11508,
+      "approximate_tokens": 2819,
+      "compacted": true,
+      "prompt_tokens": 3039,
+      "completion_tokens": 594,
+      "total_tokens": 3633,
+      "finish_reason": "stop",
+      "duration_seconds": 7.359
+    }
+  },
+  "inc:b5413138": {
+    "durum_ozeti": "I1 olayında belge işleme hattında CSV ayrıştırma, kodlama ve Confluence indirme hataları yoğunlaştı; 228 olay ve 71 sinyal ile belge tüketici akışı etkilendi.",
+    "kok_neden_hipotezi": "domain_data_source_consumer'da CSV dosyaları beklenen kolon sayısıyla ayrıştırılamıyor (S1/S8) ve cp950 kodlama hatası (S3) görülüyor; kaynak CSV'ler bozuk/uyumsuz formatlı, işleme worker'ı belgeleri tamamlayamıyor.",
+    "guven": 0.72,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:b5413138"
+    ],
+    "karar_gerekcesi": [
+      "S1 ve S8 aynı CSV tokenizing hatasını consumer ve extractor katmanında doğruluyor.",
+      "S3'teki cp950 decode hatası kaynak dosya kodlama uyumsuzluğuna işaret ediyor.",
+      "S7'de ek indirme hatası ERROR status belge oluşumuna yol açıyor."
+    ],
+    "alternatif_hipotezler": [
+      "S4'teki Non-base64 hata ve S5'teki model bağlam limiti aşımı bağımsız içerik kalitesi sorunları olabilir.",
+      "S6'daki Confluence HTTP 400 hataları geçici istemci tarafı istek problemi olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "Hatalı CSV dosyalarının kolon yapısını ve kodlamasını (cp950) manuel doğrulayın.",
+      "Confluence ek indirme hatalarındaki URL ve dosya adlarını kontrol edin.",
+      "CSV extractor'ın beklenen şema tanımını kaynak veriyle karşılaştırın.",
+      "S4 ve S5 hatalarının ayrı bir içerik kalitesi iş akışına ait olup olmadığını doğrulayın."
+    ],
+    "eksik_kanitlar": [
+      "Hatalı belgelerin kaynak URL'leri ve sahipleri hakkında bilgi yok.",
+      "CSV şema beklentisi ve sürüm geçmişi kanıtı bulunmuyor.",
+      "Confluence tarafındaki 400 hatalarının sunucu logları mevcut değil."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_90f4044091cc3dbc:src.consumers.domain_data_source_consumer:1792434600000",
+      "sig:tpl_b0de7f6f721bc48e:src.extractors.csv_extractor:1792434600000",
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792434600000",
+      "sig:tpl_ad769762b72b010a:src.connectors.confluence_connector:1792434600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3091,
+      "completion_tokens": 507,
+      "total_tokens": 3598,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.282,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 71,
+      "signals_selected": 8,
+      "signal_groups": 50,
+      "correlations_total": 8,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5036,
+      "serialized_bytes": 5106,
+      "input_chars": 11133,
+      "input_bytes": 11391,
+      "approximate_tokens": 2784,
+      "compacted": true,
+      "prompt_tokens": 3091,
+      "completion_tokens": 507,
+      "total_tokens": 3598,
+      "finish_reason": "stop",
+      "duration_seconds": 7.282
+    }
+  },
+  "inc:99fc41a4": {
+    "durum_ozeti": "I2'de belge işleme hattında 373 olay; S2'de cp950 UnicodeDecodeError, S6/S7'de model bağlam uzunluğu BadRequestError'ları. I1'de Non-base64 BadRequestError, I3'te .msg cp950 ayrıştırma hatası, I5'te CSV tokenizasyon hatası.",
+    "kok_neden_hipotezi": "Belge işleme hattında kodlama (cp950) çözümleme hataları ve model bağlam uzunluğu aşımı bir arada; S2'deki UnicodeDecodeError en erken teknik arıza, S6/S7 türev semptom olarak değerlendiriliyor.",
+    "guven": 0.72,
+    "nedensellik_durumu": "belirsiz",
+    "etkilenen_olaylar": [
+      "inc:aa2052e9",
+      "inc:99fc41a4",
+      "inc:a8617efc",
+      "inc:30def3fe"
+    ],
+    "karar_gerekcesi": [
+      "S2 en erken (t=...005925) teknik arıza; S6 t=...133319'da başlıyor, korelasyon S2→S6.",
+      "S6/S7 bağlam uzunluğu aşımı ayrı bir arıza olabilir; tek kök neden iddiası kanıtla tam desteklenmiyor.",
+      "I1/I3/I5 farklı bileşenlerde izole kodlama/ayrıştırma hataları; ortak tetikleyici kanıtı yok."
+    ],
+    "alternatif_hipotezler": [
+      "S6/S7'deki model bağlam uzunluğu aşımı, I2'nin asıl kök nedeni olabilir; S2 bağımsız bir kodlama arızası.",
+      "I1'deki Non-base64 hatası, görsel açıklama servisine gönderilen bozuk girdiden bağımsız bir API/istek biçim arızası."
+    ],
+    "onerilen_incelemeler": [
+      "cp950 hatası veren belgelerin kodlamasını ve decode çağrılarında encoding parametresinin kullanımını inceleyin.",
+      "Bağlam uzunluğu aşan belgelerde chunking/özetleme stratejisini ve max token ayarlarını gözden geçirin.",
+      "I1'deki Non-base64 hatası için görsel girdilerin base64 dönüşüm adımını doğrulayın.",
+      "I5'teki CSV ayrıştırma hatalarında ayraç/satır yapısını ve dosya kodlamasını kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "S2 ile S6 arasındaki 127 sn'lik gecikmenin nedensel bağını doğrulayan ara loglar yok.",
+      "Belge işleme hattının servis topolojisi ve bağımlılık haritası sağlanmadı.",
+      "I1, I3, I5 olaylarının I2 ile ortak bir kaynağa bağlı olduğuna dair korelasyon yok."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792438200000",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792439100000",
+      "sig:tpl_be6aafc37eb8fac0:src.services.image_description_service:1792438200000",
+      "sig:tpl_be6aafc37eb8fac0:src.services.image_description_service:1792439100000",
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792438200000",
+      "sig:tpl_b0de7f6f721bc48e:src.extractors.csv_extractor:1792439100000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3150,
+      "completion_tokens": 690,
+      "total_tokens": 3840,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.535,
+    "expert_diagnostics": {
+      "incidents_total": 7,
+      "incidents_selected": 5,
+      "signals_total": 47,
+      "signals_selected": 7,
+      "signal_groups": 40,
+      "correlations_total": 12,
+      "correlations_selected": 1,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5415,
+      "serialized_bytes": 5480,
+      "input_chars": 11512,
+      "input_bytes": 11765,
+      "approximate_tokens": 2878,
+      "compacted": true,
+      "prompt_tokens": 3150,
+      "completion_tokens": 690,
+      "total_tokens": 3840,
+      "finish_reason": "stop",
+      "duration_seconds": 8.535
+    }
+  },
+  "inc:b34244cd": {
+    "durum_ozeti": "I1'de belge işleme hattında CSV ayrıştırma, görsel yükleme ve .msg kod çözme hataları; I2'de Confluence ek indirme 400 Bad Request hataları. Her iki olay da veri girişi/istek kaynaklı işlemsel arızalar.",
+    "kok_neden_hipotezi": "I1: Bozuk/uyumsuz girdi dosyaları (CSV alan sayısı uyumsuzluğu, tanınamayan görsel, cp950 kodlama) worker'da ValueError ile işleme düşüyor. I2: Confluence ek indirme istekleri 400 Bad Request alıyor.",
+    "guven": 0.72,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:b34244cd",
+      "inc:6e7ac4e6"
+    ],
+    "karar_gerekcesi": [
+      "S3/S6 ValueError ile CSV tokenizing hatası, I1'in en yoğun ve tekrarlayan sinyali; açık hata semantiği var.",
+      "S7 ve S8 ayrı girdi tiplerinde (görsel, .msg) hata gösteriyor; ortak nokta bozuk girdi verisi.",
+      "S5'te 400 Bad Request ek indirmeyi kesiyor; I2 için deterministik tetikleyici."
+    ],
+    "alternatif_hipotezler": [
+      "S4'teki model bağlam uzunluğu aşımı, özet üretiminde ayrı bir kapasite sorunu olabilir.",
+      "I2'deki 400 hatası URL/parametre üretimindeki istemci tarafı hatasından kaynaklanabilir."
+    ],
+    "onerilen_incelemeler": [
+      "Hatalı CSV dosyalarının alan sayısı ve ayırıcı yapısını kaynak sistemde doğrulayın.",
+      "S7'deki BytesIO içeriğinin gerçekten görsel olup olmadığını dosya tipiyle kontrol edin.",
+      "S8'deki .msg dosyalarının kodlamasını (cp950) ve kaynak e-posta istemcisini inceleyin.",
+      "S5'teki indirme URL'lerinin ve ek parametrelerinin Confluence API sürümüyle uyumunu kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "Hatalı dosyaların kaynak kimlikleri ve örnek içerikleri pakette yok.",
+      "I2'deki 400 hatasının tam URL/istek gövdesi günlüğü bulunmuyor.",
+      "S4'ün I1 ile nedensel bağlantısı doğrulanmış değil."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_90f4044091cc3dbc:src.consumers.domain_data_source_consumer:1792439100000",
+      "sig:tpl_90f4044091cc3dbc:src.consumers.domain_data_source_consumer:1792440000000",
+      "sig:tpl_b0de7f6f721bc48e:src.extractors.csv_extractor:1792439100000",
+      "sig:tpl_b0de7f6f721bc48e:src.extractors.csv_extractor:1792440000000",
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792440000000",
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792440000000",
+      "sig:tpl_ad769762b72b010a:src.connectors.confluence_connector:1792439100000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3082,
+      "completion_tokens": 585,
+      "total_tokens": 3667,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.882,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 61,
+      "signals_selected": 8,
+      "signal_groups": 42,
+      "correlations_total": 12,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4969,
+      "serialized_bytes": 5039,
+      "input_chars": 11066,
+      "input_bytes": 11324,
+      "approximate_tokens": 2767,
+      "compacted": true,
+      "prompt_tokens": 3082,
+      "completion_tokens": 585,
+      "total_tokens": 3667,
+      "finish_reason": "stop",
+      "duration_seconds": 7.882
+    }
+  },
+  "inc:5ccf7718": {
+    "durum_ozeti": "I1 ve I2 olaylarında belge işleme hattında çok sayıda hata: görsel yükleme BadRequestError, cp950 UnicodeDecodeError, Confluence ek indirme ve görsel URL timeout hataları.",
+    "kok_neden_hipotezi": "S3 ve S7'deki cp950 UnicodeDecodeError, bozuk/uyumsuz kodlamalı belge ve .msg içeriklerinin işlenememesi; S1'deki 'cannot identify image file' bozuk görsel yüklemeleri hattı tetikliyor.",
+    "guven": 0.72,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:5ccf7718",
+      "inc:994a4d85"
+    ],
+    "karar_gerekcesi": [
+      "S3/S7 cp950 decode hataları açık teknik arıza sinyali; semptom değil.",
+      "S1 'cannot identify image file' bozuk görsel yüklemesini doğrudan gösteriyor.",
+      "S2/S8 Confluence indirme hataları I2'yi tetikleyen ayrı teknik arıza."
+    ],
+    "alternatif_hipotezler": [
+      "S4/S5'teki görsel URL timeout'ları ağ/servis yavaşlığından kaynaklanıyor olabilir.",
+      "S6'daki model bağlam uzunluğu aşımı prompt boyutu sorunundan olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "cp950 kodlamasıyla işlenen belge ve .msg dosyalarını inceleyin.",
+      "Bozuk görsel dosyalarını (BytesIO) doğrulayın.",
+      "Confluence ek indirme hatalarının kaynak dosyalarını kontrol edin.",
+      "Timeout olan görsel URL'lerinin erişilebilirliğini test edin."
+    ],
+    "eksik_kanitlar": [
+      "Hataların tek pod/versiyonda izole olup olmadığı bilgisi yok.",
+      "Servisler arası bağımlılık/topoloji verisi sağlanmadı.",
+      "S6 pattern'ı kesik olduğu için tam hata detayı eksik."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792440000000",
+      "sig:tpl_ec3b680f78c1a9f2:src.consumers.domain_data_source_consumer:1792440000000",
+      "sig:tpl_03adbd6be214170f:src.utils.email_parser:1792440000000",
+      "sig:tpl_bed987d8a9688ff0:src.connectors.confluence_connector:1792440000000",
+      "sig:tpl_4e9a158ba0efc41c:aida_core.clients.confluence_client:1792440000000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 2975,
+      "completion_tokens": 477,
+      "total_tokens": 3452,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 6.195,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 46,
+      "signals_selected": 8,
+      "signal_groups": 46,
+      "correlations_total": 12,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 4583,
+      "serialized_bytes": 4651,
+      "input_chars": 10680,
+      "input_bytes": 10936,
+      "approximate_tokens": 2670,
+      "compacted": true,
+      "prompt_tokens": 2975,
+      "completion_tokens": 477,
+      "total_tokens": 3452,
+      "finish_reason": "stop",
+      "duration_seconds": 6.195
+    }
+  },
+  "inc:47ca119c": {
+    "durum_ozeti": "I1'de belge işleme hataları (bağlam uzunluğu aşıldı, bozuk dosya/görsel), I2'de PostgreSQL bağlantı kopması nedeniyle centroid saklama başarısız. İki bağımsız iş yükü arızası gözleniyor.",
+    "kok_neden_hipotezi": "I1: LLM'e gönderilen istemler model bağlam limitini aşıyor (BadRequestError) ve bozuk dosyalar işlenemiyor. I2: psycopg2 OperationalError ile DB sunucusu beklenmedik şekilde bağlantıyı kapattı; DELETE işlemi ve oturum kapanışı başarısız.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:47ca119c",
+      "inc:d83026fc"
+    ],
+    "karar_gerekcesi": [
+      "S1/S3: Model maksimum bağlam uzunluğu aşıldı; istem+çıkan token limiti aşıldı.",
+      "S2/S4: psycopg2 OperationalError, DB sunucusu bağlantıyı beklenmedik kapattı.",
+      "S6-S8: Bozuk dosya/görsel girdileri işleme hatalarına yol açıyor; ayrı veri kalitesi sorunu."
+    ],
+    "alternatif_hipotezler": [
+      "I2'de DB yeniden başlatması veya ağ kesintisi bağlantı kapanmasına neden olmuş olabilir.",
+      "I1'deki retry döngüsü (S1) bağlam aşımını hafifletmek yerine tekrarlı arızaya yol açıyor olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "LLM istem boyutlarını ve max_output token ayarlarını bağlam limitine göre doğrulayın.",
+      "DB sunucusu (PostgreSQL) loglarını ve son yeniden başlatma/çökme kayıtlarını inceleyin.",
+      "Bozuk dosya/görsel kaynaklarını ve yükleme doğrulama adımlarını kontrol edin.",
+      "I1 ve I2 zaman çizelgelerinde ortak altyapı değişikliği olup olmadığını kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "I1 ile I2 arasındaki topolojik bağımlılığı gösteren korelasyon verisi yok.",
+      "DB sunucusunun neden bağlantıyı kapattığına dair sunucu tarafı loglar yok.",
+      "Etkilenen pod/servis dağılımı ve deployment sürüm bilgisi yok."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792441800000",
+      "sig:tpl_d9317c071fca4042:src.processors.centroid_processor:1792441800000",
+      "sig:tpl_ab84065b719810dd:src.db.session:1792441800000",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792441800000",
+      "sig:tpl_94b76c04e168d189:src.consumers.domain_data_source_consumer:1792441800000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3036,
+      "completion_tokens": 591,
+      "total_tokens": 3627,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.708,
+    "expert_diagnostics": {
+      "incidents_total": 2,
+      "incidents_selected": 2,
+      "signals_total": 21,
+      "signals_selected": 8,
+      "signal_groups": 19,
+      "correlations_total": 0,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5145,
+      "serialized_bytes": 5211,
+      "input_chars": 11242,
+      "input_bytes": 11496,
+      "approximate_tokens": 2811,
+      "compacted": true,
+      "prompt_tokens": 3036,
+      "completion_tokens": 591,
+      "total_tokens": 3627,
+      "finish_reason": "stop",
+      "duration_seconds": 7.708
+    }
+  },
+  "inc:3f8ce7b1": {
+    "durum_ozeti": "aida-document-digest-consumer-dds iş yükünde belge işleme hataları; I1-I3 olaylarında görüntü yükleme, bağlam uzunluğu ve Confluence indirme arızaları gözlemleniyor.",
+    "kok_neden_hipotezi": "S1/S2'deki 'cannot identify image file' BadRequestError, bozuk/desteklenmeyen görsel içerikle beslenen toplu iş akışının kalıcı arızası; S4/S5'teki maksimum bağlam uzunluğu aşımı ve S3/S6'daki ek hatalar ikincil.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:3f8ce7b1",
+      "inc:47ca119c",
+      "inc:5388a069"
+    ],
+    "karar_gerekcesi": [
+      "S1 ve S2 aynı BadRequestError şablonunu paylaşıyor; açık hata semantiği ve güvenilir şablon kanıtıyla kök neden adayı.",
+      "S4/S5'teki bağlam uzunluğu aşımı ve S8 UnicodeDecodeError, bozuk/uygunsuz girdi belgelerin türev semptomları.",
+      "S3/S6 Confluence indirme hatası ayrı bir girdi kaynağı sorunu; ana işleme hatalarından bağımsız."
+    ],
+    "alternatif_hipotezler": [
+      "S4/S5'teki maksimum bağlam uzunluğu aşımı, büyük belgelerin özetleme adımında ayrı bir yapılandırma/kapasiton sorunu olabilir.",
+      "S3/S6'daki Confluence ek indirme arızası ağ/erişim sorunundan kaynaklanan bağımsız bir hata olabilir."
+    ],
+    "onerilen_incelemeler": [
+      "S1/S2'de hata veren görsel dosyaların bütünlüğünü ve formatını manuel doğrulayın.",
+      "S4/S5'te bağlam limitini aşan belgelerin boyut/token sayısını inceleyin.",
+      "S3/S6 için Confluence erişim izinlerini ve ağ bağlantısını kontrol edin.",
+      "S8'deki UTF-8 çözümleme hatalarının kaynak dosya kodlamalarını araştırın."
+    ],
+    "eksik_kanitlar": [
+      "Hatalı görsellerin kaynak URL'leri ve içerik türü bilgisi yok.",
+      "Bağlam limiti aşan belgelerin token sayıları kesilmiş (truncated) loglarda.",
+      "Confluence indirme hatasının HTTP durum kodu belirtilmemiş.",
+      "Pod/sürüm dağılımı verisi yok; izole arıya değerlendirilemedi."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:522ffa3e76444e3283f849db7d6d646b:pattern_frequency:tpl_559996d6d3ee44af",
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792440900000",
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792441800000",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792440900000",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792441800000",
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792440900000",
+      "sig:tpl_10c2f1f3233ec657:src.utils.retry_decorator:1792441800000",
+      "sig:tpl_bed987d8a9688ff0:src.connectors.confluence_connector:1792441800000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3118,
+      "completion_tokens": 610,
+      "total_tokens": 3728,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.281,
+    "expert_diagnostics": {
+      "incidents_total": 3,
+      "incidents_selected": 3,
+      "signals_total": 41,
+      "signals_selected": 8,
+      "signal_groups": 30,
+      "correlations_total": 4,
+      "correlations_selected": 1,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5290,
+      "serialized_bytes": 5351,
+      "input_chars": 11387,
+      "input_bytes": 11636,
+      "approximate_tokens": 2847,
+      "compacted": true,
+      "prompt_tokens": 3118,
+      "completion_tokens": 610,
+      "total_tokens": 3728,
+      "finish_reason": "stop",
+      "duration_seconds": 8.281
+    }
+  },
+  "inc:deddb65b": {
+    "durum_ozeti": "aida-document-digest-consumer-dds iş yükünde doküman işleme hataları; I1-I3 olaylarında ek indirme, görsel tanımlama, token limiti ve dosya ayrıştırma arızaları gözlemlendi.",
+    "kok_neden_hipotezi": "S1/S3'te Confluence eklerinin indirilememesi ('Failed to download attachment') birincil tetikleyici; bu dosyalar ERROR statüsüyle işleniyor. S2/S4-S8 bu bozuk/eksik içerikten türeyen ikincil ayrıştırma hatalarıdır.",
+    "guven": 0.72,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:deddb65b",
+      "inc:47ca119c",
+      "inc:5388a069"
+    ],
+    "karar_gerekcesi": [
+      "S1 ve S3 aynı ek indirme hatasını gösteriyor; I1'in probable_root'u bu consumer.",
+      "S6'daki Request error, indirme zincirini destekleyen ağ/istek seviyesi arıza.",
+      "S2/S4-S8 semptom niteliğinde; türev hatalar kök neden seçilmedi."
+    ],
+    "alternatif_hipotezler": [
+      "S4/S5'teki model maksimum bağlam uzunluğu aşımı bağımsız bir yapılandırma sorunu olabilir.",
+      "S7/S8'deki CSV ve PDF geometri bozulmaları kaynak dosya kalitesi sorununu işaret eder."
+    ],
+    "onerilen_incelemeler": [
+      "S1/S3'te başarısız eklerin URL ve dosya bütünlüğünü Confluence tarafında doğrulayın.",
+      "S6'daki istek hataları için ağ erişimi ve kimlik doğrulama durumunu kontrol edin.",
+      "S4/S5 için token limiti ve prompt boyutu yapılandırmasını gözden geçirin.",
+      "S7/S8'deki sorunlu dosyaları ayrı test ortamında yeniden işleyin."
+    ],
+    "eksik_kanitlar": [
+      "İndirme hatalarının HTTP durum kodları ve hata mesaj gövdeleri mevcut değil.",
+      "Sinyaller arası topolojik bağımlılık haritası sağlanmadı.",
+      "S1'de tekil olay (total_occurrences=1) genellenebilirliği sınırlıyor."
+    ],
+    "kanit_sinyal_idleri": [
+      "monitor:30a2b75a575448d2adca9aced709e8e8:new_pattern:tpl_d506577cb4f8da66",
+      "sig:tpl_d506577cb4f8da66:src.connectors.confluence_connector:1792443600000",
+      "sig:tpl_4e9a158ba0efc41c:aida_core.clients.confluence_client:1792443600000",
+      "sig:tpl_559996d6d3ee44af:src.services.image_description_service:1792443600000",
+      "sig:tpl_8fb68924b519dcff:src.consumers.domain_data_source_consumer:1792443600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3068,
+      "completion_tokens": 533,
+      "total_tokens": 3601,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 7.746,
+    "expert_diagnostics": {
+      "incidents_total": 3,
+      "incidents_selected": 3,
+      "signals_total": 61,
+      "signals_selected": 8,
+      "signal_groups": 57,
+      "correlations_total": 10,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5013,
+      "serialized_bytes": 5071,
+      "input_chars": 11110,
+      "input_bytes": 11356,
+      "approximate_tokens": 2778,
+      "compacted": true,
+      "prompt_tokens": 3068,
+      "completion_tokens": 533,
+      "total_tokens": 3601,
+      "finish_reason": "stop",
+      "duration_seconds": 7.746
+    }
+  },
+  "inc:5388a069": {
+    "durum_ozeti": "I1 kapsamında aicc_mcp_gateway_http üzerinden gelen BALANCE istekleri AssetReadException kaynaklı EJB Exception ile başarısız oluyor; ayrıca istek gövde doğrulama hataları (client_error) gözlemleniyor.",
+    "kok_neden_hipotezi": "balanceinquiry servisinde AssetReadException RuntimeException olarak fırlatılıyor; varlık/bakiye verisi okunamadığı için EJB çağrıları 77-313ms içinde FAILED ile sonuçlanıyor. Bu, altta yatan teknik arıza sinyalidir.",
+    "guven": 0.82,
+    "nedensellik_durumu": "destekleniyor",
+    "etkilenen_olaylar": [
+      "inc:5388a069"
+    ],
+    "karar_gerekcesi": [
+      "S1-S8'de AssetReadException açık hata semantiğiyle tekrarlıyor; kök aday S1 (0.85) deterministik olarak öne çıkıyor.",
+      "S2'deki RequestValidationError istemci kaynaklı (client_error) ayrı bir semptom; sunucu tarafı EJB arızasıyla nedensel zincir kurmaya yeterli değil.",
+      "Hata süreleri 77-313ms ve avg_latency 45ms; timeout/rollback türevi değil, doğrudan unhandled exception zinciri görülüyor."
+    ],
+    "alternatif_hipotezler": [
+      "S2'deki gövde doğrulama hataları (6 tekrar) ayrı bir istemci entegrasyon sorununa işaret ediyor olabilir.",
+      "AssetReadException altında yatan veri kaynağı (DB/önbellek) erişim arızası olabilir; stack trace kesildiği için doğrulanamadı."
+    ],
+    "onerilen_incelemeler": [
+      "AssetReadException'ın tam stack trace'ini ve fırlatıldığı servis metodunu inceleyin.",
+      "S2'deki doğrulama hatalarının hangi endpoint ve gövde alanlarında yoğunlaştığını kontrol edin.",
+      "balanceinquiry bağımlılıklarının (veri kaynağı/önbellek) o zaman aralığında sağlık durumunu gözden geçirin.",
+      "EJB katmanı loglarında exception öncesi uyarı/kaynak sinyali olup olmadığını kontrol edin."
+    ],
+    "eksik_kanitlar": [
+      "AssetReadException'ın tam mesajı ve iç neden (caused by) zinciri kesilmiş (pattern_truncated).",
+      "Başarısız isteklerin pod/sürüm dağılımı ve topoloji bağlamı paylaşılmamış.",
+      "S2 hatalarının BALANCE akışıyla aynı isteklerde mi görüldüğü belirsiz."
+    ],
+    "kanit_sinyal_idleri": [
+      "sig:tpl_f3d8b5fc82e3b603:com.turkcell.balanceinquiry.model.exception.AssetReadException:1792443600000",
+      "sig:tpl_058ec1dca078c156:com.turkcell.balanceinquiry.model.exception.AssetReadException:1792443600000",
+      "sig:tpl_862bfdea38a6d19f:com.turkcell.balanceinquiry.model.exception.AssetReadException:1792443600000",
+      "sig:tpl_203563065e62c667:com.turkcell.balanceinquiry.model.exception.AssetReadException:1792443600000",
+      "sig:tpl_8daee34508baa077:com.turkcell.balanceinquiry.model.exception.AssetReadException:1792443600000"
+    ],
+    "analysis_source": "qwen_uzman",
+    "closed_loop_learned": false,
+    "ai_usage": {
+      "prompt_tokens": 3232,
+      "completion_tokens": 626,
+      "total_tokens": 3858,
+      "finish_reason": "stop"
+    },
+    "analysis_model": "saka__glm-53-flash-dynamo-saka",
+    "ai_duration_seconds": 8.557,
+    "expert_diagnostics": {
+      "incidents_total": 1,
+      "incidents_selected": 1,
+      "signals_total": 15,
+      "signals_selected": 8,
+      "signal_groups": 14,
+      "correlations_total": 0,
+      "correlations_selected": 0,
+      "root_candidates_selected": 3,
+      "serialized_chars": 5507,
+      "serialized_bytes": 5587,
+      "input_chars": 11604,
+      "input_bytes": 11872,
+      "approximate_tokens": 2901,
+      "compacted": true,
+      "prompt_tokens": 3232,
+      "completion_tokens": 626,
+      "total_tokens": 3858,
+      "finish_reason": "stop",
+      "duration_seconds": 8.557
+    }
+  }
+}
